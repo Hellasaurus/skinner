@@ -81,7 +81,84 @@ private extension WMSParser {
             options: .regularExpression
         )
 
+        // Remove duplicate attributes within a single tag — strict XML rejects them.
+        str = removeDuplicateAttributes(str)
+
         return Data(str.utf8)
+    }
+
+    /// Scans each opening XML tag and drops any attribute whose name was already seen in that tag.
+    static func removeDuplicateAttributes(_ xml: String) -> String {
+        var result = ""
+        result.reserveCapacity(xml.count)
+        var i = xml.startIndex
+
+        while i < xml.endIndex {
+            guard xml[i] == "<" else {
+                result.append(xml[i])
+                i = xml.index(after: i)
+                continue
+            }
+
+            // Scan to the matching >, respecting quoted attribute values.
+            var j = xml.index(after: i)
+            var quote: Character? = nil
+            while j < xml.endIndex {
+                let c = xml[j]
+                if let q = quote {
+                    if c == q { quote = nil }
+                } else if c == "\"" || c == "'" {
+                    quote = c
+                } else if c == ">" {
+                    j = xml.index(after: j)
+                    break
+                }
+                j = xml.index(after: j)
+            }
+
+            let tag = String(xml[i..<j])
+            // Only deduplicate opening tags (not </, <!, <?)
+            let second = xml.index(after: i) < j ? xml[xml.index(after: i)] : Character(" ")
+            if second != "/" && second != "!" && second != "?" {
+                result += deduplicatedTag(tag)
+            } else {
+                result += tag
+            }
+            i = j
+        }
+        return result
+    }
+
+    /// Returns `tag` with any duplicate attribute names removed (first occurrence kept).
+    private static func deduplicatedTag(_ tag: String) -> String {
+        // Match: whitespace + attrName + = + "value"
+        let pattern = #"(\s+)([A-Za-z_][A-Za-z0-9_:.-]*)\s*=\s*"[^"]*""#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return tag }
+
+        let ns = tag as NSString
+        let matches = regex.matches(in: tag, range: NSRange(location: 0, length: ns.length))
+
+        var seen: Set<String> = []
+        var removals: [NSRange] = []
+        for m in matches {
+            guard let nameRange = Range(m.range(at: 2), in: tag) else { continue }
+            let name = tag[nameRange].lowercased()
+            if seen.contains(name) {
+                removals.append(m.range) // remove the entire `\s+ name="value"` span
+            } else {
+                seen.insert(name)
+            }
+        }
+
+        if removals.isEmpty { return tag }
+
+        // Apply in reverse to preserve index validity.
+        var result = tag
+        for range in removals.reversed() {
+            guard let r = Range(range, in: result) else { continue }
+            result.removeSubrange(r)
+        }
+        return result
     }
 }
 
