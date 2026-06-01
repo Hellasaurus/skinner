@@ -90,6 +90,7 @@ public struct Subview: Sendable {
     public var backgroundImage: String?
     public var backgroundColor: String?
     public var backgroundTiled: Bool
+    public var clippingColor: String?
     public var onEndMove: String?
     public var children: [SkinElement]
 }

@@ -119,7 +119,10 @@ public final class SkinCanvasView: NSView {
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
-                result += collectButtons(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc)
+                let svZ = sv.base.zIndex ?? 0
+                let co  = CGPoint(x: sx, y: sy)
+                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
+                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
             default: break
             }
         }
@@ -154,7 +157,10 @@ public final class SkinCanvasView: NSView {
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
-                result += collectSliders(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc)
+                let svZ = sv.base.zIndex ?? 0
+                let co  = CGPoint(x: sx, y: sy)
+                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
+                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
             default: break
             }
         }
@@ -164,14 +170,18 @@ public final class SkinCanvasView: NSView {
     // MARK: - Background opacity map
 
     private func buildBgOpacity() {
-        guard let name = firstBackgroundImage(in: skinView.elements),
-              let md   = cache.mapData[name.lowercased()]
+        guard let info = firstSubviewBgInfo(in: skinView.elements),
+              let md   = cache.mapData[info.name.lowercased()]
         else { return }
         bgWidth  = md.width
         bgHeight = md.height
+        let extraColors = info.transparentColors
         bgOpacity = (0 ..< md.width * md.height).map { i in
             let o = i * 4
-            return md.bytes[o + 3] > 128 && !isMagenta(md.bytes[o], md.bytes[o + 1], md.bytes[o + 2])
+            let r = md.bytes[o], g = md.bytes[o + 1], b = md.bytes[o + 2]
+            guard md.bytes[o + 3] > 128, !isMagenta(r, g, b) else { return false }
+            if extraColors.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { return false }
+            return true
         }
     }
 
@@ -207,6 +217,14 @@ public final class SkinCanvasView: NSView {
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+                let svZ = sv.base.zIndex ?? 0
+                let childOffset = CGPoint(x: sx, y: sy)
+                // Children whose z-index is lower than the parent's own z-index render
+                // behind the parent's background image (e.g. intro_anim under screen_cover).
+                let below = sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }
+                let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }
+                drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
+                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
                 // Skip if an animated NSImageView is handling this element.
                 if sv.base.id.flatMap({ animatedSubviews[$0] }) == nil {
                     let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
@@ -220,7 +238,7 @@ public final class SkinCanvasView: NSView {
                         img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
                     }
                 }
-                drawElements(sv.children, offset: CGPoint(x: sx, y: sy), lc: lc, ctx: ctx,
+                drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
 
             case .buttonGroup(let bg):
@@ -439,6 +457,11 @@ public final class SkinCanvasView: NSView {
     ///
     /// GIFs are loaded directly from disk (not from the flattened single-frame cache)
     /// so NSImageView receives the full multi-frame image and can animate it.
+    ///
+    /// When a subview has children whose z-index is lower than the subview's own z-index
+    /// (e.g. XBOX screenCover/intro_anim), those children are added first, then the
+    /// parent's background is added as an NSImageView so it sits above them.  This is
+    /// necessary because CGContext drawing (draw()) is always behind every NSImageView.
     private func buildAnimatedSubviews(in elements: [SkinElement],
                                         offset: CGPoint,
                                         lc: LayoutContext) {
@@ -448,26 +471,59 @@ public final class SkinCanvasView: NSView {
             guard !elementIsHidden(sv.base) else { continue }
             let x = (lc.resolve(sv.base.left) ?? 0) + offset.x
             let y = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+            let co = CGPoint(x: x, y: y)
 
-            // Resolve the effective background image name (script override wins).
             let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                          ?? sv.backgroundImage
+            let svZ = sv.base.zIndex ?? 0
+            let below = sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }
+            let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }
 
-            if let name = bgName, name.lowercased().hasSuffix(".gif"),
-               !cache.clipImageNames.contains(name.lowercased()),
-               let img  = NSImage(contentsOf: bundle.assetURL(named: name)) {
-                let w  = lc.resolve(sv.base.width)  ?? img.size.width
-                let h  = lc.resolve(sv.base.height) ?? img.size.height
-                let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
-                iv.image        = img
-                iv.animates     = true
-                iv.imageScaling = .scaleAxesIndependently
-                addSubview(iv)
-                if let id = sv.base.id { animatedSubviews[id] = iv }
+            // Check if any below-children are GIF subviews (will become NSImageViews).
+            // If so, this element's background must also be an NSImageView added after
+            // them, since CGContext is always behind all NSImageViews.
+            let hasGifBelow = below.contains { child in
+                guard case .subview(let csv) = child else { return false }
+                let cn = (csv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
+                          ?? csv.backgroundImage) ?? ""
+                return cn.lowercased().hasSuffix(".gif") && !cache.clipImageNames.contains(cn.lowercased())
             }
 
-            // Recurse after adding this element so children (added later) sit on top.
-            buildAnimatedSubviews(in: sv.children, offset: CGPoint(x: x, y: y), lc: lc)
+            if hasGifBelow {
+                buildAnimatedSubviews(in: below, offset: co, lc: lc)
+                // Add this element's background as an NSImageView so it sits above the GIF below-children.
+                if let name = bgName,
+                   !cache.clipImageNames.contains(name.lowercased()),
+                   let img = NSImage(contentsOf: bundle.assetURL(named: name)) {
+                    // Use the pixel-accurate size from the asset cache rather than img.size,
+                    // which may be DPI-adjusted (e.g. screen_cover.png has a 300 DPI pHYs chunk).
+                    let cachedSize = cache.images[name.lowercased()]?.size
+                    let w  = lc.resolve(sv.base.width)  ?? cachedSize?.width  ?? img.size.width
+                    let h  = lc.resolve(sv.base.height) ?? cachedSize?.height ?? img.size.height
+                    let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                    iv.image        = img
+                    iv.animates     = name.lowercased().hasSuffix(".gif")
+                    iv.imageScaling = .scaleAxesIndependently
+                    addSubview(iv)
+                    if let id = sv.base.id { animatedSubviews[id] = iv }
+                }
+                buildAnimatedSubviews(in: above, offset: co, lc: lc)
+            } else {
+                if let name = bgName, name.lowercased().hasSuffix(".gif"),
+                   !cache.clipImageNames.contains(name.lowercased()),
+                   let img  = NSImage(contentsOf: bundle.assetURL(named: name)) {
+                    let w  = lc.resolve(sv.base.width)  ?? img.size.width
+                    let h  = lc.resolve(sv.base.height) ?? img.size.height
+                    let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                    iv.image        = img
+                    iv.animates     = true
+                    iv.imageScaling = .scaleAxesIndependently
+                    addSubview(iv)
+                    if let id = sv.base.id { animatedSubviews[id] = iv }
+                }
+                // Recurse after adding this element so children (added later) sit on top.
+                buildAnimatedSubviews(in: sv.children, offset: co, lc: lc)
+            }
         }
     }
 
@@ -484,11 +540,17 @@ public final class SkinCanvasView: NSView {
         return str.lowercased() == "false" || str == "0"
     }
 
-    private func firstBackgroundImage(in elements: [SkinElement]) -> String? {
+    private func firstSubviewBgInfo(
+        in elements: [SkinElement]
+    ) -> (name: String, transparentColors: [(UInt8, UInt8, UInt8)])? {
         for element in elements {
             if case .subview(let sv) = element, !elementIsHidden(sv.base) {
-                if let img = sv.backgroundImage { return img }
-                if let img = firstBackgroundImage(in: sv.children) { return img }
+                if let img = sv.backgroundImage {
+                    let colors = [sv.clippingColor, sv.base.transparencyColor]
+                        .compactMap { $0.flatMap(parseAnyColor) }
+                    return (img, colors)
+                }
+                if let info = firstSubviewBgInfo(in: sv.children) { return info }
             }
         }
         return nil

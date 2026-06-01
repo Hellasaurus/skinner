@@ -387,6 +387,7 @@ private extension WMSParser {
             backgroundImage: a.str("backgroundimage"),
             backgroundColor: a.str("backgroundcolor"),
             backgroundTiled: a.bool("backgroundtiled"),
+            clippingColor: a.str("clippingcolor"),
             onEndMove: a.str("onendmove"),
             children: node.children.map(buildElement)
         )

@@ -65,12 +65,19 @@ public final class AssetCache {
             collectFilenames(from: view.elements, into: &filenames)
         }
 
+        // Collect per-image transparent colors (clippingColor + transparencyColor from every
+        // element) so they can be zeroed alongside magenta during image loading.
+        var extraTransparentColors: [String: [(UInt8, UInt8, UInt8)]] = [:]
+        for view in theme.views {
+            collectImageTransparentColors(from: view.elements, into: &extraTransparentColors)
+        }
+
         var images:  [String: NSImage] = [:]
         var mapData: [String: MapData] = [:]
         for name in filenames {
             let url = bundle.assetURL(named: name)
             let key = name.lowercased()
-            if let img = loadMagentaFree(url: url) { images[key]  = img }
+            if let img = loadMagentaFree(url: url, extraTransparent: extraTransparentColors[key] ?? []) { images[key]  = img }
             if let md  = loadMapData(url: url)     { mapData[key] = md }
         }
 
@@ -86,7 +93,7 @@ public final class AssetCache {
             for fileURL in entries
             where scriptImageExts.contains(fileURL.pathExtension.lowercased()) {
                 let key = fileURL.lastPathComponent.lowercased()
-                if images[key]  == nil, let img = loadMagentaFree(url: fileURL) { images[key]  = img }
+                if images[key]  == nil, let img = loadMagentaFree(url: fileURL, extraTransparent: extraTransparentColors[key] ?? []) { images[key]  = img }
                 if mapData[key] == nil, let md  = loadMapData(url: fileURL)     { mapData[key] = md  }
             }
         }
@@ -155,6 +162,47 @@ private func allButtonGroups(in elements: [SkinElement]) -> [ButtonGroup] {
         }
     }
     return result
+}
+
+// MARK: - Per-image transparent color collection
+
+/// Walks every element and records all `clippingColor` / `transparencyColor` values that
+/// apply to each image file.  Both attributes act as chroma-keys: pixels matching any
+/// collected color are zeroed (made transparent) alongside magenta when the image is loaded.
+///
+/// Handles hex strings (`#RRGGBB`) and CSS named colors (`white`, `green`, …).
+/// `"none"`, `"auto"`, and empty strings are silently ignored.
+private func collectImageTransparentColors(from elements: [SkinElement],
+                                            into map: inout [String: [(UInt8, UInt8, UInt8)]]) {
+    func add(_ name: String?, _ colorStr: String?) {
+        guard let name, let colorStr, let rgb = parseAnyColor(colorStr) else { return }
+        let key = name.lowercased()
+        map[key, default: []].append(rgb)
+    }
+
+    for element in elements {
+        switch element {
+        case .subview(let sv):
+            // Both clippingColor and transparencyColor apply to the background image.
+            add(sv.backgroundImage, sv.clippingColor)
+            add(sv.backgroundImage, sv.base.transparencyColor)
+            collectImageTransparentColors(from: sv.children, into: &map)
+
+        case .button(let b):
+            let tc = b.base.transparencyColor
+            for name in [b.image, b.hoverImage, b.downImage, b.disabledImage, b.hoverDownImage] {
+                add(name, tc)
+            }
+
+        case .buttonGroup(let bg):
+            let tc = bg.base.transparencyColor
+            for name in [bg.image, bg.hoverImage, bg.downImage, bg.disabledImage] {
+                add(name, tc)
+            }
+
+        default: break
+        }
+    }
 }
 
 // MARK: - Clip image name collection
@@ -238,7 +286,8 @@ private func buildGroupAssets(_ group: ButtonGroup,
 
 // MARK: - Image loading
 
-private func loadMagentaFree(url: URL) -> NSImage? {
+private func loadMagentaFree(url: URL,
+                              extraTransparent: [(UInt8, UInt8, UInt8)] = []) -> NSImage? {
     guard let raw = NSImage(contentsOf: url),
           let cg  = raw.cgImage(forProposedRect: nil, context: nil, hints: nil),
           let ctx = makeBitmapContext(width: cg.width, height: cg.height)
@@ -248,7 +297,10 @@ private func loadMagentaFree(url: URL) -> NSImage? {
     let pixels = data.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
     for i in 0 ..< cg.width * cg.height {
         let o = i * 4
-        if isMagenta(pixels[o], pixels[o + 1], pixels[o + 2]) {
+        let r = pixels[o], g = pixels[o + 1], b = pixels[o + 2]
+        let erase = isMagenta(r, g, b) ||
+            extraTransparent.contains { colorMatches(r, g, b, $0.0, $0.1, $0.2) }
+        if erase {
             pixels[o] = 0; pixels[o + 1] = 0; pixels[o + 2] = 0; pixels[o + 3] = 0
         }
     }

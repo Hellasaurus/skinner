@@ -19,3 +19,22 @@ func parseHexColor(_ hex: String) -> (UInt8, UInt8, UInt8)? {
             UInt8((value >> 8)  & 0xFF),
             UInt8(value         & 0xFF))
 }
+
+/// Parses a WMP skin color string — hex `#RRGGBB` or CSS named color — into component bytes.
+/// Returns `nil` for `"none"`, `"auto"`, empty strings, or unrecognised values.
+func parseAnyColor(_ s: String) -> (UInt8, UInt8, UInt8)? {
+    let lower = s.lowercased().trimmingCharacters(in: .whitespaces)
+    guard !lower.isEmpty, lower != "none", lower != "auto" else { return nil }
+    switch lower {
+    case "white":              return (255, 255, 255)
+    case "black":              return (0,   0,   0  )
+    case "red":                return (255, 0,   0  )
+    case "green":              return (0,   128, 0  )
+    case "lime":               return (0,   255, 0  )
+    case "blue":               return (0,   0,   255)
+    case "yellow":             return (255, 255, 0  )
+    case "cyan", "aqua":       return (0,   255, 255)
+    case "magenta", "fuchsia": return (255, 0,   255)
+    default:                   return parseHexColor(s)
+    }
+}
