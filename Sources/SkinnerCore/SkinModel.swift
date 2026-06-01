@@ -9,6 +9,21 @@ public struct Theme: Sendable {
     public var views: [SkinView]
 }
 
+public extension Theme {
+    /// The view most likely to be the primary player UI.
+    ///
+    /// Priority:
+    /// 1. First view whose `id` contains "main" (case-insensitive) — covers `mainView`, `mainBox`, `mainModule`, etc.
+    /// 2. First view that has a resolvable literal width **and** height — handles skins whose main view has no id.
+    /// 3. `views.first` — last resort.
+    var mainView: SkinView? {
+        if let v = views.first(where: { $0.id.lowercased().contains("main") }) { return v }
+        let lc = LayoutContext(viewWidth: 0, viewHeight: 0)
+        if let v = views.first(where: { lc.resolve($0.width) != nil && lc.resolve($0.height) != nil }) { return v }
+        return views.first
+    }
+}
+
 // MARK: - SkinView
 
 public struct SkinView: Sendable {
@@ -97,6 +112,8 @@ public struct Button: Sendable {
     public var upToolTip: String?
     public var downToolTip: String?
     public var sticky: Bool
+    public var clippingImage: String?
+    public var clippingColor: String?
 }
 
 // MARK: - ButtonElement
@@ -129,6 +146,8 @@ public struct ButtonGroup: Sendable {
     public var downImage: String?
     public var disabledImage: String?
     public var mappingImage: String?
+    public var clippingImage: String?
+    public var clippingColor: String?
     public var elements: [ButtonElement]
 }
 

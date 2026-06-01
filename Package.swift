@@ -7,11 +7,17 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .library(name: "SkinnerCore", targets: ["SkinnerCore"]),
+        .executable(name: "Skinner",  targets: ["Skinner"]),
     ],
     targets: [
         .target(
             name: "SkinnerCore",
             path: "Sources/SkinnerCore"
+        ),
+        .executableTarget(
+            name: "Skinner",
+            dependencies: ["SkinnerCore"],
+            path: "Sources/Skinner"
         ),
         .testTarget(
             name: "SkinnerCoreTests",

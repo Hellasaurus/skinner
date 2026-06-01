@@ -11,7 +11,7 @@ public struct SkinBundle: Sendable {
     }
 }
 
-public enum SkinLoaderError: Error, CustomStringConvertible {
+public enum SkinLoaderError: Error, CustomStringConvertible, LocalizedError {
     case notAFileOrDirectory(URL)
     case noWMSFile(URL)
     case extractionFailed(underlying: Error)
@@ -26,6 +26,8 @@ public enum SkinLoaderError: Error, CustomStringConvertible {
             return "ZIP extraction failed: \(err.localizedDescription)"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 public enum SkinLoader {

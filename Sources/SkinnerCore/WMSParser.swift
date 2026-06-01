@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Error
 
-public enum WMSParserError: Error, CustomStringConvertible {
+public enum WMSParserError: Error, CustomStringConvertible, LocalizedError {
     case encodingFailed
     case parseFailed(String)
     case noThemeElement
@@ -14,6 +14,8 @@ public enum WMSParserError: Error, CustomStringConvertible {
         case .noThemeElement: return "No <theme> root element found"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 // MARK: - Public API
@@ -74,17 +76,47 @@ private extension WMSParser {
 
         // Fix missing whitespace between attributes: `attr="val"next=` → `attr="val" next=`
         // Some WMS files are not strict XML — WMP used a lenient parser.
-        // Use negative lookbehind (?<!=) so we only match closing quotes, not opening ones.
+        // Lookbehind (?<![=\s]) excludes both `=` and whitespace so we only fire on a
+        // genuine closing quote run directly into the next attribute name, not on opening
+        // quotes where the attribute value begins with a letter (e.g. `= "filename.gif"`).
         str = str.replacingOccurrences(
-            of: #"(?<!=)"([A-Za-z_])"#,
+            of: #"(?<![=\s])"([A-Za-z_])"#,
             with: #"" $1"#,
             options: .regularExpression
         )
+
+        // Normalize element tag names to uppercase so case-typos (e.g. </BUTTONGROuP>)
+        // don't break the strict XML parser.  WMP's own parser was case-insensitive.
+        str = normalizeTagCase(str)
 
         // Remove duplicate attributes within a single tag — strict XML rejects them.
         str = removeDuplicateAttributes(str)
 
         return Data(str.utf8)
+    }
+
+    /// Uppercases every XML element name (the word immediately after `<` or `</`).
+    /// Skips `<!--` comments, `<?...?>` processing instructions, and `<![CDATA[`.
+    private static func normalizeTagCase(_ s: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: #"<(/?)[A-Za-z][A-Za-z0-9]*"#) else { return s }
+        let ns = s as NSString
+        let matches = regex.matches(in: s, range: NSRange(location: 0, length: ns.length))
+        let result = NSMutableString(string: s)
+        var offset = 0
+        for m in matches {
+            let fullRange = NSRange(location: m.range.location + offset, length: m.range.length)
+            let full = result.substring(with: fullRange)
+            // full is like "<BUTTONGROUP" or "</BUTTONGROuP" — prefix is "<" or "</"
+            let prefixLen = full.hasPrefix("</") ? 2 : 1
+            let prefix = String(full.prefix(prefixLen))
+            let name   = String(full.dropFirst(prefixLen))
+            let upper  = prefix + name.uppercased()
+            if upper != full {
+                result.replaceCharacters(in: fullRange, with: upper)
+                offset += upper.count - full.count
+            }
+        }
+        return result as String
     }
 
     /// Scans each opening XML tag and drops any attribute whose name was already seen in that tag.
@@ -294,9 +326,9 @@ private extension WMSParser {
             return .slider(buildSlider(node, kind: .balance))
         case "text":
             return .text(buildText(node))
-        case "effects":
+        case "effects", "wmpeffects":
             return .effects(buildEffects(node))
-        case "video":
+        case "video", "wmpvideo":
             return .video(buildVideo(node))
         case "playlist":
             return .playlist(buildPlaylist(node))
@@ -372,7 +404,9 @@ private extension WMSParser {
             hoverDownImage: a.str("hoverdownimage"),
             upToolTip: a.str("uptooltip"),
             downToolTip: a.str("downtooltip"),
-            sticky: a.bool("sticky")
+            sticky: a.bool("sticky"),
+            clippingImage: a.str("clippingimage"),
+            clippingColor: a.str("clippingcolor")
         )
     }
 
@@ -388,6 +422,8 @@ private extension WMSParser {
             downImage: a.str("downimage"),
             disabledImage: a.str("disabledimage"),
             mappingImage: a.str("mappingimage"),
+            clippingImage: a.str("clippingimage"),
+            clippingColor: a.str("clippingcolor"),
             elements: elements
         )
     }

@@ -1,0 +1,306 @@
+import AppKit
+
+// MARK: - MapData
+
+/// Raw RGBA pixel data decoded from an asset image, used for hit-testing.
+public struct MapData {
+    public let bytes: [UInt8]
+    public let width: Int
+    public let height: Int
+}
+
+// MARK: - ButtonGroupAssets
+
+/// Pre-built CGImage masks for one ButtonGroup's mapping image.
+///
+/// `masks` is keyed by `ButtonElement.mappingColor` (lowercased, e.g. `"#33ff00"`).
+/// `fullMask` is the union of all recognised button regions and is used to clip the
+/// normal image so pixels outside any button region are hidden.
+public struct ButtonGroupAssets {
+    public let groupID:  String?
+    public let fullMask: CGImage?
+    public let masks:    [String: CGImage]
+}
+
+// MARK: - AssetCache
+
+/// All image assets needed to render a Theme, loaded once at skin-open time.
+public final class AssetCache {
+    /// Magenta-cleaned `NSImage` for every referenced asset filename (key: lowercased).
+    public let images: [String: NSImage]
+    /// Raw RGBA pixel data for every referenced asset (key: lowercased filename).
+    public let mapData: [String: MapData]
+    /// Mask data for every `ButtonGroup` found in the theme, keyed by lowercased mappingImage filename.
+    public let buttonGroupsByMappingImage: [String: ButtonGroupAssets]
+    /// Filenames (lowercased) used as `clippingImage` on any button or buttonGroup.
+    /// Subview `backgroundImage` entries in this set are clip masks, not visual backgrounds.
+    public let clipImageNames: Set<String>
+    /// CGImage alpha masks built from `clippingImage` files (non-transparent pixels → 255).
+    /// Used to clip button and buttonGroup drawing to the skin's shaped regions.
+    public let clipMasks: [String: CGImage]
+
+    /// Returns pre-built mask assets for the given mapping image filename, or `nil` if not found.
+    public func buttonGroupAssets(forMappingImage name: String?) -> ButtonGroupAssets? {
+        guard let name else { return nil }
+        return buttonGroupsByMappingImage[name.lowercased()]
+    }
+
+    private init(images: [String: NSImage],
+                 mapData: [String: MapData],
+                 buttonGroupsByMappingImage: [String: ButtonGroupAssets],
+                 clipImageNames: Set<String>,
+                 clipMasks: [String: CGImage]) {
+        self.images = images
+        self.mapData = mapData
+        self.buttonGroupsByMappingImage = buttonGroupsByMappingImage
+        self.clipImageNames = clipImageNames
+        self.clipMasks = clipMasks
+    }
+
+    // MARK: - Factory
+
+    public static func build(from bundle: SkinBundle, theme: Theme) -> AssetCache {
+        var filenames = Set<String>()
+        for view in theme.views {
+            collectFilenames(from: view.elements, into: &filenames)
+        }
+
+        var images:  [String: NSImage] = [:]
+        var mapData: [String: MapData] = [:]
+        for name in filenames {
+            let url = bundle.assetURL(named: name)
+            let key = name.lowercased()
+            if let img = loadMagentaFree(url: url) { images[key]  = img }
+            if let md  = loadMapData(url: url)     { mapData[key] = md }
+        }
+
+        // Scripts reference image filenames not declared in the WMS (e.g. shutter_open2.gif
+        // set via element.backgroundImage at runtime).  Load everything in the bundle directory
+        // so those assets are available when the canvas draws them.
+        let scriptImageExts: Set<String> = ["png", "gif", "bmp", "jpg", "jpeg"]
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: bundle.directory,
+            includingPropertiesForKeys: nil,
+            options: .skipsHiddenFiles
+        ) {
+            for fileURL in entries
+            where scriptImageExts.contains(fileURL.pathExtension.lowercased()) {
+                let key = fileURL.lastPathComponent.lowercased()
+                if images[key]  == nil, let img = loadMagentaFree(url: fileURL) { images[key]  = img }
+                if mapData[key] == nil, let md  = loadMapData(url: fileURL)     { mapData[key] = md  }
+            }
+        }
+
+        var groupsByMappingImage: [String: ButtonGroupAssets] = [:]
+        for view in theme.views {
+            for group in allButtonGroups(in: view.elements) {
+                let assets = buildGroupAssets(group, mapData: mapData)
+                if let key = group.mappingImage?.lowercased() {
+                    groupsByMappingImage[key] = assets
+                }
+            }
+        }
+
+        // Collect every filename used as a clippingImage, then build shape masks for them.
+        var clipNames = Set<String>()
+        for view in theme.views {
+            collectClipImageNames(from: view.elements, into: &clipNames)
+        }
+        var clipMasks: [String: CGImage] = [:]
+        for name in clipNames {
+            if let md = mapData[name] {
+                if let mask = buildClipMask(from: md) { clipMasks[name] = mask }
+            }
+        }
+
+        return AssetCache(images: images, mapData: mapData,
+                          buttonGroupsByMappingImage: groupsByMappingImage,
+                          clipImageNames: clipNames,
+                          clipMasks: clipMasks)
+    }
+}
+
+// MARK: - Filename collection (recursive element walk)
+
+private func collectFilenames(from elements: [SkinElement], into set: inout Set<String>) {
+    for element in elements {
+        switch element {
+        case .subview(let sv):
+            if let img = sv.backgroundImage { set.insert(img) }
+            collectFilenames(from: sv.children, into: &set)
+        case .button(let b):
+            [b.image, b.hoverImage, b.downImage, b.disabledImage, b.hoverDownImage, b.clippingImage]
+                .forEach { if let s = $0 { set.insert(s) } }
+        case .buttonGroup(let bg):
+            [bg.image, bg.hoverImage, bg.downImage, bg.disabledImage, bg.mappingImage, bg.clippingImage]
+                .forEach { if let s = $0 { set.insert(s) } }
+        case .slider(let s):
+            [s.thumbImage, s.thumbDownImage, s.foregroundImage, s.image, s.positionImage]
+                .forEach { if let f = $0 { set.insert(f) } }
+        default:
+            break
+        }
+    }
+}
+
+// MARK: - ButtonGroup traversal (recursive)
+
+private func allButtonGroups(in elements: [SkinElement]) -> [ButtonGroup] {
+    var result: [ButtonGroup] = []
+    for element in elements {
+        switch element {
+        case .buttonGroup(let bg): result.append(bg)
+        case .subview(let sv):     result += allButtonGroups(in: sv.children)
+        default: break
+        }
+    }
+    return result
+}
+
+// MARK: - Clip image name collection
+
+private func collectClipImageNames(from elements: [SkinElement], into set: inout Set<String>) {
+    for element in elements {
+        switch element {
+        case .button(let b):
+            if let name = b.clippingImage { set.insert(name.lowercased()) }
+        case .buttonGroup(let bg):
+            if let name = bg.clippingImage { set.insert(name.lowercased()) }
+            collectClipImageNames(from: bg.elements.compactMap { _ in nil }, into: &set)
+        case .subview(let sv):
+            collectClipImageNames(from: sv.children, into: &set)
+        default: break
+        }
+    }
+}
+
+// MARK: - Clip mask builder
+
+/// Builds a grayscale CGImage mask where pixels that are NOT "transparent" in the
+/// clipping image map to 255 (show) and "transparent" pixels map to 0 (clip away).
+/// WMP skins use white (r>240, g>240, b>240) as the clip-transparent colour in
+/// clippingImage files; magenta and zero-alpha are also treated as transparent.
+private func buildClipMask(from md: MapData) -> CGImage? {
+    let region = (0 ..< md.width * md.height).map { i -> Bool in
+        let o = i * 4
+        let r = md.bytes[o], g = md.bytes[o + 1], b = md.bytes[o + 2], a = md.bytes[o + 3]
+        guard a > 10 else { return false }
+        if isMagenta(r, g, b)                  { return false }
+        if r > 240 && g > 240 && b > 240       { return false } // white = transparent
+        return true
+    }
+    return makeGrayMask(region: region, width: md.width, height: md.height)
+}
+
+// MARK: - ButtonGroupAssets builder
+
+private func buildGroupAssets(_ group: ButtonGroup,
+                               mapData: [String: MapData]) -> ButtonGroupAssets {
+    guard let mapName = group.mappingImage,
+          let md = mapData[mapName.lowercased()]
+    else {
+        return ButtonGroupAssets(groupID: group.base.id, fullMask: nil, masks: [:])
+    }
+
+    let parsedColors: [(key: String, r: UInt8, g: UInt8, b: UInt8)] =
+        group.elements.compactMap { elem in
+            parseHexColor(elem.mappingColor).map { (elem.mappingColor.lowercased(), $0.0, $0.1, $0.2) }
+        }
+
+    var perButton: [String: [Bool]] = [:]
+    var fullRegion = [Bool](repeating: false, count: md.width * md.height)
+
+    for i in 0 ..< md.width * md.height {
+        let base = i * 4
+        let r = md.bytes[base], g = md.bytes[base + 1],
+            b = md.bytes[base + 2], a = md.bytes[base + 3]
+        guard a > 128, !isMagenta(r, g, b) else { continue }
+        for color in parsedColors where colorMatches(r, g, b, color.r, color.g, color.b) {
+            if perButton[color.key] == nil {
+                perButton[color.key] = [Bool](repeating: false, count: md.width * md.height)
+            }
+            perButton[color.key]![i] = true
+            fullRegion[i] = true
+            break
+        }
+    }
+
+    var masks: [String: CGImage] = [:]
+    for (colorKey, region) in perButton {
+        if let img = makeGrayMask(region: region, width: md.width, height: md.height) {
+            masks[colorKey] = img
+        }
+    }
+    let fullMask = makeGrayMask(region: fullRegion, width: md.width, height: md.height)
+
+    return ButtonGroupAssets(groupID: group.base.id, fullMask: fullMask, masks: masks)
+}
+
+// MARK: - Image loading
+
+private func loadMagentaFree(url: URL) -> NSImage? {
+    guard let raw = NSImage(contentsOf: url),
+          let cg  = raw.cgImage(forProposedRect: nil, context: nil, hints: nil),
+          let ctx = makeBitmapContext(width: cg.width, height: cg.height)
+    else { return nil }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+    guard let data = ctx.data else { return nil }
+    let pixels = data.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
+    for i in 0 ..< cg.width * cg.height {
+        let o = i * 4
+        if isMagenta(pixels[o], pixels[o + 1], pixels[o + 2]) {
+            pixels[o] = 0; pixels[o + 1] = 0; pixels[o + 2] = 0; pixels[o + 3] = 0
+        }
+    }
+    guard let result = ctx.makeImage() else { return nil }
+    return NSImage(cgImage: result, size: NSSize(width: cg.width, height: cg.height))
+}
+
+private func loadMapData(url: URL) -> MapData? {
+    guard let raw = NSImage(contentsOf: url),
+          let cg  = raw.cgImage(forProposedRect: nil, context: nil, hints: nil),
+          let ctx = makeBitmapContext(width: cg.width, height: cg.height)
+    else { return nil }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+    guard let data = ctx.data else { return nil }
+    let count = cg.width * cg.height * 4
+    let src = data.bindMemory(to: UInt8.self, capacity: count)
+    return MapData(bytes: Array(UnsafeBufferPointer(start: src, count: count)),
+                   width: cg.width, height: cg.height)
+}
+
+// MARK: - Mask building
+
+private func makeGrayMask(region: [Bool], width: Int, height: Int) -> CGImage? {
+    var bytes = [UInt8](repeating: 0, count: width * height)
+    for maskRow in 0 ..< height {
+        let srcRow = height - 1 - maskRow   // flip: CGContext draws bottom-up, view is flipped
+        for x in 0 ..< width {
+            bytes[maskRow * width + x] = region[srcRow * width + x] ? 255 : 0
+        }
+    }
+    guard let space = CGColorSpace(name: CGColorSpace.linearGray) else { return nil }
+    let cfData = Data(bytes) as CFData
+    guard let provider = CGDataProvider(data: cfData) else { return nil }
+    return CGImage(width: width, height: height,
+                   bitsPerComponent: 8, bitsPerPixel: 8,
+                   bytesPerRow: width,
+                   space: space,
+                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                   provider: provider,
+                   decode: nil,
+                   shouldInterpolate: false,
+                   intent: .defaultIntent)
+}
+
+// MARK: - Pixel helpers
+
+private func makeBitmapContext(width: Int, height: Int) -> CGContext? {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    return CGContext(data: nil,
+                     width: width, height: height,
+                     bitsPerComponent: 8, bytesPerRow: width * 4,
+                     space: space,
+                     bitmapInfo: CGBitmapInfo(
+                         rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).rawValue)
+}
