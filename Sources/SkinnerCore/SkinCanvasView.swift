@@ -28,6 +28,9 @@ public final class SkinCanvasView: NSView {
     private var engine: SkinScriptEngine?
     private var animatedSubviews: [String: NSImageView] = [:]   // element id → NSImageView
 
+    public var onOpenView:  ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
+    public var onCloseView: ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
+
     public override var isFlipped: Bool { true }
 
     // MARK: - Init
@@ -111,6 +114,11 @@ public final class SkinCanvasView: NSView {
                 var h  = lc.resolve(b.base.height) ?? CGFloat(md?.height ?? 0)
                 if w == 0, let d = md { w = CGFloat(d.width)  }
                 if h == 0, let d = md { h = CGFloat(d.height) }
+                // Fallback to image pixel size for buttons that have no explicit
+                // dimensions and no mapping image (e.g. close buttons in subviews).
+                let imgName = b.image ?? b.hoverImage ?? b.downImage
+                if w == 0, let n = imgName, let img = cache.images[n.lowercased()] { w = img.size.width  }
+                if h == 0, let n = imgName, let img = cache.images[n.lowercased()] { h = img.size.height }
                 result.append(RenderedButton(model: b,
                                              frame: CGRect(x: x, y: y, width: w, height: h),
                                              mapData: md,
@@ -121,8 +129,8 @@ public final class SkinCanvasView: NSView {
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
-                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
-                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
+                result += collectButtons(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
+                result += collectButtons(in: sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
             default: break
             }
         }
@@ -150,17 +158,19 @@ public final class SkinCanvasView: NSView {
                     if w == 0 { w = CGFloat(pd.width)  }
                     if h == 0 { h = CGFloat(pd.height) }
                 }
-                result.append(RenderedSlider(model: s,
-                                             frame: CGRect(x: x, y: y, width: w, height: h),
-                                             frameCount: fc))
+                var rs = RenderedSlider(model: s,
+                                        frame: CGRect(x: x, y: y, width: w, height: h),
+                                        frameCount: fc)
+                rs.value = resolvedSliderValue(s)
+                result.append(rs)
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
-                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
-                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
+                result += collectSliders(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
+                result += collectSliders(in: sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
             default: break
             }
         }
@@ -219,10 +229,18 @@ public final class SkinCanvasView: NSView {
                 let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let childOffset = CGPoint(x: sx, y: sy)
-                // Children whose z-index is lower than the parent's own z-index render
-                // behind the parent's background image (e.g. intro_anim under screen_cover).
-                let below = sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }
-                let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }
+                // Only children with an *explicitly set* zIndex lower than the parent's go
+                // behind the background image.  Children with no zIndex (defaulting to 0)
+                // always draw above the background — they are the normal case.
+                let below = sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }
+                let above = sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }
+                let alpha = effectiveAlpha(for: sv.base)
+                let needsAlpha = alpha < 255
+                if needsAlpha {
+                    ctx.saveGState()
+                    ctx.setAlpha(CGFloat(alpha) / 255.0)
+                    ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+                }
                 drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
                 // Skip if an animated NSImageView is handling this element.
@@ -240,6 +258,10 @@ public final class SkinCanvasView: NSView {
                 }
                 drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
+                if needsAlpha {
+                    ctx.endTransparencyLayer()
+                    ctx.restoreGState()
+                }
 
             case .buttonGroup(let bg):
                 guard !elementIsHidden(bg.base) else { continue }
@@ -261,9 +283,42 @@ public final class SkinCanvasView: NSView {
                     sliderIdx += 1
                 }
 
+            case .playlist(let p):
+                guard !elementIsHidden(p.base) else { continue }
+                let x = (lc.resolve(p.base.left) ?? 0) + offset.x
+                let y = (lc.resolve(p.base.top)  ?? 0) + offset.y
+                // Only fall back to full view dimensions when there is no attribute at all.
+                // If the attribute exists but can't be resolved (e.g. jscript:someProxy.width),
+                // skip drawing rather than covering the entire view.
+                let w: CGFloat
+                let h: CGFloat
+                if let rw = lc.resolve(p.base.width)        { w = rw }
+                else if p.base.width == nil                  { w = lc.viewWidth }
+                else                                         { continue }
+                if let rh = lc.resolve(p.base.height)       { h = rh }
+                else if p.base.height == nil                 { h = lc.viewHeight }
+                else                                         { continue }
+                let rect = NSRect(x: x, y: y, width: w, height: h)
+                let bg = parseAnyColor(p.backgroundColor ?? "#1a1a2e") ?? (0x1a, 0x1a, 0x2e)
+                NSColor(skinRGB: bg).setFill()
+                NSBezierPath.fill(rect)
+                let fg = parseAnyColor(p.foregroundColor ?? "#cccccc") ?? (0xcc, 0xcc, 0xcc)
+                drawCenteredText("Playlist", in: rect, color: NSColor(skinRGB: fg))
+
             default: break
             }
         }
+    }
+
+    private func drawCenteredText(_ text: String, in rect: NSRect, color: NSColor) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: color,
+            .font: NSFont.systemFont(ofSize: 11)
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let pt   = NSPoint(x: rect.midX - size.width / 2,
+                           y: rect.midY - size.height / 2)
+        (text as NSString).draw(at: pt, withAttributes: attrs)
     }
 
     // MARK: - Per-element drawing
@@ -277,8 +332,7 @@ public final class SkinCanvasView: NSView {
         let cgRect = CGRect(origin: rect.origin, size: rect.size)
 
         ctx.saveGState()
-        if let clip = group.clipMask  { ctx.clip(to: cgRect, mask: clip) }
-        if let full = group.assets.fullMask { ctx.clip(to: cgRect, mask: full) }
+        if let clip = group.clipMask { ctx.clip(to: cgRect, mask: clip) }
         normal.draw(in: rect)
         ctx.restoreGState()
 
@@ -322,6 +376,16 @@ public final class SkinCanvasView: NSView {
     }
 
     private func drawSlider(_ slider: RenderedSlider) {
+        if slider.model.positionImage != nil {
+            drawSpriteSlider(slider)
+        } else if slider.model.thumbImage != nil {
+            drawStandardSlider(slider)
+        } else if let name = slider.model.image, let img = cache.images[name.lowercased()] {
+            img.draw(in: slider.frame)
+        }
+    }
+
+    private func drawSpriteSlider(_ slider: RenderedSlider) {
         guard let name = slider.model.image,
               let img  = cache.images[name.lowercased()]
         else { return }
@@ -338,6 +402,47 @@ public final class SkinCanvasView: NSView {
             img.draw(in: dest, from: src, operation: .sourceOver, fraction: 1.0,
                      respectFlipped: true, hints: nil)
         }
+    }
+
+    private func drawStandardSlider(_ slider: RenderedSlider) {
+        let frame = slider.frame
+
+        if let trackName = slider.model.foregroundImage,
+           let track = cache.images[trackName.lowercased()] {
+            track.draw(in: frame)
+        }
+
+        guard let thumbName = slider.model.thumbImage,
+              let thumb = cache.images[thumbName.lowercased()] else { return }
+
+        let thumbW  = thumb.size.width
+        let thumbH  = thumb.size.height
+        let border  = CGFloat(slider.model.borderSize ?? 0)
+        let v       = slider.value
+        let vertical = slider.model.direction?.lowercased() == "vertical"
+
+        let thumbRect: NSRect
+        if vertical {
+            let travel = max(0, frame.height - thumbH - border * 2)
+            let thumbY = frame.minY + border + (1 - v) * travel
+            let thumbX = frame.minX + (frame.width - thumbW) / 2
+            thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
+        } else {
+            let travel = max(0, frame.width - thumbW - border * 2)
+            let thumbX = frame.minX + border + v * travel
+            let thumbY = frame.minY + (frame.height - thumbH) / 2
+            thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
+        }
+        thumb.draw(in: thumbRect)
+    }
+
+    private func resolvedSliderValue(_ s: Slider) -> Double {
+        let minV = s.min?.doubleValue ?? 0
+        let maxV = s.max?.doubleValue ?? 1
+        let rawV = s.value?.doubleValue   // nil for wmpprop: bindings → default center
+        let v    = rawV ?? ((minV + maxV) / 2)
+        guard maxV > minV else { return 0 }
+        return min(1, max(0, (v - minV) / (maxV - minV)))
     }
 
     // MARK: - Hit testing
@@ -437,7 +542,8 @@ public final class SkinCanvasView: NSView {
     private func fireGroupAction(_ group: RenderedGroup, colorKey: String) {
         let elem  = group.model.elements.first { $0.mappingColor.lowercased() == colorKey }
         let label = elem?.id ?? colorKey
-        print("[ACTION] \(group.model.base.id ?? "buttongroup") / \(label)")
+        if let script = elem?.onClick { engine?.evaluate(script) }
+        else { print("[ACTION] \(group.model.base.id ?? "buttongroup") / \(label)") }
     }
 
     private func fireButtonAction(_ button: RenderedButton) {
@@ -446,7 +552,8 @@ public final class SkinCanvasView: NSView {
         case .mute:    label = "mute"
         case .generic: label = button.model.base.id ?? button.model.base.onClick ?? button.model.image ?? "?"
         }
-        print("[ACTION] button / \(label)")
+        if let script = button.model.base.onClick { engine?.evaluate(script) }
+        else { print("[ACTION] button / \(label)") }
     }
 
     // MARK: - Animated GIF subviews
@@ -511,7 +618,8 @@ public final class SkinCanvasView: NSView {
             } else {
                 if let name = bgName, name.lowercased().hasSuffix(".gif"),
                    !cache.clipImageNames.contains(name.lowercased()),
-                   let img  = NSImage(contentsOf: bundle.assetURL(named: name)) {
+                   let img  = NSImage(contentsOf: bundle.assetURL(named: name)),
+                   gifIsAnimated(img) {
                     let w  = lc.resolve(sv.base.width)  ?? img.size.width
                     let h  = lc.resolve(sv.base.height) ?? img.size.height
                     let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
@@ -536,8 +644,15 @@ public final class SkinCanvasView: NSView {
             if let vis   = s.visible    { return !vis }
             if let alpha = s.alphaBlend, alpha == 0 { return true }
         }
+        if let alpha = base.alphaBlend, alpha == 0 { return true }
         guard case .literal(let str) = base.visible else { return false }
         return str.lowercased() == "false" || str == "0"
+    }
+
+    /// Returns the effective 0–255 alpha for a subview, checking script state first.
+    private func effectiveAlpha(for base: ElementBase) -> Int {
+        if let id = base.id, let s = engine?.state(for: id), let a = s.alphaBlend { return a }
+        return base.alphaBlend ?? 255
     }
 
     private func firstSubviewBgInfo(
@@ -622,8 +737,26 @@ private struct RenderedSlider {
 
 // MARK: - File-local helpers
 
+/// Returns true if the NSImage has more than one frame (i.e. is a real animated GIF).
+/// Single-frame GIFs used as shape masks return false and should be drawn by CGContext.
+private func gifIsAnimated(_ img: NSImage) -> Bool {
+    guard let rep = img.representations.first as? NSBitmapImageRep,
+          let count = rep.value(forProperty: .frameCount) as? Int
+    else { return false }
+    return count > 1
+}
+
 /// Stable sort by z-index ascending (no z-index → 0, document order preserved for ties).
 private func sortedByZIndex(_ elements: [SkinElement]) -> [SkinElement] {
     elements.sorted { ($0.base?.zIndex ?? 0) < ($1.base?.zIndex ?? 0) }
+}
+
+private extension NSColor {
+    convenience init(skinRGB: (UInt8, UInt8, UInt8)) {
+        self.init(red:   CGFloat(skinRGB.0) / 255,
+                  green: CGFloat(skinRGB.1) / 255,
+                  blue:  CGFloat(skinRGB.2) / 255,
+                  alpha: 1)
+    }
 }
 

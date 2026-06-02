@@ -6,7 +6,7 @@ final class SkinWindow: NSWindow {
 
     private(set) var skinCanvas: SkinCanvasView?
 
-    init(canvas: SkinCanvasView) {
+    init(canvas: SkinCanvasView, relativeTo parent: NSWindow? = nil) {
         let frame = canvas.frame
         super.init(
             contentRect: frame,
@@ -23,7 +23,13 @@ final class SkinWindow: NSWindow {
 
         contentView  = canvas
         skinCanvas   = canvas
-        center()
+
+        if let parent {
+            let pf = parent.frame
+            setFrameOrigin(NSPoint(x: pf.maxX + 8, y: pf.minY))
+        } else {
+            center()
+        }
     }
 
     override var canBecomeKey:  Bool { true }

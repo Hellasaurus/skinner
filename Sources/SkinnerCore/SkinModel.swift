@@ -22,6 +22,11 @@ public extension Theme {
         if let v = views.first(where: { lc.resolve($0.width) != nil && lc.resolve($0.height) != nil }) { return v }
         return views.first
     }
+
+    var eqView:    SkinView? { views.first { $0.id.lowercased().contains("eq") } }
+    var plView:    SkinView? { views.first { $0.id.lowercased().contains("pl") } }
+    var visView:   SkinView? { views.first { $0.id.lowercased().contains("vis") } }
+    var videoView: SkinView? { views.first { $0.id.lowercased().contains("vid") && !$0.id.lowercased().contains("prev") } }
 }
 
 // MARK: - SkinView
@@ -66,6 +71,7 @@ public struct ElementBase: Sendable {
     public var width: AttributeValue?
     public var height: AttributeValue?
     public var zIndex: Int?
+    public var alphaBlend: Int?
     public var visible: AttributeValue?
     public var enabled: AttributeValue?
     public var transparencyColor: String?

@@ -31,6 +31,9 @@ final class SkinScriptEngine {
     private let context: JSContext
     private var proxies: [String: JSValue] = [:]
 
+    var onOpenView:  ((String) -> Void)?
+    var onCloseView: ((String) -> Void)?
+
     // IDs used by host stubs — element proxies must not overwrite these.
     private static let hostIds: Set<String> = [
         "view", "player", "theme", "mediacenter", "event", "_prefs", "_EP"
@@ -81,6 +84,13 @@ final class SkinScriptEngine {
                 ctx.evaluateScript("try { \(handler) } catch(e) {}")
             }
         }
+    }
+
+    // MARK: - Script evaluation
+
+    func evaluate(_ script: String) {
+        guard !script.isEmpty else { return }
+        context.evaluateScript("try { \(script) } catch(e) {}")
     }
 
     // MARK: - State readback
@@ -155,8 +165,21 @@ final class SkinScriptEngine {
         let sizeCtx = LayoutContext(viewWidth: 0, viewHeight: 0)
         let w = Int(sizeCtx.resolve(skinView.width)  ?? 320)
         let h = Int(sizeCtx.resolve(skinView.height) ?? 240)
+        let viewId = skinView.id
+
+        // Swift→JS bridges injected first so theme/view stubs can reference them.
+        let openBridge: @convention(block) (String) -> Void = { [weak self] id in
+            self?.onOpenView?(id)
+        }
+        ctx.setObject(openBridge, forKeyedSubscript: "_skinnerOpenView" as NSString)
+
+        let closeBridge: @convention(block) (String) -> Void = { [weak self] id in
+            self?.onCloseView?(id)
+        }
+        ctx.setObject(closeBridge, forKeyedSubscript: "_skinnerCloseView" as NSString)
 
         // view — the current skin view; also aliased by the view's own id.
+        // view.close() calls back into Swift so the window manager can close the window.
         ctx.evaluateScript("""
         var view = {
             width: \(w), height: \(h),
@@ -164,7 +187,7 @@ final class SkinScriptEngine {
             timerInterval: 0,
             title: "",
             backgroundImage: "",
-            close: function() {}
+            close: function() { _skinnerCloseView('\(viewId)'); }
         };
         """)
         if !skinView.id.isEmpty, isValidJSIdentifier(skinView.id) {
@@ -210,7 +233,7 @@ final class SkinScriptEngine {
         };
         """)
 
-        // theme — loadPreference returns "--" (the "not set" sentinel skins expect).
+        // theme — openView/closeView call back into Swift via the bridges above.
         ctx.evaluateScript("""
         var _prefs = {};
         var theme = {
@@ -218,8 +241,8 @@ final class SkinScriptEngine {
             loadpreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
             savePreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
             savepreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
-            openView:        function(id) {},
-            closeView:       function(id) {},
+            openView:        function(id) { _skinnerOpenView(id); },
+            closeView:       function(id) { _skinnerCloseView(id); },
             openDialog:      function(t, f) { return null; },
             currentViewID:   ""
         };
@@ -231,6 +254,44 @@ final class SkinScriptEngine {
             videoZoom: 100, videoStretchToFit: true
         };
         var event = { keycode: 0, screenWidth: 1920, screenHeight: 1080 };
+        """)
+
+        // WMP system functions normally loaded from res://wmploc.dll — stub them here
+        // so skins that call toggleEQ()/togglePL() directly work without the DLL.
+        ctx.evaluateScript("""
+        function toggleView(viewId, prefKey) {
+            var open = theme.loadPreference(prefKey) === 'true';
+            if (open) {
+                theme.closeView(viewId);
+                theme.savePreference(prefKey, 'false');
+            } else {
+                theme.openView(viewId);
+                theme.savePreference(prefKey, 'true');
+            }
+        }
+        function closeView(prefKey) {
+            var viewId = prefKey.replace(/Viewer$/i, 'View');
+            theme.closeView(viewId);
+            theme.savePreference(prefKey, 'false');
+        }
+        function toggleEQ()    { toggleView('eqView',    'eqViewer'); }
+        function togglePL()    { toggleView('plView',    'plViewer'); }
+        function toggleVis()   { toggleView('visView',   'visViewer'); }
+        function toggleVideo() { toggleView('videoView', 'videoViewer'); }
+        """)
+
+        // EQ stub — gives sliders' value_onchange scripts a valid target.
+        ctx.evaluateScript("""
+        var eq = {
+            gainLevel1: 0, gainLevel2: 0, gainLevel3: 0, gainLevel4: 0, gainLevel5: 0,
+            gainLevel6: 0, gainLevel7: 0, gainLevel8: 0, gainLevel9: 0, gainLevel10: 0,
+            enableSplineTension: false, splineTension: 0,
+            presetCount: 0,
+            presetTitle:    function(i) { return ""; },
+            previousPreset: function()  {},
+            nextPreset:     function()  {},
+            reset:          function()  {}
+        };
         """)
     }
 

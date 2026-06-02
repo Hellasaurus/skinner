@@ -5,6 +5,10 @@ import SkinnerCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var window: SkinWindow?
+    private var theme:  Theme?
+    private var cache:  AssetCache?
+    private var bundle: SkinBundle?
+    private var secondaryWindows: [String: SkinWindow] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Accept a skin path from the command line, e.g.:
@@ -25,22 +29,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func open(_ url: URL) {
         do {
-            let bundle = try SkinLoader.load(from: url)
-            let theme  = try WMSParser.parse(contentsOf: bundle.wmsFile)
+            let b = try SkinLoader.load(from: url)
+            let t = try WMSParser.parse(contentsOf: b.wmsFile)
 
-            guard let view = theme.mainView else {
+            guard let view = t.mainView else {
                 showError("Skin has no views.")
                 return
             }
 
-            let cache  = AssetCache.build(from: bundle, theme: theme)
-            let canvas = SkinCanvasView(skinView: view, cache: cache, bundle: bundle)
+            let c      = AssetCache.build(from: b, theme: t)
+            theme      = t
+            cache      = c
+            bundle     = b
+
+            let canvas = SkinCanvasView(skinView: view, cache: c, bundle: b)
+            canvas.onOpenView  = { [weak self] id in self?.openSecondaryView(id) }
+            canvas.onCloseView = { [weak self] id in self?.closeSecondaryView(id) }
             window     = SkinWindow(canvas: canvas)
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         } catch {
             print("[Skinner] Load error: \(error)")
             showError(error.localizedDescription)
+        }
+    }
+
+    private func openSecondaryView(_ viewId: String) {
+        if let existing = secondaryWindows[viewId] {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        guard let skinView = theme?.views.first(where: { $0.id == viewId }),
+              let cache, let bundle else { return }
+        let canvas = SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
+        canvas.onOpenView  = { [weak self] id in self?.openSecondaryView(id) }
+        canvas.onCloseView = { [weak self] id in self?.closeSecondaryView(id) }
+        let win = SkinWindow(canvas: canvas, relativeTo: window)
+        secondaryWindows[viewId] = win
+        win.makeKeyAndOrderFront(nil)
+    }
+
+    private func closeSecondaryView(_ viewId: String) {
+        let key = secondaryWindows.keys.first {
+            $0 == viewId || viewId.contains($0) || $0.contains(viewId)
+        }
+        if let key {
+            secondaryWindows[key]?.close()
+            secondaryWindows[key] = nil
         }
     }
 

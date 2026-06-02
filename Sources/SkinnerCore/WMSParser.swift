@@ -360,6 +360,7 @@ private extension WMSParser {
             width: a.av("width"),
             height: a.av("height"),
             zIndex: a.int("zindex"),
+            alphaBlend: a.int("alphablend"),
             visible: a.av("visible"),
             enabled: a.av("enabled"),
             transparencyColor: a.str("transparencycolor"),
