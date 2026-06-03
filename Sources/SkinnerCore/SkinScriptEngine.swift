@@ -402,13 +402,15 @@ final class SkinScriptEngine {
         function toggleVideo() { toggleView('videoView', 'videoViewer'); }
         """)
 
-        // EQ stub — gives sliders' value_onchange scripts a valid target.
+        // EQ stub — properties are later replaced by live getters/setters in rewirePlayer.
         ctx.evaluateScript("""
         var eq = {
             gainLevel1: 0, gainLevel2: 0, gainLevel3: 0, gainLevel4: 0, gainLevel5: 0,
             gainLevel6: 0, gainLevel7: 0, gainLevel8: 0, gainLevel9: 0, gainLevel10: 0,
             enableSplineTension: false, splineTension: 0,
+            enabled: true,
             presetCount: 0,
+            currentPresetTitle: "",
             presetTitle:    function(i) { return ""; },
             previousPreset: function()  {},
             nextPreset:     function()  {},
@@ -587,6 +589,41 @@ final class SkinScriptEngine {
             }
         }
 
+        // EQ
+        let getEQEnabled: @convention(block) () -> Bool = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.eqEnabled ?? false }
+        }
+        let setEQEnabled: @convention(block) (Bool) -> Void = { [weak self] v in
+            MainActor.assumeIsolated { self?.playerBackend?.eqEnabled = v }
+        }
+        let getEQGain: @convention(block) (Int) -> Double = { [weak self] band in
+            MainActor.assumeIsolated {
+                let b = max(1, min(10, band))
+                return Double(self?.playerBackend?.eqBands[b - 1].gain ?? 0)
+            }
+        }
+        let setEQGain: @convention(block) (Int, Double) -> Void = { [weak self] band, gain in
+            MainActor.assumeIsolated { self?.playerBackend?.setEQGain(Float(gain), band: band) }
+        }
+        let getEQPresetCount: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.eqPresetCount ?? 0 }
+        }
+        let getEQPresetTitleAt: @convention(block) (Int) -> String = { [weak self] i in
+            MainActor.assumeIsolated { self?.playerBackend?.eqPresetTitle(at: i) ?? "" }
+        }
+        let eqNextPreset: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.nextEQPreset() }
+        }
+        let eqPrevPreset: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.previousEQPreset() }
+        }
+        let eqReset: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.resetEQ() }
+        }
+        let getEQPresetTitle: @convention(block) () -> String = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentEQPresetTitle ?? "" }
+        }
+
         for (name, val): (NSString, Any) in [
             ("_skinnerGetPlayState",      getPlayState),    ("_skinnerGetOpenState",  getOpenState),
             ("_skinnerGetURL",            getURL),          ("_skinnerGetPosition",   getPosition),
@@ -600,6 +637,12 @@ final class SkinScriptEngine {
             ("_skinnerPrevious",     doPrevious),   ("_skinnerSeekTo",       seekTo),
             ("_skinnerSetVolume",    setVolume),    ("_skinnerSetBalance",   setBalance),
             ("_skinnerSetMute",      setMute),      ("_skinnerOpenURL",      openURL),
+            ("_skinnerGetEQEnabled",      getEQEnabled),   ("_skinnerSetEQEnabled",    setEQEnabled),
+            ("_skinnerGetEQGain",         getEQGain),      ("_skinnerSetEQGain",       setEQGain),
+            ("_skinnerGetEQPresetCount",  getEQPresetCount),
+            ("_skinnerGetEQPresetTitleAt",getEQPresetTitleAt),
+            ("_skinnerEQNextPreset",      eqNextPreset),   ("_skinnerEQPrevPreset",    eqPrevPreset),
+            ("_skinnerEQReset",           eqReset),        ("_skinnerGetEQPresetTitle",getEQPresetTitle),
         ] { context.setObject(val, forKeyedSubscript: name) }
 
         context.evaluateScript("""
@@ -646,6 +689,35 @@ final class SkinScriptEngine {
         player.currentMedia.getiteminfo = function(k) { return _skinnerGetItemInfo(k); };
         player.currentmedia = player.currentMedia;
         """)
+
+        // Wire the eq object's band gains and preset methods to the live backend.
+        context.evaluateScript("""
+        (function() {
+            for (var _b = 1; _b <= 10; _b++) {
+                (function(band) {
+                    Object.defineProperty(eq, 'gainLevel' + band, {
+                        get: function()  { return _skinnerGetEQGain(band); },
+                        set: function(v) { _skinnerSetEQGain(band, v); },
+                        configurable: true
+                    });
+                })(_b);
+            }
+            Object.defineProperty(eq, 'enabled', {
+                get: function()  { return _skinnerGetEQEnabled(); },
+                set: function(v) { _skinnerSetEQEnabled(v); },
+                configurable: true
+            });
+            Object.defineProperty(eq, 'currentPresetTitle', {
+                get: function() { return _skinnerGetEQPresetTitle(); },
+                configurable: true
+            });
+            eq.presetCount    = _skinnerGetEQPresetCount();
+            eq.presetTitle    = function(i) { return _skinnerGetEQPresetTitleAt(i); };
+            eq.nextPreset     = function()  { _skinnerEQNextPreset(); };
+            eq.previousPreset = function()  { _skinnerEQPrevPreset(); };
+            eq.reset          = function()  { _skinnerEQReset(); };
+        })();
+        """)
     }
 
     private func subscribeToBackend(_ backend: any PlayerBackend) {
@@ -673,6 +745,13 @@ final class SkinScriptEngine {
                 guard let self else { return }
                 if let script = self.playerCallbacks?.controls?.currentPositionOnChange { self.evaluate(script) }
                 self.onStateChanged?()
+            }
+            .store(in: &backendCancellables)
+
+        backend.eqPublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.onStateChanged?()
             }
             .store(in: &backendCancellables)
     }

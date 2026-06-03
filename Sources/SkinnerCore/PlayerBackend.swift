@@ -14,6 +14,19 @@ public enum OpenState: Int, Sendable {
     case mediaOpen  = 13
 }
 
+// MARK: - EQ
+
+public struct EQBand: Sendable {
+    public let centerFrequency: Float   // Hz
+    public var gain: Float              // dB, –14…+14
+    public init(centerFrequency: Float, gain: Float) {
+        self.centerFrequency = centerFrequency
+        self.gain = gain
+    }
+}
+
+// MARK: - PlayerBackend
+
 @MainActor
 public protocol PlayerBackend: AnyObject {
     var playState: PlayState { get }
@@ -39,4 +52,19 @@ public protocol PlayerBackend: AnyObject {
     func next()
     func previous()
     func seek(to position: Double)
+
+    // EQ
+    var eqEnabled: Bool { get set }
+    var eqBands: [EQBand] { get }              // 10 elements; index 0–9 = band 1–10
+    func setEQGain(_ gain: Float, band: Int)   // band: 1–10
+
+    var eqPresetCount: Int { get }
+    func eqPresetTitle(at index: Int) -> String
+    func applyEQPreset(at index: Int)
+    var currentEQPresetTitle: String { get }
+    func nextEQPreset()
+    func previousEQPreset()
+    func resetEQ()
+
+    var eqPublisher: AnyPublisher<Void, Never> { get }
 }

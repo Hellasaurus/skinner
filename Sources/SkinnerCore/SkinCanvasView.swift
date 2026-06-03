@@ -101,7 +101,21 @@ public final class SkinCanvasView: NSView {
                     sliders[i].value = min(1, max(0, (rv - minV) / (maxV - minV)))
                 }
             case .generic:
-                break
+                // Generic <slider> elements may carry wmpprop/jsExpr value bindings (e.g. EQ band sliders).
+                // Only update when such a binding is present; otherwise preserve the drag position.
+                guard let eng = engine else { break }
+                var raw: Double? = nil
+                switch sliders[i].model.value {
+                case .wmpProp(let expr): raw = eng.evaluateNumber(expr).map(Double.init)
+                case .jsExpr(let expr):  raw = eng.evaluateNumber(expr).map(Double.init)
+                default: break
+                }
+                if let rv = raw {
+                    let minV = resolveSliderBound(sliders[i].model.min) ?? 0
+                    let maxV = resolveSliderBound(sliders[i].model.max) ?? 100
+                    guard maxV > minV else { break }
+                    sliders[i].value = min(1, max(0, (rv - minV) / (maxV - minV)))
+                }
             }
         }
     }
@@ -708,15 +722,19 @@ public final class SkinCanvasView: NSView {
         let v       = slider.value
         let vertical = slider.model.direction?.lowercased() == "vertical"
 
+        // borderSize is the distance from each edge to the thumb's CENTER at the extremes.
+        // The thumb image can slightly clip at the edges; clamp to stay within the frame.
         let thumbRect: NSRect
         if vertical {
-            let travel = max(0, frame.height - thumbH - border * 2)
-            let thumbY = frame.minY + border + (1 - v) * travel
+            let travel = max(0, frame.height - border * 2)
+            let rawY   = frame.minY + border + (1 - v) * travel - thumbH / 2
+            let thumbY = max(frame.minY, min(frame.maxY - thumbH, rawY))
             let thumbX = frame.minX + (frame.width - thumbW) / 2
             thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
         } else {
-            let travel = max(0, frame.width - thumbW - border * 2)
-            let thumbX = frame.minX + border + v * travel
+            let travel = max(0, frame.width - border * 2)
+            let rawX   = frame.minX + border + v * travel - thumbW / 2
+            let thumbX = max(frame.minX, min(frame.maxX - thumbW, rawX))
             let thumbY = frame.minY + (frame.height - thumbH) / 2
             thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
         }
@@ -857,15 +875,14 @@ public final class SkinCanvasView: NSView {
         }
 
         // Standard (thumb) slider: map cursor position along the track.
+        // borderSize is the thumb-center-to-edge distance, so travel = dimension - 2*border.
         let border = CGFloat(slider.model.borderSize ?? 0)
         let vertical = slider.model.direction?.lowercased() == "vertical"
-        let thumbW = slider.model.thumbImage.flatMap { cache.images[$0.lowercased()]?.size.width  } ?? 0
-        let thumbH = slider.model.thumbImage.flatMap { cache.images[$0.lowercased()]?.size.height } ?? 0
         if vertical {
-            let travel = max(1, slider.frame.height - thumbH - border * 2)
+            let travel = max(1, slider.frame.height - border * 2)
             return min(1, max(0, 1 - (CGFloat(ly) - border) / travel))
         } else {
-            let travel = max(1, slider.frame.width - thumbW - border * 2)
+            let travel = max(1, slider.frame.width - border * 2)
             return min(1, max(0, (CGFloat(lx) - border) / travel))
         }
     }
