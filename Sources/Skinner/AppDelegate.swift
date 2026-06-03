@@ -44,7 +44,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let canvas = SkinCanvasView(skinView: view, cache: c, bundle: b)
             canvas.onOpenView  = { [weak self] id in self?.openSecondaryView(id) }
-            canvas.onCloseView = { [weak self] id in self?.closeSecondaryView(id) }
+            let mainId = view.id
+            canvas.onCloseView = { [weak self] id in
+                if id == mainId { self?.window?.close() }
+                else            { self?.closeSecondaryView(id) }
+            }
             window     = SkinWindow(canvas: canvas)
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)

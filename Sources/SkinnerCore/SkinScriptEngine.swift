@@ -70,18 +70,20 @@ final class SkinScriptEngine {
             }
         }
 
-        // Fire onLoad, then pump the timer up to 256 ticks synchronously.
-        // 256 covers frame-sequence intros (Batman Begins needs 155 ticks to
-        // complete its 154-frame PNG intro before the main UI becomes visible).
-        // Wrap each call in JS try/catch so a mid-handler exception doesn't
-        // suppress property writes that already ran before the throw.
+        // Fire onLoad, then pump the timer synchronously to fast-forward past intro animations.
+        // Stop early when the skin sets view.timerInterval = 0 (its "animation done" signal).
+        // Cap at 1024 ticks to handle long intros (Alienware Invader uses 569 frames;
+        // Batman Begins needs 155). Wrap each call in JS try/catch so a mid-handler
+        // exception doesn't suppress property writes that already ran before the throw.
         if let handler = skinView.onLoad, !handler.isEmpty {
             ctx.evaluateScript("try { \(handler) } catch(e) {}")
         }
         if let interval = skinView.timerInterval, interval > 0,
            let handler  = skinView.onTimer, !handler.isEmpty {
-            for _ in 0 ..< 256 {
+            for _ in 0 ..< 1024 {
                 ctx.evaluateScript("try { \(handler) } catch(e) {}")
+                if let ti = ctx.evaluateScript("view.timerInterval"),
+                   ti.isNumber, ti.toInt32() == 0 { break }
             }
         }
     }
@@ -91,6 +93,22 @@ final class SkinScriptEngine {
     func evaluate(_ script: String) {
         guard !script.isEmpty else { return }
         context.evaluateScript("try { \(script) } catch(e) {}")
+    }
+
+    /// Evaluates a JS expression and returns its value as a CGFloat, or nil if the
+    /// expression throws, is not a number, or is NaN. Used to resolve `jscript:`
+    /// layout attributes (e.g. `iVolumeSmallLeft`) against the live global scope.
+    func evaluateNumber(_ expr: String) -> CGFloat? {
+        guard !expr.isEmpty else { return nil }
+        // WMS JScript attribute values often end with ";".  Wrapping as `(EXPR;)` causes
+        // a SyntaxError in JavaScriptCore, so strip any trailing semicolons first.
+        var cleanExpr = expr.trimmingCharacters(in: .whitespaces)
+        while cleanExpr.hasSuffix(";") { cleanExpr = String(cleanExpr.dropLast()) }
+        guard !cleanExpr.isEmpty else { return nil }
+        let js = "(function(){ try { var _r=(\(cleanExpr)); return (typeof _r==='number'&&!isNaN(_r))?_r:NaN; } catch(e){ return NaN; } })()"
+        guard let result = context.evaluateScript(js), result.isNumber else { return nil }
+        let v = result.toDouble()
+        return v.isNaN ? nil : CGFloat(v)
     }
 
     // MARK: - State readback
@@ -180,14 +198,17 @@ final class SkinScriptEngine {
 
         // view — the current skin view; also aliased by the view's own id.
         // view.close() calls back into Swift so the window manager can close the window.
+        let timerInterval = skinView.timerInterval ?? 0
         ctx.evaluateScript("""
         var view = {
             width: \(w), height: \(h),
             minWidth: \(w), minHeight: \(h),
-            timerInterval: 0,
+            timerInterval: \(timerInterval),
             title: "",
             backgroundImage: "",
-            close: function() { _skinnerCloseView('\(viewId)'); }
+            close:               function() { _skinnerCloseView('\(viewId)'); },
+            minimize:            function() {},
+            returnToMediaCenter: function() {}
         };
         """)
         if !skinView.id.isEmpty, isValidJSIdentifier(skinView.id) {
@@ -241,6 +262,8 @@ final class SkinScriptEngine {
             loadpreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
             savePreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
             savepreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
+            loadString:      function(res) { return ""; },
+            loadstring:      function(res) { return ""; },
             openView:        function(id) { _skinnerOpenView(id); },
             closeView:       function(id) { _skinnerCloseView(id); },
             openDialog:      function(t, f) { return null; },
@@ -303,25 +326,25 @@ final class SkinScriptEngine {
         for element in elements {
             switch element {
             case .subview(let sv):
-                if let id = sv.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = sv.base.id { registerProxy(id: id, base: sv.base, in: ctx, reserved: reserved) }
                 registerElements(sv.children, in: ctx, reserved: reserved)
             case .button(let b):
-                if let id = b.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = b.base.id { registerProxy(id: id, base: b.base, in: ctx, reserved: reserved) }
             case .buttonGroup(let bg):
-                if let id = bg.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = bg.base.id { registerProxy(id: id, base: bg.base, in: ctx, reserved: reserved) }
                 for elem in bg.elements {
-                    if let id = elem.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                    if let id = elem.id { registerProxy(id: id, base: nil, in: ctx, reserved: reserved) }
                 }
             case .slider(let s):
-                if let id = s.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = s.base.id { registerProxy(id: id, base: s.base, in: ctx, reserved: reserved) }
             case .text(let t):
-                if let id = t.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = t.base.id { registerProxy(id: id, base: t.base, in: ctx, reserved: reserved) }
             case .effects(let e):
-                if let id = e.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = e.base.id { registerProxy(id: id, base: e.base, in: ctx, reserved: reserved) }
             case .video(let v):
-                if let id = v.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = v.base.id { registerProxy(id: id, base: v.base, in: ctx, reserved: reserved) }
             case .playlist(let p):
-                if let id = p.base.id { registerProxy(id: id, in: ctx, reserved: reserved) }
+                if let id = p.base.id { registerProxy(id: id, base: p.base, in: ctx, reserved: reserved) }
             case .unknown(_, _, let children):
                 registerElements(children, in: ctx, reserved: reserved)
             case .player, .equalizerSettings, .videoSettings:
@@ -330,7 +353,7 @@ final class SkinScriptEngine {
         }
     }
 
-    private func registerProxy(id: String, in ctx: JSContext, reserved: Set<String>) {
+    private func registerProxy(id: String, base: ElementBase?, in ctx: JSContext, reserved: Set<String>) {
         guard !id.isEmpty,
               isValidJSIdentifier(id),
               !reserved.contains(id),
@@ -338,6 +361,19 @@ final class SkinScriptEngine {
         else { return }
 
         guard let proxy = ctx.evaluateScript("Object.create(_EP)") else { return }
+
+        // Seed literal layout properties so sibling-reference JScript expressions
+        // (e.g. "view.width - svStub.width - svMain.left") resolve correctly before
+        // any onLoad script runs and potentially overwrites them.
+        if let b = base {
+            if case .literal(let s) = b.left,   let v = Double(s) { proxy.setValue(v,   forProperty: "left") }
+            if case .literal(let s) = b.top,    let v = Double(s) { proxy.setValue(v,   forProperty: "top") }
+            if case .literal(let s) = b.width,  let v = Double(s) { proxy.setValue(v,   forProperty: "width") }
+            if case .literal(let s) = b.height, let v = Double(s) { proxy.setValue(v,   forProperty: "height") }
+            if let vis = b.visible, let bv = vis.boolValue        { proxy.setValue(bv,  forProperty: "visible") }
+            if let alpha = b.alphaBlend { proxy.setValue(alpha, forProperty: "alphaBlend") }
+        }
+
         proxies[id] = proxy
         ctx.globalObject?.setValue(proxy, forProperty: id)
     }

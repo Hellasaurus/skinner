@@ -23,6 +23,7 @@ public final class SkinCanvasView: NSView {
     private var bgOpacity: [Bool]           = []
     private var bgWidth    = 0
     private var bgHeight   = 0
+    private var bgMask:    CGImage?         = nil
     private let bundle: SkinBundle?
     private var dragOrigin: NSPoint?
     private var engine: SkinScriptEngine?
@@ -41,8 +42,9 @@ public final class SkinCanvasView: NSView {
         self.bundle   = bundle                 // stored before super.init (let property)
 
         let sizeCtx = LayoutContext(viewWidth: 0, viewHeight: 0)
-        let w = sizeCtx.resolve(skinView.width)  ?? 320
-        let h = sizeCtx.resolve(skinView.height) ?? 240
+        let bgImg = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
+        let w = sizeCtx.resolve(skinView.width)  ?? bgImg?.size.width  ?? 320
+        let h = sizeCtx.resolve(skinView.height) ?? bgImg?.size.height ?? 240
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
 
         engine = bundle.flatMap { SkinScriptEngine(skinView: skinView, bundle: $0) }
@@ -60,6 +62,18 @@ public final class SkinCanvasView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    // MARK: - Layout helpers
+
+    /// Resolves a layout coordinate attribute. Falls back to evaluating the JS
+    /// expression in the live engine when `LayoutContext` alone can't resolve it
+    /// (e.g. bare global variable names like `iVolumeSmallLeft`).
+    private func resolveCoord(_ av: AttributeValue?, lc: LayoutContext) -> CGFloat? {
+        guard let av else { return nil }
+        if let v = lc.resolve(av) { return v }
+        if case .jsExpr(let expr) = av { return engine?.evaluateNumber(expr) }
+        return nil
+    }
 
     // MARK: - Collection
 
@@ -88,8 +102,8 @@ public final class SkinCanvasView: NSView {
                                             clipMask: clipMask))
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
-                let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
                 result += collectGroups(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc)
             default: break
             }
@@ -125,8 +139,8 @@ public final class SkinCanvasView: NSView {
                                              clipMask: clipMask))
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
-                let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
                 result += collectButtons(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
@@ -165,8 +179,8 @@ public final class SkinCanvasView: NSView {
                 result.append(rs)
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
-                let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
                 result += collectSliders(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
@@ -180,18 +194,100 @@ public final class SkinCanvasView: NSView {
     // MARK: - Background opacity map
 
     private func buildBgOpacity() {
-        guard let info = firstSubviewBgInfo(in: skinView.elements),
-              let md   = cache.mapData[info.name.lowercased()]
-        else { return }
-        bgWidth  = md.width
-        bgHeight = md.height
-        let extraColors = info.transparentColors
-        bgOpacity = (0 ..< md.width * md.height).map { i in
-            let o = i * 4
-            let r = md.bytes[o], g = md.bytes[o + 1], b = md.bytes[o + 2]
-            guard md.bytes[o + 3] > 128, !isMagenta(r, g, b) else { return false }
-            if extraColors.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { return false }
-            return true
+        let vw = Int(bounds.width), vh = Int(bounds.height)
+        guard vw > 0, vh > 0 else { return }
+        bgWidth  = vw
+        bgHeight = vh
+        bgOpacity = Array(repeating: false, count: vw * vh)
+        // Paint view-level background image at its natural pixel size.
+        // The declared view width/height may exceed the image (e.g. Tomb Raider 2), but
+        // WMP always draws background images unscaled — the view size sets the window region.
+        if let imgName = skinView.backgroundImage,
+           let md = cache.mapData[imgName.lowercased()] {
+            let extra: [(UInt8, UInt8, UInt8)] = [skinView.clippingColor, skinView.transparencyColor]
+                .compactMap { $0.flatMap(parseAnyColor) }
+            paintMdIntoOpacity(md: md, ox: 0, oy: 0, extraColors: extra)
+        }
+        let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+        paintBgOpacity(in: skinView.elements, lc: lc, offset: .zero)
+        bgMask = makeBgMask()
+    }
+
+    /// Converts the boolean `bgOpacity` map into a CGImage mask suitable for
+    /// `CGContext.clip(to:mask:)`.  bgOpacity uses flipped coords (row 0 = visual
+    /// top); the mask is consumed in a flipped CGContext (isFlipped=true) where row 0
+    /// also lands at the visual top, so no row mirroring is needed.
+    private func makeBgMask() -> CGImage? {
+        guard bgWidth > 0, bgHeight > 0 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: bgWidth * bgHeight)
+        for i in 0 ..< bgWidth * bgHeight {
+            bytes[i] = bgOpacity[i] ? 255 : 0
+        }
+        guard let space    = CGColorSpace(name: CGColorSpace.linearGray),
+              let provider = CGDataProvider(data: Data(bytes) as CFData)
+        else { return nil }
+        return CGImage(width: bgWidth, height: bgHeight,
+                       bitsPerComponent: 8, bitsPerPixel: 8,
+                       bytesPerRow: bgWidth,
+                       space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                       provider: provider,
+                       decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// Paints one image's non-transparent pixels into the composite opacity map.
+    ///
+    /// `dstW`/`dstH` let the caller specify the destination size when the image will
+    /// be drawn scaled (e.g. a view background drawn with `img.draw(in: bounds)`).
+    /// Defaults to the MapData's own pixel dimensions (no scaling).
+    ///
+    /// Row order: MapData stores rows in CGContext order (row 0 = visual bottom).
+    /// bgOpacity uses flipped view order (row 0 = visual top). The two are mirrored here.
+    private func paintMdIntoOpacity(md: MapData, ox: Int, oy: Int,
+                                     dstW: Int = 0, dstH: Int = 0,
+                                     extraColors: [(UInt8, UInt8, UInt8)]) {
+        let destW = dstW > 0 ? dstW : md.width
+        let destH = dstH > 0 ? dstH : md.height
+
+        for viewRow in 0 ..< destH {
+            let vy = oy + viewRow
+            guard vy >= 0, vy < bgHeight else { continue }
+            // viewRow 0 = visual top; CGContext row 0 = visual bottom → mirror
+            let srcVisRow = min(md.height - 1, viewRow * md.height / destH)
+            let cgRow     = md.height - 1 - srcVisRow
+
+            for viewCol in 0 ..< destW {
+                let vx = ox + viewCol
+                guard vx >= 0, vx < bgWidth else { continue }
+                let srcCol = min(md.width - 1, viewCol * md.width / destW)
+
+                let i = (cgRow * md.width + srcCol) * 4
+                let r = md.bytes[i], g = md.bytes[i+1], b = md.bytes[i+2], a = md.bytes[i+3]
+                guard a > 128, !isMagenta(r, g, b) else { continue }
+                if extraColors.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { continue }
+                bgOpacity[vy * bgWidth + vx] = true
+            }
+        }
+    }
+
+    /// Recursively paints every subview's background image into the composite opacity
+    /// map. MapData rows are in CGContext order (row 0 = visual bottom); flipped view
+    /// coords use row 0 = visual top, so each row index is mirrored when stored.
+    private func paintBgOpacity(in elements: [SkinElement],
+                                 lc: LayoutContext,
+                                 offset: CGPoint) {
+        for element in elements {
+            guard case .subview(let sv) = element, !elementIsHidden(sv.base) else { continue }
+            let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+            let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+            if let imgName = sv.backgroundImage,
+               let md = cache.mapData[imgName.lowercased()] {
+                let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
+                    .compactMap { $0.flatMap(parseAnyColor) }
+                paintMdIntoOpacity(md: md, ox: Int(sx), oy: Int(sy), extraColors: extra)
+            }
+            paintBgOpacity(in: sv.children, lc: lc, offset: CGPoint(x: sx, y: sy))
         }
     }
 
@@ -208,6 +304,20 @@ public final class SkinCanvasView: NSView {
     public override func draw(_ dirtyRect: NSRect) {
         let lc  = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        if let name = skinView.backgroundImage, let img = cache.images[name.lowercased()] {
+            // Draw at natural pixel size — view width/height may exceed the image (e.g. Tomb Raider 2).
+            let imgRect = NSRect(x: 0, y: 0, width: img.size.width, height: img.size.height)
+            if let mask = bgMask {
+                ctx.saveGState()
+                // Clip to full bounds so the mask CGImage (view-size) is not scaled.
+                // Pixels outside imgRect are never drawn, so the wider clip is harmless.
+                ctx.clip(to: bounds, mask: mask)
+                img.draw(in: imgRect)
+                ctx.restoreGState()
+            } else {
+                img.draw(in: imgRect)
+            }
+        }
         var bi = 0
         var si = 0
         drawElements(skinView.elements, offset: .zero, lc: lc, ctx: ctx,
@@ -225,8 +335,8 @@ public final class SkinCanvasView: NSView {
 
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (lc.resolve(sv.base.left) ?? 0) + offset.x
-                let sy = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let childOffset = CGPoint(x: sx, y: sy)
                 // Only children with an *explicitly set* zIndex lower than the parent's go
@@ -236,8 +346,21 @@ public final class SkinCanvasView: NSView {
                 let above = sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }
                 let alpha = effectiveAlpha(for: sv.base)
                 let needsAlpha = alpha < 255
+                // Clip children to the subview's declared bounds when both dimensions are
+                // literal values.  This implements the sprite-font viewport: a narrow parent
+                // subview (e.g. width=11) wrapping a full sprite-sheet button (width=110)
+                // shows only one digit-column at a time.  JS scrolls the button's left
+                // position to select the displayed digit.  Subviews with JS-computed sizes
+                // (jscript:…) resolve to nil and are not clipped.
+                let clipW = lc.resolve(sv.base.width)
+                let clipH = lc.resolve(sv.base.height)
+                let needsClip = clipW != nil && clipH != nil
+                let needsGState = needsClip || needsAlpha
+                if needsGState { ctx.saveGState() }
+                if needsClip {
+                    ctx.clip(to: CGRect(x: sx, y: sy, width: clipW!, height: clipH!))
+                }
                 if needsAlpha {
-                    ctx.saveGState()
                     ctx.setAlpha(CGFloat(alpha) / 255.0)
                     ctx.beginTransparencyLayer(auxiliaryInfo: nil)
                 }
@@ -258,10 +381,8 @@ public final class SkinCanvasView: NSView {
                 }
                 drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
-                if needsAlpha {
-                    ctx.endTransparencyLayer()
-                    ctx.restoreGState()
-                }
+                if needsAlpha { ctx.endTransparencyLayer() }
+                if needsGState { ctx.restoreGState() }
 
             case .buttonGroup(let bg):
                 guard !elementIsHidden(bg.base) else { continue }
@@ -333,6 +454,7 @@ public final class SkinCanvasView: NSView {
 
         ctx.saveGState()
         if let clip = group.clipMask { ctx.clip(to: cgRect, mask: clip) }
+        if let full = group.assets.fullMask { ctx.clip(to: cgRect, mask: full) }
         normal.draw(in: rect)
         ctx.restoreGState()
 
@@ -365,13 +487,19 @@ public final class SkinCanvasView: NSView {
         else if button.isHovered { name = button.model.hoverImage ?? button.model.image }
         else                     { name = button.model.image }
         guard let n = name, let img = cache.images[n.lowercased()] else { return }
+        // Draw at natural pixel size from the button origin.  The declared button
+        // width/height defines the interaction area; the parent subview's clip rect
+        // (set in drawElements) acts as the viewport — this is how sprite-font digit
+        // buttons work: a wide sprite sheet is scrolled behind a narrow clip window.
+        let drawRect = NSRect(x: button.frame.minX, y: button.frame.minY,
+                              width: img.size.width, height: img.size.height)
         if let clip = button.clipMask {
             ctx.saveGState()
-            ctx.clip(to: button.frame, mask: clip)
-            img.draw(in: button.frame)
+            ctx.clip(to: drawRect, mask: clip)
+            img.draw(in: drawRect)
             ctx.restoreGState()
         } else {
-            img.draw(in: button.frame)
+            img.draw(in: drawRect)
         }
     }
 
@@ -449,8 +577,8 @@ public final class SkinCanvasView: NSView {
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
         guard bgWidth > 0 else { return super.hitTest(point) }
-        let px = Int(point.x)
-        let py = bgHeight - 1 - Int(point.y)  // superview is non-flipped; row 0 is top of image
+        // point arrives in flipped view coords (y=0 at top); composite map uses same convention.
+        let px = Int(point.x), py = Int(point.y)
         guard px >= 0, px < bgWidth, py >= 0, py < bgHeight else { return nil }
         guard bgOpacity[py * bgWidth + px] else { return nil }
         return super.hitTest(point)
@@ -576,8 +704,8 @@ public final class SkinCanvasView: NSView {
         for element in sortedByZIndex(elements) {
             guard case .subview(let sv) = element else { continue }
             guard !elementIsHidden(sv.base) else { continue }
-            let x = (lc.resolve(sv.base.left) ?? 0) + offset.x
-            let y = (lc.resolve(sv.base.top)  ?? 0) + offset.y
+            let x = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
+            let y = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
             let co = CGPoint(x: x, y: y)
 
             let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
@@ -655,21 +783,6 @@ public final class SkinCanvasView: NSView {
         return base.alphaBlend ?? 255
     }
 
-    private func firstSubviewBgInfo(
-        in elements: [SkinElement]
-    ) -> (name: String, transparentColors: [(UInt8, UInt8, UInt8)])? {
-        for element in elements {
-            if case .subview(let sv) = element, !elementIsHidden(sv.base) {
-                if let img = sv.backgroundImage {
-                    let colors = [sv.clippingColor, sv.base.transparencyColor]
-                        .compactMap { $0.flatMap(parseAnyColor) }
-                    return (img, colors)
-                }
-                if let info = firstSubviewBgInfo(in: sv.children) { return info }
-            }
-        }
-        return nil
-    }
 }
 
 // MARK: - RenderedGroup

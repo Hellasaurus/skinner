@@ -40,6 +40,9 @@ public struct SkinView: Sendable {
     public var titleBar: Bool
     public var resizable: Bool
     public var backgroundColor: String?
+    public var backgroundImage: String?
+    public var clippingColor: String?
+    public var transparencyColor: String?
     public var scriptFile: String?
     public var timerInterval: Int?
     public var onLoad: String?
