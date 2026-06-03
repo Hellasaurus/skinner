@@ -72,6 +72,8 @@ public final class SkinCanvasView: NSView {
         guard let backend = playerBackend else { return }
         let dur = backend.duration
         for i in sliders.indices {
+            // Don't override display position of the actively-dragged slider.
+            if i == activeSliderIdx { continue }
             switch sliders[i].model.kind {
             case .seek:
                 sliders[i].value = dur > 0 ? min(1, max(0, backend.currentPosition / dur)) : 0
@@ -158,6 +160,15 @@ public final class SkinCanvasView: NSView {
         return nil
     }
 
+    /// Resolves a layout coordinate for a named element, preferring the JS proxy's
+    /// live value (updated by moveTo / direct assignment) over the static WMS expression.
+    /// This is necessary because skins call `element.left = newPos` to reposition subviews
+    /// at runtime, but the WMS attribute still holds the original expression.
+    private func liveCoord(_ id: String?, attr: AttributeValue?, propName: String, lc: LayoutContext) -> CGFloat {
+        if let id, let v = engine?.evaluateNumber("\(id).\(propName)") { return v }
+        return resolveCoord(attr, lc: lc) ?? 0
+    }
+
     // MARK: - Collection
 
     private func collectGroups(in elements: [SkinElement],
@@ -185,8 +196,8 @@ public final class SkinCanvasView: NSView {
                                             clipMask: clipMask))
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
-                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 result += collectGroups(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc)
             default: break
             }
@@ -222,8 +233,8 @@ public final class SkinCanvasView: NSView {
                                              clipMask: clipMask))
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
-                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
                 result += collectButtons(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
@@ -263,8 +274,8 @@ public final class SkinCanvasView: NSView {
                 result.append(rs)
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
-                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
-                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
                 result += collectSliders(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
@@ -421,8 +432,8 @@ public final class SkinCanvasView: NSView {
 
             case .subview(let sv):
                 guard !elementIsHidden(sv.base, live: true) else { continue }
-                let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
-                let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 let svZ = sv.base.zIndex ?? 0
                 let childOffset = CGPoint(x: sx, y: sy)
                 // Only children with an *explicitly set* zIndex lower than the parent's go
@@ -473,7 +484,17 @@ public final class SkinCanvasView: NSView {
             case .buttonGroup(let bg):
                 guard !elementIsHidden(bg.base, live: true) else { continue }
                 if let rg = groups.first(where: { $0.model.mappingImage == bg.mappingImage }) {
-                    drawGroup(rg, ctx: ctx)
+                    // Recompute position from the live offset so groups inside JS-moved
+                    // subviews draw at the correct position rather than their stale init frame.
+                    let x = (lc.resolve(bg.base.left) ?? 0) + offset.x
+                    let y = (lc.resolve(bg.base.top)  ?? 0) + offset.y
+                    var w = lc.resolve(bg.base.width)  ?? 0
+                    var h = lc.resolve(bg.base.height) ?? 0
+                    if (w == 0 || h == 0), let n = bg.image, let img = cache.images[n.lowercased()] {
+                        if w == 0 { w = img.size.width  }
+                        if h == 0 { h = img.size.height }
+                    }
+                    drawGroup(rg, frame: CGRect(x: x, y: y, width: w, height: h), ctx: ctx)
                 }
 
             case .button(let b):
@@ -582,12 +603,12 @@ public final class SkinCanvasView: NSView {
 
     // MARK: - Per-element drawing
 
-    private func drawGroup(_ group: RenderedGroup, ctx: CGContext) {
+    private func drawGroup(_ group: RenderedGroup, frame: CGRect, ctx: CGContext) {
         guard let imgName = group.model.image,
               let normal  = cache.images[imgName.lowercased()]
         else { return }
 
-        let rect   = group.frame
+        let rect   = frame
         let cgRect = CGRect(origin: rect.origin, size: rect.size)
 
         ctx.saveGState()
@@ -867,6 +888,22 @@ public final class SkinCanvasView: NSView {
         if isMouseUp, let script = slider.model.base.onMouseUp, !script.isEmpty {
             engine?.evaluate(script)
         }
+
+        // Direct backend calls for standard kinds — fallback for skins without JS scripts,
+        // and guarantees correct behavior regardless of whether the skin script fires.
+        if let backend = playerBackend {
+            switch slider.model.kind {
+            case .seek:
+                // Only seek on release; continuous seeking during drag is choppy with AVFoundation.
+                if isMouseUp { backend.seek(to: raw) }
+            case .volume:
+                backend.volume = max(0, min(100, Int(raw.rounded())))
+            case .balance:
+                backend.balance = max(-100, min(100, Int(raw.rounded())))
+            default: break
+            }
+        }
+
         applyScriptChanges()
     }
 
@@ -953,7 +990,22 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// Rebuilds hit-test frames for groups, buttons, and sliders using live JS state.
+    /// Must be called whenever JS changes element positions (moveTo, direct property write).
+    private func recollect() {
+        let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+        let savedValues = sliders.map { $0.value }
+        groups  = collectGroups(in: skinView.elements,  offset: .zero, lc: lc)
+        buttons = collectButtons(in: skinView.elements, offset: .zero, lc: lc)
+        sliders = collectSliders(in: skinView.elements, offset: .zero, lc: lc)
+        for i in sliders.indices where i < savedValues.count {
+            sliders[i].value = savedValues[i]
+        }
+    }
+
     private func applyScriptChanges() {
+        engine?.fireOnEndMoveCallbacks()
+        recollect()
         updateAnimatedSubviewVisibility()
         setNeedsDisplay(bounds)
     }

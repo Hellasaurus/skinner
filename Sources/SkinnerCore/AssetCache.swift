@@ -262,7 +262,9 @@ private func buildGroupAssets(_ group: ButtonGroup,
         let base = i * 4
         let r = md.bytes[base], g = md.bytes[base + 1],
             b = md.bytes[base + 2], a = md.bytes[base + 3]
-        guard a > 128, !isMagenta(r, g, b) else { continue }
+        guard a > 128, !isMagenta(r, g, b),
+              !(r > 240 && g > 240 && b > 240)  // white = background in mapping images
+        else { continue }
         fullRegion[i] = true
         for color in parsedColors where colorMatches(r, g, b, color.r, color.g, color.b) {
             if perButton[color.key] == nil {

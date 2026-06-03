@@ -114,6 +114,21 @@ final class SkinScriptEngine {
         context.evaluateScript("try { \(script) } catch(e) {}")
     }
 
+    /// Fires the `onEndMove` callback for every proxy whose `_moved` flag was set
+    /// by a `moveTo` call during the preceding `evaluate()`.  Must be called after
+    /// the script fully completes so state variables (e.g. `eqIsOpen`) are already
+    /// in their final toggled state when `onEndMove` reads them.
+    func fireOnEndMoveCallbacks() {
+        for proxy in proxies.values {
+            guard let moved = proxy.forProperty("_moved"), moved.toBool() else { continue }
+            proxy.setValue(false, forProperty: "_moved")
+            if let s = proxy.forProperty("_onEndMove"),
+               let script = s.toString(), !script.isEmpty, script != "undefined" {
+                context.evaluateScript("try { \(script) } catch(e) {}")
+            }
+        }
+    }
+
     /// Evaluates a JS expression and returns its value as a CGFloat, or nil if the
     /// expression throws, is not a number, or is NaN. Used to resolve `jscript:`
     /// layout attributes (e.g. `iVolumeSmallLeft`) against the live global scope.
@@ -222,15 +237,21 @@ final class SkinScriptEngine {
         var psLast          = 12;
 
         // Prototype shared by every element proxy.
-        // moveTo / alphaBlendTo execute synchronously (no animation in Phase 1).
+        // moveTo / alphaBlendTo execute synchronously (no animation).
+        // onEndMove is NOT fired here — it must fire after the calling script fully
+        // completes (so state toggles like eqIsOpen have already been applied).
+        // _moved is set as a deferred marker; Swift calls fireOnEndMoveCallbacks()
+        // after evaluate() returns.
         var _EP = {
-            moveTo:              function(x, y, ms) { this.left = x; this.top = y; },
+            moveTo: function(x, y, ms) { this.left = x; this.top = y; this._moved = true; },
             alphaBlendTo:        function(v, ms)    { this.alphaBlend = v; },
             setColumnResizeMode: function(col, mode) {},
             appendItem:          function(text)      {},
             presetTitle:         function(i)         { return ""; },
             presetCount:         0
         };
+        _EP.moveto       = _EP.moveTo;
+        _EP.alphablendto = _EP.alphaBlendTo;
         """)
     }
 
@@ -404,7 +425,7 @@ final class SkinScriptEngine {
         for element in elements {
             switch element {
             case .subview(let sv):
-                if let id = sv.base.id { registerProxy(id: id, base: sv.base, in: ctx, reserved: reserved) }
+                if let id = sv.base.id { registerProxy(id: id, base: sv.base, onEndMove: sv.onEndMove, in: ctx, reserved: reserved) }
                 registerElements(sv.children, in: ctx, reserved: reserved)
             case .button(let b):
                 if let id = b.base.id { registerProxy(id: id, base: b.base, in: ctx, reserved: reserved) }
@@ -431,7 +452,7 @@ final class SkinScriptEngine {
         }
     }
 
-    private func registerProxy(id: String, base: ElementBase?, in ctx: JSContext, reserved: Set<String>) {
+    private func registerProxy(id: String, base: ElementBase?, onEndMove: String? = nil, in ctx: JSContext, reserved: Set<String>) {
         guard !id.isEmpty,
               isValidJSIdentifier(id),
               !reserved.contains(id),
@@ -451,6 +472,7 @@ final class SkinScriptEngine {
             if let vis = b.visible, let bv = vis.boolValue        { proxy.setValue(bv,  forProperty: "visible") }
             if let alpha = b.alphaBlend { proxy.setValue(alpha, forProperty: "alphaBlend") }
         }
+        if let script = onEndMove, !script.isEmpty { proxy.setValue(script, forProperty: "_onEndMove") }
 
         proxies[id] = proxy
         ctx.globalObject?.setValue(proxy, forProperty: id)
