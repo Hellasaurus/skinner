@@ -379,6 +379,7 @@ private extension WMSParser {
             onMouseDown: a.str("onmousedown"),
             onMouseUp: a.str("onmouseup"),
             onMouseOver: a.str("onmouseover"),
+            onMouseOut: a.str("onmouseout"),
             onKeyDown: a.str("onkeydown"),
             onKeyUp: a.str("onkeyup")
         )

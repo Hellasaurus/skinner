@@ -27,10 +27,62 @@ public final class SkinCanvasView: NSView {
     private let bundle: SkinBundle?
     private var dragOrigin: NSPoint?
     private var engine: SkinScriptEngine?
-    private var animatedSubviews: [String: NSImageView] = [:]   // element id → NSImageView
+    private var animatedSubviews:     [String: NSImageView] = [:]   // element id → NSImageView
+    private var animatedSubviewBases: [String: ElementBase] = [:]  // element id → base (for visibility sync)
 
-    public var onOpenView:  ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
-    public var onCloseView: ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
+    public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
+    public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
+    public var onDroppedURL: ((URL) -> Void)?
+
+    private var playerBackend: (any PlayerBackend)?
+
+    public func setPlayerBackend(_ backend: any PlayerBackend) {
+        playerBackend = backend
+        engine?.onStateChanged = { [weak self] in
+            self?.updateLiveSliders()
+            self?.updateAnimatedSubviewVisibility()
+            if let b = self?.bounds { self?.setNeedsDisplay(b) }
+        }
+        engine?.playerBackend = backend
+    }
+
+    private func updateAnimatedSubviewVisibility() {
+        let isPlaying = playerBackend?.playState == .playing
+        for (id, iv) in animatedSubviews {
+            guard let base = animatedSubviewBases[id] else { continue }
+            // Subviews declared visible="false" in the WMS are playback-state animations.
+            // Show them when playing; the skin JS doesn't reliably toggle them due to
+            // visMark initialization ordering (e.g. Pulsar's playbackAnim/visMark=4 issue).
+            let initiallyHidden: Bool
+            if case .literal(let v) = base.visible {
+                initiallyHidden = v.lowercased() == "false" || v == "0"
+            } else {
+                initiallyHidden = false
+            }
+            if initiallyHidden && playerBackend != nil {
+                iv.isHidden = !isPlaying
+            } else {
+                iv.isHidden = elementIsHidden(base, live: true)
+            }
+        }
+    }
+
+    private func updateLiveSliders() {
+        guard let backend = playerBackend else { return }
+        let dur = backend.duration
+        for i in sliders.indices {
+            switch sliders[i].model.kind {
+            case .seek:
+                sliders[i].value = dur > 0 ? min(1, max(0, backend.currentPosition / dur)) : 0
+            case .volume:
+                sliders[i].value = Double(backend.volume) / 100.0
+            case .balance:
+                sliders[i].value = (Double(backend.balance) + 100.0) / 200.0
+            case .generic, .custom:
+                break
+            }
+        }
+    }
 
     public override var isFlipped: Bool { true }
 
@@ -59,6 +111,7 @@ public final class SkinCanvasView: NSView {
         buildBgOpacity()
         buildAnimatedSubviews(in: skinView.elements, offset: .zero, lc: lc)
         setupTracking()
+        registerForDraggedTypes([.fileURL])
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -281,7 +334,9 @@ public final class SkinCanvasView: NSView {
             guard case .subview(let sv) = element, !elementIsHidden(sv.base) else { continue }
             let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
             let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
-            if let imgName = sv.backgroundImage,
+            let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
+                         ?? sv.backgroundImage
+            if let imgName = bgName,
                let md = cache.mapData[imgName.lowercased()] {
                 let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
                     .compactMap { $0.flatMap(parseAnyColor) }
@@ -334,7 +389,7 @@ public final class SkinCanvasView: NSView {
             switch element {
 
             case .subview(let sv):
-                guard !elementIsHidden(sv.base) else { continue }
+                guard !elementIsHidden(sv.base, live: true) else { continue }
                 let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
                 let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
                 let svZ = sv.base.zIndex ?? 0
@@ -385,27 +440,29 @@ public final class SkinCanvasView: NSView {
                 if needsGState { ctx.restoreGState() }
 
             case .buttonGroup(let bg):
-                guard !elementIsHidden(bg.base) else { continue }
+                guard !elementIsHidden(bg.base, live: true) else { continue }
                 if let rg = groups.first(where: { $0.model.mappingImage == bg.mappingImage }) {
                     drawGroup(rg, ctx: ctx)
                 }
 
             case .button(let b):
+                // Advance the counter whenever the button was collected (static check),
+                // even if it's dynamically hidden now — keeps the index in sync.
                 guard !elementIsHidden(b.base) else { continue }
-                if buttonIdx < buttons.count {
+                defer { buttonIdx += 1 }
+                if !elementIsHidden(b.base, live: true), buttonIdx < buttons.count {
                     drawButton(buttons[buttonIdx], ctx: ctx)
-                    buttonIdx += 1
                 }
 
             case .slider(let s):
                 guard !elementIsHidden(s.base) else { continue }
-                if sliderIdx < sliders.count {
+                defer { sliderIdx += 1 }
+                if !elementIsHidden(s.base, live: true), sliderIdx < sliders.count {
                     drawSlider(sliders[sliderIdx])
-                    sliderIdx += 1
                 }
 
             case .playlist(let p):
-                guard !elementIsHidden(p.base) else { continue }
+                guard !elementIsHidden(p.base, live: true) else { continue }
                 let x = (lc.resolve(p.base.left) ?? 0) + offset.x
                 let y = (lc.resolve(p.base.top)  ?? 0) + offset.y
                 // Only fall back to full view dimensions when there is no attribute at all.
@@ -426,9 +483,57 @@ public final class SkinCanvasView: NSView {
                 let fg = parseAnyColor(p.foregroundColor ?? "#cccccc") ?? (0xcc, 0xcc, 0xcc)
                 drawCenteredText("Playlist", in: rect, color: NSColor(skinRGB: fg))
 
+            case .text(let t):
+                guard !elementIsHidden(t.base, live: true) else { continue }
+                let tx = (resolveCoord(t.base.left,   lc: lc) ?? 0) + offset.x
+                let ty = (resolveCoord(t.base.top,    lc: lc) ?? 0) + offset.y
+                let tw =  resolveCoord(t.base.width,  lc: lc) ?? 100
+                let th =  resolveCoord(t.base.height, lc: lc) ?? 14
+                let text = engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
+                guard !text.isEmpty else { continue }
+                drawTextLabel(text, in: NSRect(x: tx, y: ty, width: tw, height: th), label: t)
+
             default: break
             }
         }
+    }
+
+    private func drawTextLabel(_ text: String, in rect: NSRect, label: TextLabel) {
+        let pointSize = CGFloat(label.fontSize ?? 10)
+        let isBold   = label.fontStyle?.lowercased().contains("bold")   ?? false
+        let isItalic = label.fontStyle?.lowercased().contains("italic") ?? false
+        let font: NSFont
+        if let face = label.fontFace {
+            var descriptor = NSFontDescriptor(fontAttributes: [.family: face])
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if isBold   { traits.insert(.bold) }
+            if isItalic { traits.insert(.italic) }
+            if !traits.isEmpty { descriptor = descriptor.withSymbolicTraits(traits) }
+            font = NSFont(descriptor: descriptor, size: pointSize) ?? NSFont.systemFont(ofSize: pointSize)
+        } else {
+            font = NSFont.systemFont(ofSize: pointSize)
+        }
+        let fgRGB = parseAnyColor(label.foregroundColor ?? "#ffffff") ?? (0xff, 0xff, 0xff)
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byClipping
+        switch label.justification?.lowercased() {
+        case "center": paragraphStyle.alignment = .center
+        case "right":  paragraphStyle.alignment = .right
+        default:       paragraphStyle.alignment = .left
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor(skinRGB: fgRGB),
+            .font: font,
+            .paragraphStyle: paragraphStyle,
+        ]
+        let attrStr = NSAttributedString(string: text, attributes: attrs)
+        let textH = attrStr.boundingRect(with: NSSize(width: rect.width, height: .infinity),
+                                         options: .usesLineFragmentOrigin).height
+        let drawRect = NSRect(x: rect.minX,
+                              y: rect.minY + max(0, (rect.height - textH) / 2),
+                              width: rect.width,
+                              height: rect.height)
+        attrStr.draw(with: drawRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
     private func drawCenteredText(_ text: String, in rect: NSRect, color: NSColor) {
@@ -596,14 +701,17 @@ public final class SkinCanvasView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
-        for i in groups.indices {
+        for i in groups.indices.reversed() {
+            guard !elementIsHidden(groups[i].model.base, live: true) else { continue }
             if let color = groups[i].colorAt(pt) {
                 groups[i].pressedColor = color
                 setNeedsDisplay(bounds)
                 return
             }
         }
-        for i in buttons.indices where buttons[i].hitTest(pt) {
+        for i in buttons.indices.reversed() {
+            guard !elementIsHidden(buttons[i].model.base, live: true) else { continue }
+            guard buttons[i].hitTest(pt) else { continue }
             buttons[i].isPressed = true
             setNeedsDisplay(bounds)
             return
@@ -632,7 +740,8 @@ public final class SkinCanvasView: NSView {
                 return
             }
         }
-        for i in buttons.indices where buttons[i].isPressed {
+        for i in buttons.indices.reversed() {
+            guard buttons[i].isPressed else { continue }
             if buttons[i].hitTest(pt) { fireButtonAction(buttons[i]) }
             buttons[i].isPressed = false
             setNeedsDisplay(bounds)
@@ -643,15 +752,45 @@ public final class SkinCanvasView: NSView {
     public override func mouseMoved(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
         var changed = false
-        for i in groups.indices {
-            let h = groups[i].colorAt(pt)
+        var groupHitHandled = false
+        for i in groups.indices.reversed() {
+            let hidden = elementIsHidden(groups[i].model.base, live: true)
+            let h: String? = (!hidden && !groupHitHandled) ? groups[i].colorAt(pt) : nil
+            if h != nil { groupHitHandled = true }
             if h != groups[i].hoveredColor { groups[i].hoveredColor = h; changed = true }
         }
-        for i in buttons.indices {
-            let h = buttons[i].hitTest(pt)
-            if h != buttons[i].isHovered { buttons[i].isHovered = h; changed = true }
+        var buttonHitHandled = false
+        for i in buttons.indices.reversed() {
+            let hidden = elementIsHidden(buttons[i].model.base, live: true)
+            let h = !hidden && !buttonHitHandled && buttons[i].hitTest(pt)
+            if h { buttonHitHandled = true }
+            if h != buttons[i].isHovered {
+                buttons[i].isHovered = h
+                changed = true
+                if h, let script = buttons[i].model.base.onMouseOver { engine?.evaluate(script) }
+                else if !h, let script = buttons[i].model.base.onMouseOut { engine?.evaluate(script) }
+            }
         }
         if changed { setNeedsDisplay(bounds) }
+    }
+
+    // MARK: - Drag and drop
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: opts) else {
+            return []
+        }
+        return .copy
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let urls = sender.draggingPasteboard
+                .readObjects(forClasses: [NSURL.self], options: opts) as? [URL],
+              let url = urls.first else { return false }
+        onDroppedURL?(url)
+        return true
     }
 
     public override func mouseExited(with event: NSEvent) {
@@ -668,20 +807,34 @@ public final class SkinCanvasView: NSView {
     // MARK: - Actions
 
     private func fireGroupAction(_ group: RenderedGroup, colorKey: String) {
-        let elem  = group.model.elements.first { $0.mappingColor.lowercased() == colorKey }
-        let label = elem?.id ?? colorKey
-        if let script = elem?.onClick { engine?.evaluate(script) }
-        else { print("[ACTION] \(group.model.base.id ?? "buttongroup") / \(label)") }
+        let elem = group.model.elements.first { $0.mappingColor.lowercased() == colorKey }
+        if let script = elem?.onClick { engine?.evaluate(script); applyScriptChanges(); return }
+        if let backend = playerBackend {
+            switch elem?.kind {
+            case .play:   backend.play()
+            case .pause:  backend.pause()
+            case .stop:   backend.stop()
+            case .next:   backend.next()
+            case .prev:   backend.previous()
+            case .custom, nil:
+                print("[ACTION] \(group.model.base.id ?? "buttongroup") / \(elem?.id ?? colorKey)")
+            }
+        } else {
+            print("[ACTION] \(group.model.base.id ?? "buttongroup") / \(elem?.id ?? colorKey)")
+        }
     }
 
     private func fireButtonAction(_ button: RenderedButton) {
-        let label: String
+        if let script = button.model.base.onClick { engine?.evaluate(script); applyScriptChanges(); return }
         switch button.model.kind {
-        case .mute:    label = "mute"
-        case .generic: label = button.model.base.id ?? button.model.base.onClick ?? button.model.image ?? "?"
+        case .mute:    playerBackend?.isMuted.toggle()
+        case .generic: print("[ACTION] button / \(button.model.base.id ?? button.model.image ?? "?")")
         }
-        if let script = button.model.base.onClick { engine?.evaluate(script) }
-        else { print("[ACTION] button / \(label)") }
+    }
+
+    private func applyScriptChanges() {
+        updateAnimatedSubviewVisibility()
+        setNeedsDisplay(bounds)
     }
 
     // MARK: - Animated GIF subviews
@@ -703,7 +856,10 @@ public final class SkinCanvasView: NSView {
         guard let bundle else { return }
         for element in sortedByZIndex(elements) {
             guard case .subview(let sv) = element else { continue }
-            guard !elementIsHidden(sv.base) else { continue }
+            let hidden = elementIsHidden(sv.base)
+            // Skip children of statically-hidden subviews (they can't be independently visible).
+            // But still try to create an NSImageView for this element itself — it may become
+            // visible later when JS changes its state (e.g. playbackAnim starts hidden).
             let x = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
             let y = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
             let co = CGPoint(x: x, y: y)
@@ -717,7 +873,7 @@ public final class SkinCanvasView: NSView {
             // Check if any below-children are GIF subviews (will become NSImageViews).
             // If so, this element's background must also be an NSImageView added after
             // them, since CGContext is always behind all NSImageViews.
-            let hasGifBelow = below.contains { child in
+            let hasGifBelow = !hidden && below.contains { child in
                 guard case .subview(let csv) = child else { return false }
                 let cn = (csv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                           ?? csv.backgroundImage) ?? ""
@@ -739,8 +895,12 @@ public final class SkinCanvasView: NSView {
                     iv.image        = img
                     iv.animates     = name.lowercased().hasSuffix(".gif")
                     iv.imageScaling = .scaleAxesIndependently
+                    iv.isHidden     = hidden
                     addSubview(iv)
-                    if let id = sv.base.id { animatedSubviews[id] = iv }
+                    if let id = sv.base.id {
+                        animatedSubviews[id]     = iv
+                        animatedSubviewBases[id] = sv.base
+                    }
                 }
                 buildAnimatedSubviews(in: above, offset: co, lc: lc)
             } else {
@@ -754,11 +914,15 @@ public final class SkinCanvasView: NSView {
                     iv.image        = img
                     iv.animates     = true
                     iv.imageScaling = .scaleAxesIndependently
+                    iv.isHidden     = hidden
                     addSubview(iv)
-                    if let id = sv.base.id { animatedSubviews[id] = iv }
+                    if let id = sv.base.id {
+                        animatedSubviews[id]     = iv
+                        animatedSubviewBases[id] = sv.base
+                    }
                 }
-                // Recurse after adding this element so children (added later) sit on top.
-                buildAnimatedSubviews(in: sv.children, offset: co, lc: lc)
+                // Only recurse into children of visible subviews.
+                if !hidden { buildAnimatedSubviews(in: sv.children, offset: co, lc: lc) }
             }
         }
     }
@@ -767,14 +931,21 @@ public final class SkinCanvasView: NSView {
 
     /// Script state takes precedence over the parsed `visible` attribute.
     /// `alphaBlend == 0` is treated as hidden (WMP skins use it to fade-out elements).
-    private func elementIsHidden(_ base: ElementBase) -> Bool {
+    /// Pass `live: true` during draw to evaluate `wmpenabled:` bindings against current player state.
+    private func elementIsHidden(_ base: ElementBase, live: Bool = false) -> Bool {
         if let id = base.id, let s = engine?.state(for: id) {
             if let vis   = s.visible    { return !vis }
             if let alpha = s.alphaBlend, alpha == 0 { return true }
         }
         if let alpha = base.alphaBlend, alpha == 0 { return true }
-        guard case .literal(let str) = base.visible else { return false }
-        return str.lowercased() == "false" || str == "0"
+        switch base.visible {
+        case .literal(let str):
+            return str.lowercased() == "false" || str == "0"
+        case .wmpEnabled(let expr):
+            return live ? !(engine?.evaluateWmpEnabled(expr) ?? false) : false
+        default:
+            return false
+        }
     }
 
     /// Returns the effective 0–255 alpha for a subview, checking script state first.

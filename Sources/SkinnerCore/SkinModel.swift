@@ -88,6 +88,7 @@ public struct ElementBase: Sendable {
     public var onMouseDown: String?
     public var onMouseUp: String?
     public var onMouseOver: String?
+    public var onMouseOut: String?
     public var onKeyDown: String?
     public var onKeyUp: String?
 }

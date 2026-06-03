@@ -1,5 +1,8 @@
+import AppKit
 import JavaScriptCore
 import Foundation
+import UniformTypeIdentifiers
+@preconcurrency import Combine
 
 // MARK: - ElementScriptState
 
@@ -31,8 +34,22 @@ final class SkinScriptEngine {
     private let context: JSContext
     private var proxies: [String: JSValue] = [:]
 
-    var onOpenView:  ((String) -> Void)?
-    var onCloseView: ((String) -> Void)?
+    var onOpenView:    ((String) -> Void)?
+    var onCloseView:   ((String) -> Void)?
+    var onStateChanged: (() -> Void)?
+
+    // Stored once at init time; JS callbacks fire these scripts when backend state changes.
+    private let playerCallbacks: Player?
+    private var backendCancellables = Set<AnyCancellable>()
+
+    var playerBackend: (any PlayerBackend)? {
+        didSet {
+            backendCancellables.removeAll()
+            guard let backend = playerBackend else { return }
+            rewirePlayer(backend)
+            subscribeToBackend(backend)
+        }
+    }
 
     // IDs used by host stubs — element proxies must not overwrite these.
     private static let hostIds: Set<String> = [
@@ -45,6 +62,7 @@ final class SkinScriptEngine {
         guard let scriptFile = skinView.scriptFile, !scriptFile.isEmpty else { return nil }
         guard let ctx = JSContext() else { return nil }
         self.context = ctx
+        self.playerCallbacks = skinView.player
 
         ctx.exceptionHandler = { _, exc in
             // Skin scripts routinely access WMP internals we don't implement;
@@ -98,6 +116,21 @@ final class SkinScriptEngine {
     /// Evaluates a JS expression and returns its value as a CGFloat, or nil if the
     /// expression throws, is not a number, or is NaN. Used to resolve `jscript:`
     /// layout attributes (e.g. `iVolumeSmallLeft`) against the live global scope.
+    /// Evaluates a `wmpenabled:` binding and returns whether the element should be enabled/visible.
+    func evaluateWmpEnabled(_ expr: String) -> Bool {
+        let lower = expr.lowercased()
+        if lower.hasPrefix("player.controls.") {
+            let method = String(expr.dropFirst("player.controls.".count))
+            let safe   = method.replacingOccurrences(of: "'", with: "\\'")
+            let result = context.evaluateScript("player.controls.isAvailable('\(safe)')")
+            return result?.toBool() ?? false
+        }
+        guard !expr.isEmpty else { return false }
+        let result = context.evaluateScript(
+            "(function(){try{return !!((\(expr)));}catch(e){return false;}})()")
+        return result?.toBool() ?? false
+    }
+
     func evaluateNumber(_ expr: String) -> CGFloat? {
         guard !expr.isEmpty else { return nil }
         // WMS JScript attribute values often end with ";".  Wrapping as `(EXPR;)` causes
@@ -109,6 +142,28 @@ final class SkinScriptEngine {
         guard let result = context.evaluateScript(js), result.isNumber else { return nil }
         let v = result.toDouble()
         return v.isNaN ? nil : CGFloat(v)
+    }
+
+    /// Evaluates a JS expression and returns the result as a String, or nil on error.
+    func evaluateString(_ expr: String) -> String? {
+        guard !expr.isEmpty else { return nil }
+        var clean = expr.trimmingCharacters(in: .whitespaces)
+        while clean.hasSuffix(";") { clean = String(clean.dropLast()) }
+        guard !clean.isEmpty else { return nil }
+        let js = "(function(){ try { var _r=(\(clean)); return (_r===null||_r===undefined)?null:String(_r); } catch(e){ return null; } })()"
+        guard let result = context.evaluateScript(js), !result.isNull, !result.isUndefined else { return nil }
+        return result.toString()
+    }
+
+    /// Resolves an `AttributeValue` to a displayable string against the live JS context.
+    func resolveText(_ av: AttributeValue?) -> String {
+        guard let av else { return "" }
+        switch av {
+        case .literal(let s):    return s
+        case .jsExpr(let expr):  return evaluateString(expr) ?? ""
+        case .wmpProp(let expr): return evaluateString(expr) ?? ""
+        case .wmpEnabled:        return ""
+        }
     }
 
     // MARK: - State readback
@@ -196,6 +251,25 @@ final class SkinScriptEngine {
         }
         ctx.setObject(closeBridge, forKeyedSubscript: "_skinnerCloseView" as NSString)
 
+        let prefChangeBridge: @convention(block) (String, String) -> Void = { [weak self] key, value in
+            MainActor.assumeIsolated {
+                if key == "exitview" && value == "true" { self?.onCloseView?(viewId) }
+            }
+        }
+        ctx.setObject(prefChangeBridge, forKeyedSubscript: "_skinnerOnPrefChange" as NSString)
+
+        let openDialogBridge: @convention(block) (String, String) -> String = { _, _ in
+            MainActor.assumeIsolated {
+                let panel = NSOpenPanel()
+                panel.title                = "Open Media File"
+                panel.allowedContentTypes  = [.audio, .movie]
+                panel.allowsOtherFileTypes = true
+                guard panel.runModal() == .OK, let url = panel.url else { return "" }
+                return url.absoluteString
+            }
+        }
+        ctx.setObject(openDialogBridge, forKeyedSubscript: "_skinnerOpenDialog" as NSString)
+
         // view — the current skin view; also aliased by the view's own id.
         // view.close() calls back into Swift so the window manager can close the window.
         let timerInterval = skinView.timerInterval ?? 0
@@ -235,7 +309,8 @@ final class SkinScriptEngine {
                 stop:            function() {},
                 next:            function() {},
                 previous:        function() {},
-                currentPosition: 0
+                currentPosition:       0,
+                currentPositionString: "0:00"
             },
             currentMedia: {
                 name: "", sourceURL: "",
@@ -260,13 +335,14 @@ final class SkinScriptEngine {
         var theme = {
             loadPreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
             loadpreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
-            savePreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
-            savepreference:  function(k, v) { _prefs[k.toLowerCase()] = String(v); },
+            savePreference:  function(k, v) { var lk=k.toLowerCase(), sv=String(v); _prefs[lk]=sv; _skinnerOnPrefChange(lk,sv); },
+            savepreference:  function(k, v) { var lk=k.toLowerCase(), sv=String(v); _prefs[lk]=sv; _skinnerOnPrefChange(lk,sv); },
             loadString:      function(res) { return ""; },
             loadstring:      function(res) { return ""; },
             openView:        function(id) { _skinnerOpenView(id); },
             closeView:       function(id) { _skinnerCloseView(id); },
-            openDialog:      function(t, f) { return null; },
+            openDialog:      function(t, f) { return _skinnerOpenDialog(t, f) || null; },
+            playSound:       function(f) {},
             currentViewID:   ""
         };
         """)
@@ -376,6 +452,193 @@ final class SkinScriptEngine {
 
         proxies[id] = proxy
         ctx.globalObject?.setValue(proxy, forProperty: id)
+    }
+
+    // MARK: - Live backend wiring
+
+    private func rewirePlayer(_ backend: any PlayerBackend) {
+        // Inject Swift closures as _skinner* globals, then rewire the JS player object.
+        // All blocks are called synchronously from the main thread (JSContext has no threading here),
+        // so MainActor.assumeIsolated is safe.
+
+        let getPlayState: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.playState.rawValue ?? PlayState.stopped.rawValue }
+        }
+        let getOpenState: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.openState.rawValue ?? OpenState.undefined.rawValue }
+        }
+        let getURL: @convention(block) () -> String = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentItemURL ?? "" }
+        }
+        let getPosition: @convention(block) () -> Double = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentPosition ?? 0 }
+        }
+        let getPositionString: @convention(block) () -> String = { [weak self] in
+            MainActor.assumeIsolated {
+                let pos = Int(self?.playerBackend?.currentPosition ?? 0)
+                return "\(pos / 60):\(String(format: "%02d", pos % 60))"
+            }
+        }
+        let getDuration: @convention(block) () -> Double = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.duration ?? 0 }
+        }
+        let getVolume: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.volume ?? 100 }
+        }
+        let getBalance: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.balance ?? 0 }
+        }
+        let getMute: @convention(block) () -> Bool = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.isMuted ?? false }
+        }
+        let getMediaName: @convention(block) () -> String = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentItemTitle ?? "" }
+        }
+        let getItemInfo: @convention(block) (String) -> String = { [weak self] key in
+            MainActor.assumeIsolated {
+                guard let b = self?.playerBackend else { return "" }
+                switch key.lowercased() {
+                case "title", "name":   return b.currentItemTitle
+                case "sourceurl", "url": return b.currentItemURL
+                case "duration":        return String(b.duration)
+                default:                return ""
+                }
+            }
+        }
+        let isAvailable: @convention(block) (String) -> Bool = { [weak self] cmd in
+            MainActor.assumeIsolated {
+                guard let b = self?.playerBackend else { return false }
+                switch cmd.lowercased() {
+                case "play":     return b.openState == .mediaOpen && b.playState != .playing
+                case "pause":    return b.playState == .playing
+                case "stop":     return b.playState == .playing || b.playState == .paused
+                case "next":     return b.canNext
+                case "previous": return b.canPrevious
+                default:         return false
+                }
+            }
+        }
+        let doPlay: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.play() }
+        }
+        let doPause: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.pause() }
+        }
+        let doStop: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.stop() }
+        }
+        let doNext: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.next() }
+        }
+        let doPrevious: @convention(block) () -> Void = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.previous() }
+        }
+        let seekTo: @convention(block) (Double) -> Void = { [weak self] pos in
+            MainActor.assumeIsolated { self?.playerBackend?.seek(to: pos) }
+        }
+        let setVolume: @convention(block) (Double) -> Void = { [weak self] v in
+            MainActor.assumeIsolated { self?.playerBackend?.volume = Int(v) }
+        }
+        let setBalance: @convention(block) (Double) -> Void = { [weak self] v in
+            MainActor.assumeIsolated { self?.playerBackend?.balance = Int(v) }
+        }
+        let setMute: @convention(block) (Bool) -> Void = { [weak self] v in
+            MainActor.assumeIsolated { self?.playerBackend?.isMuted = v }
+        }
+        let openURL: @convention(block) (String) -> Void = { [weak self] urlStr in
+            MainActor.assumeIsolated {
+                guard let url = URL(string: urlStr) else { return }
+                self?.playerBackend?.open(url: url)
+            }
+        }
+
+        for (name, val): (NSString, Any) in [
+            ("_skinnerGetPlayState",      getPlayState),    ("_skinnerGetOpenState",  getOpenState),
+            ("_skinnerGetURL",            getURL),          ("_skinnerGetPosition",   getPosition),
+            ("_skinnerGetPositionString", getPositionString),
+            ("_skinnerGetDuration",  getDuration),  ("_skinnerGetVolume",    getVolume),
+            ("_skinnerGetBalance",   getBalance),   ("_skinnerGetMute",      getMute),
+            ("_skinnerGetMediaName", getMediaName), ("_skinnerGetItemInfo",  getItemInfo),
+            ("_skinnerIsAvailable",  isAvailable),
+            ("_skinnerPlay",         doPlay),       ("_skinnerPause",        doPause),
+            ("_skinnerStop",         doStop),       ("_skinnerNext",         doNext),
+            ("_skinnerPrevious",     doPrevious),   ("_skinnerSeekTo",       seekTo),
+            ("_skinnerSetVolume",    setVolume),    ("_skinnerSetBalance",   setBalance),
+            ("_skinnerSetMute",      setMute),      ("_skinnerOpenURL",      openURL),
+        ] { context.setObject(val, forKeyedSubscript: name) }
+
+        context.evaluateScript("""
+        Object.defineProperty(player, 'playState', { get: function() { return _skinnerGetPlayState(); }, configurable: true });
+        Object.defineProperty(player, 'openState', { get: function() { return _skinnerGetOpenState(); }, configurable: true });
+        Object.defineProperty(player, 'URL', { get: function() { return _skinnerGetURL(); }, set: function(v) { _skinnerOpenURL(v); }, configurable: true });
+
+        player.controls.play        = function()     { _skinnerPlay();             };
+        player.controls.pause       = function()     { _skinnerPause();            };
+        player.controls.stop        = function()     { _skinnerStop();             };
+        player.controls.next        = function()     { _skinnerNext();             };
+        player.controls.previous    = function()     { _skinnerPrevious();         };
+        player.controls.isAvailable = function(cmd)  { return _skinnerIsAvailable(cmd); };
+        Object.defineProperty(player.controls, 'currentPosition', {
+            get: function()  { return _skinnerGetPosition(); },
+            set: function(v) { _skinnerSeekTo(v);            },
+            configurable: true
+        });
+        Object.defineProperty(player.controls, 'currentPositionString', {
+            get: function()  { return _skinnerGetPositionString(); },
+            configurable: true
+        });
+
+        Object.defineProperty(player.settings, 'volume', {
+            get: function()  { return _skinnerGetVolume(); },
+            set: function(v) { _skinnerSetVolume(v);       },
+            configurable: true
+        });
+        Object.defineProperty(player.settings, 'balance', {
+            get: function()  { return _skinnerGetBalance(); },
+            set: function(v) { _skinnerSetBalance(v);        },
+            configurable: true
+        });
+        Object.defineProperty(player.settings, 'mute', {
+            get: function()  { return _skinnerGetMute(); },
+            set: function(v) { _skinnerSetMute(v);       },
+            configurable: true
+        });
+
+        Object.defineProperty(player.currentMedia, 'name',      { get: function() { return _skinnerGetMediaName(); }, configurable: true });
+        Object.defineProperty(player.currentMedia, 'sourceURL', { get: function() { return _skinnerGetURL();       }, configurable: true });
+        Object.defineProperty(player.currentMedia, 'duration',  { get: function() { return _skinnerGetDuration();  }, configurable: true });
+        player.currentMedia.getItemInfo = function(k) { return _skinnerGetItemInfo(k); };
+        player.currentMedia.getiteminfo = function(k) { return _skinnerGetItemInfo(k); };
+        """)
+    }
+
+    private func subscribeToBackend(_ backend: any PlayerBackend) {
+        backend.playStatePublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if let script = self.playerCallbacks?.playStateOnChange { self.evaluate(script) }
+                self.onStateChanged?()
+            }
+            .store(in: &backendCancellables)
+
+        backend.openStatePublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if let script = self.playerCallbacks?.openStateOnChange { self.evaluate(script) }
+                self.onStateChanged?()
+            }
+            .store(in: &backendCancellables)
+
+        backend.positionPublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if let script = self.playerCallbacks?.controls?.currentPositionOnChange { self.evaluate(script) }
+                self.onStateChanged?()
+            }
+            .store(in: &backendCancellables)
     }
 
     // MARK: - Script loading
