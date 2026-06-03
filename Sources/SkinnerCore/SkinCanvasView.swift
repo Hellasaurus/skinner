@@ -17,15 +17,16 @@ public final class SkinCanvasView: NSView {
     private let skinView: SkinView
     private let cache:    AssetCache
 
-    private var groups:    [RenderedGroup]  = []
-    private var buttons:   [RenderedButton] = []
-    private var sliders:   [RenderedSlider] = []
-    private var bgOpacity: [Bool]           = []
-    private var bgWidth    = 0
-    private var bgHeight   = 0
-    private var bgMask:    CGImage?         = nil
-    private let bundle: SkinBundle?
-    private var dragOrigin: NSPoint?
+    private var groups:          [RenderedGroup]  = []
+    private var buttons:         [RenderedButton] = []
+    private var sliders:         [RenderedSlider] = []
+    private var bgOpacity:       [Bool]           = []
+    private var bgWidth          = 0
+    private var bgHeight         = 0
+    private var bgMask:          CGImage?         = nil
+    private let bundle:          SkinBundle?
+    private var dragOrigin:      NSPoint?
+    private var activeSliderIdx: Int?
     private var engine: SkinScriptEngine?
     private var animatedSubviews:     [String: NSImageView] = [:]   // element id → NSImageView
     private var animatedSubviewBases: [String: ElementBase] = [:]  // element id → base (for visibility sync)
@@ -78,10 +79,39 @@ public final class SkinCanvasView: NSView {
                 sliders[i].value = Double(backend.volume) / 100.0
             case .balance:
                 sliders[i].value = (Double(backend.balance) + 100.0) / 200.0
-            case .generic, .custom:
+            case .custom:
+                guard let eng = engine else { break }
+                let minV = resolveSliderBound(sliders[i].model.min) ?? 0
+                let maxV = resolveSliderBound(sliders[i].model.max) ?? 100
+                guard maxV > minV else { break }
+                // wmpprop/jsExpr value binding takes precedence (e.g. volume = player.settings.volume)
+                var raw: Double? = nil
+                switch sliders[i].model.value {
+                case .wmpProp(let expr): raw = eng.evaluateNumber(expr).map(Double.init)
+                case .jsExpr(let expr):  raw = eng.evaluateNumber(expr).map(Double.init)
+                default: break
+                }
+                // Fallback: read JS proxy .value set by script (e.g. seekMain.value = currentPosition)
+                if raw == nil, let id = sliders[i].model.base.id {
+                    raw = eng.evaluateNumber("\(id).value").map(Double.init)
+                }
+                if let rv = raw {
+                    sliders[i].value = min(1, max(0, (rv - minV) / (maxV - minV)))
+                }
+            case .generic:
                 break
             }
         }
+    }
+
+    /// Resolves a slider min/max attribute to a Double, supporting literal, jsExpr, and wmpprop.
+    private func resolveSliderBound(_ av: AttributeValue?) -> Double? {
+        guard let av else { return nil }
+        let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+        if let v = lc.resolve(av) { return Double(v) }
+        if case .jsExpr(let expr) = av, let v = engine?.evaluateNumber(expr) { return Double(v) }
+        if case .wmpProp(let expr) = av, let v = engine?.evaluateNumber(expr) { return Double(v) }
+        return nil
     }
 
     public override var isFlipped: Bool { true }
@@ -227,7 +257,8 @@ public final class SkinCanvasView: NSView {
                 }
                 var rs = RenderedSlider(model: s,
                                         frame: CGRect(x: x, y: y, width: w, height: h),
-                                        frameCount: fc)
+                                        frameCount: fc,
+                                        positionMapData: posMD)
                 rs.value = resolvedSliderValue(s)
                 result.append(rs)
             case .subview(let sv):
@@ -489,7 +520,9 @@ public final class SkinCanvasView: NSView {
                 let ty = (resolveCoord(t.base.top,    lc: lc) ?? 0) + offset.y
                 let tw =  resolveCoord(t.base.width,  lc: lc) ?? 100
                 let th =  resolveCoord(t.base.height, lc: lc) ?? 14
-                let text = engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
+                // JS-set value (e.g. metadata.value = ...) takes precedence over the WMS attribute.
+                let scriptValue = t.base.id.flatMap { engine?.state(for: $0)?.value }
+                let text = scriptValue ?? engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
                 guard !text.isEmpty else { continue }
                 drawTextLabel(text, in: NSRect(x: tx, y: ty, width: tw, height: th), label: t)
 
@@ -701,6 +734,15 @@ public final class SkinCanvasView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
+
+        for i in sliders.indices.reversed() {
+            guard !elementIsHidden(sliders[i].model.base, live: true) else { continue }
+            if let norm = sliderNormalizedValue(at: pt, slider: sliders[i]) {
+                activeSliderIdx = i
+                applySlider(idx: i, normalized: norm, isMouseUp: false)
+                return
+            }
+        }
         for i in groups.indices.reversed() {
             guard !elementIsHidden(groups[i].model.base, live: true) else { continue }
             if let color = groups[i].colorAt(pt) {
@@ -720,6 +762,18 @@ public final class SkinCanvasView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if let i = activeSliderIdx {
+            let pt = convert(event.locationInWindow, from: nil)
+            // Clamp to the slider frame so dragging slightly outside still works.
+            let clamped = CGPoint(
+                x: min(max(pt.x, sliders[i].frame.minX), sliders[i].frame.maxX - 1),
+                y: min(max(pt.y, sliders[i].frame.minY), sliders[i].frame.maxY - 1)
+            )
+            if let norm = sliderNormalizedValue(at: clamped, slider: sliders[i]) {
+                applySlider(idx: i, normalized: norm, isMouseUp: false)
+            }
+            return
+        }
         guard let origin = dragOrigin, let win = window else { return }
         let current = NSEvent.mouseLocation
         win.setFrameOrigin(NSPoint(
@@ -730,6 +784,20 @@ public final class SkinCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if let i = activeSliderIdx {
+            let pt = convert(event.locationInWindow, from: nil)
+            let clamped = CGPoint(
+                x: min(max(pt.x, sliders[i].frame.minX), sliders[i].frame.maxX - 1),
+                y: min(max(pt.y, sliders[i].frame.minY), sliders[i].frame.maxY - 1)
+            )
+            if let norm = sliderNormalizedValue(at: clamped, slider: sliders[i]) {
+                applySlider(idx: i, normalized: norm, isMouseUp: true)
+            } else {
+                applySlider(idx: i, normalized: sliders[i].value, isMouseUp: true)
+            }
+            activeSliderIdx = nil
+            return
+        }
         defer { dragOrigin = nil }
         let pt = convert(event.locationInWindow, from: nil)
         for i in groups.indices {
@@ -747,6 +815,59 @@ public final class SkinCanvasView: NSView {
             setNeedsDisplay(bounds)
             return
         }
+    }
+
+    // MARK: - Slider interaction
+
+    /// Returns a normalized 0–1 value for a click at `pt` on a CustomSlider (positionImage),
+    /// or a position-fraction for a standard slider. Returns nil if the point doesn't hit.
+    private func sliderNormalizedValue(at pt: CGPoint, slider: RenderedSlider) -> Double? {
+        guard slider.frame.contains(pt) else { return nil }
+        let lx = Int(pt.x - slider.frame.minX)
+        let ly = Int(pt.y - slider.frame.minY)
+
+        if let md = slider.positionMapData {
+            guard lx >= 0, lx < md.width, ly >= 0, ly < md.height else { return nil }
+            let i = (ly * md.width + lx) * 4
+            guard i + 3 < md.bytes.count else { return nil }
+            let r = md.bytes[i], g = md.bytes[i+1], b = md.bytes[i+2], a = md.bytes[i+3]
+            guard a > 128, !isMagenta(r, g, b) else { return nil }
+            return Double(r) / 255.0
+        }
+
+        // Standard (thumb) slider: map cursor position along the track.
+        let border = CGFloat(slider.model.borderSize ?? 0)
+        let vertical = slider.model.direction?.lowercased() == "vertical"
+        let thumbW = slider.model.thumbImage.flatMap { cache.images[$0.lowercased()]?.size.width  } ?? 0
+        let thumbH = slider.model.thumbImage.flatMap { cache.images[$0.lowercased()]?.size.height } ?? 0
+        if vertical {
+            let travel = max(1, slider.frame.height - thumbH - border * 2)
+            return min(1, max(0, 1 - (CGFloat(ly) - border) / travel))
+        } else {
+            let travel = max(1, slider.frame.width - thumbW - border * 2)
+            return min(1, max(0, (CGFloat(lx) - border) / travel))
+        }
+    }
+
+    /// Updates slider display, injects `value` into JS, fires value_onchange continuously
+    /// and onmouseup at release.
+    private func applySlider(idx: Int, normalized: Double, isMouseUp: Bool) {
+        sliders[idx].value = normalized
+        let slider = sliders[idx]
+        let minV   = resolveSliderBound(slider.model.min) ?? 0
+        let maxV   = resolveSliderBound(slider.model.max) ?? 100
+        let raw    = minV + normalized * (maxV - minV)
+
+        if let id = slider.model.base.id {
+            engine?.evaluate("\(id).value = \(raw)")
+        }
+        if let script = slider.model.valueOnChange, !script.isEmpty {
+            engine?.evaluate("value = \(raw); \(script)")
+        }
+        if isMouseUp, let script = slider.model.base.onMouseUp, !script.isEmpty {
+            engine?.evaluate(script)
+        }
+        applyScriptChanges()
     }
 
     public override func mouseMoved(with event: NSEvent) {
@@ -1011,10 +1132,11 @@ private struct RenderedButton {
 // MARK: - RenderedSlider
 
 private struct RenderedSlider {
-    let model:      Slider
-    let frame:      CGRect
-    let frameCount: Int
-    var value:      Double = 0
+    let model:           Slider
+    let frame:           CGRect
+    let frameCount:      Int
+    let positionMapData: MapData?
+    var value:           Double = 0
 
     var frameIndex: Int { max(0, min(frameCount - 1, Int(value * Double(frameCount - 1)))) }
 }

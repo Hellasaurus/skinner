@@ -12,10 +12,11 @@ struct ElementScriptState {
     var alphaBlend: Int?
     var enabled: Bool?
     var image: String?       // button/element image override (element.image = "foo.png")
+    var value: String?       // text element value set via JS (e.g. metadata.value = ...)
 
     var isEmpty: Bool {
         visible == nil && backgroundImage == nil && alphaBlend == nil
-            && enabled == nil && image == nil
+            && enabled == nil && image == nil && value == nil
     }
 }
 
@@ -176,6 +177,7 @@ final class SkinScriptEngine {
         s.alphaBlend      = intProp(proxy,    "alphaBlend")
         s.enabled         = boolProp(proxy,   "enabled")
         s.image           = stringProp(proxy, "image")
+        s.value           = stringProp(proxy, "value")
         return s.isEmpty ? nil : s
     }
 
@@ -542,8 +544,19 @@ final class SkinScriptEngine {
         let setBalance: @convention(block) (Double) -> Void = { [weak self] v in
             MainActor.assumeIsolated { self?.playerBackend?.balance = Int(v) }
         }
-        let setMute: @convention(block) (Bool) -> Void = { [weak self] v in
-            MainActor.assumeIsolated { self?.playerBackend?.isMuted = v }
+        // Skins pass mute as a string (e.g. player.settings.mute='false') — JS coerces
+        // non-empty strings to true, so inspect the raw JSValue to handle 'false'/'0' correctly.
+        let setMute: @convention(block) (JSValue) -> Void = { [weak self] v in
+            MainActor.assumeIsolated {
+                let muted: Bool
+                if v.isString {
+                    let s = v.toString() ?? ""
+                    muted = s != "false" && s != "0" && !s.isEmpty
+                } else {
+                    muted = v.toBool()
+                }
+                self?.playerBackend?.isMuted = muted
+            }
         }
         let openURL: @convention(block) (String) -> Void = { [weak self] urlStr in
             MainActor.assumeIsolated {
@@ -609,6 +622,7 @@ final class SkinScriptEngine {
         Object.defineProperty(player.currentMedia, 'duration',  { get: function() { return _skinnerGetDuration();  }, configurable: true });
         player.currentMedia.getItemInfo = function(k) { return _skinnerGetItemInfo(k); };
         player.currentMedia.getiteminfo = function(k) { return _skinnerGetItemInfo(k); };
+        player.currentmedia = player.currentMedia;
         """)
     }
 

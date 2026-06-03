@@ -108,11 +108,13 @@ public final class AVFoundationPlayer: PlayerBackend {
             let metadata = (try? await item.asset.load(.commonMetadata)) ?? []
             let titleItems = AVMetadataItem.metadataItems(
                 from: metadata, filteredByIdentifier: .commonIdentifierTitle)
-            if let title = try? await titleItems.first?.load(.stringValue) {
+            if let title = try? await titleItems.first?.load(.stringValue), !title.isEmpty {
                 self.currentItemTitle = title
             } else if let urlAsset = item.asset as? AVURLAsset {
                 self.currentItemTitle = urlAsset.url.deletingPathExtension().lastPathComponent
             }
+            // Re-publish openState so subscribers redraw with the now-loaded title.
+            self.openStateSubject.send(.mediaOpen)
         }
     }
 
