@@ -437,7 +437,7 @@ final class SkinScriptEngine {
                     if let id = elem.id { registerProxy(id: id, base: nil, in: ctx, reserved: reserved) }
                 }
             case .slider(let s):
-                if let id = s.base.id { registerProxy(id: id, base: s.base, in: ctx, reserved: reserved) }
+                if let id = s.base.id { registerProxy(id: id, base: s.base, valueOnChange: s.valueOnChange, in: ctx, reserved: reserved) }
             case .text(let t):
                 if let id = t.base.id { registerProxy(id: id, base: t.base, in: ctx, reserved: reserved) }
             case .effects(let e):
@@ -454,7 +454,8 @@ final class SkinScriptEngine {
         }
     }
 
-    private func registerProxy(id: String, base: ElementBase?, onEndMove: String? = nil, in ctx: JSContext, reserved: Set<String>) {
+    private func registerProxy(id: String, base: ElementBase?, onEndMove: String? = nil,
+                               valueOnChange: String? = nil, in ctx: JSContext, reserved: Set<String>) {
         guard !id.isEmpty,
               isValidJSIdentifier(id),
               !reserved.contains(id),
@@ -478,6 +479,23 @@ final class SkinScriptEngine {
 
         proxies[id] = proxy
         ctx.globalObject?.setValue(proxy, forProperty: id)
+
+        // Install a value getter/setter so JS assignments like `seek.value = X` fire
+        // the element's value_onchange callback (e.g. DrawTimeNormalView), matching WMP behaviour.
+        if let voc = valueOnChange, !voc.isEmpty {
+            let cbName = "__voc_\(id)"
+            ctx.evaluateScript("function \(cbName)(value) { \(voc) }")
+            ctx.evaluateScript("""
+            (function(p) {
+                var _v = 0;
+                Object.defineProperty(p, 'value', {
+                    get: function() { return _v; },
+                    set: function(v) { _v = v; value = v; \(cbName)(v); },
+                    configurable: true
+                });
+            })(\(id));
+            """)
+        }
     }
 
     // MARK: - Live backend wiring
@@ -726,6 +744,8 @@ final class SkinScriptEngine {
             .sink { [weak self] _ in
                 guard let self else { return }
                 if let script = self.playerCallbacks?.playStateOnChange { self.evaluate(script) }
+                // status_onChange fires whenever playback state (and thus player.status) changes.
+                if let script = self.playerCallbacks?.statusOnChange { self.evaluate(script) }
                 self.onStateChanged?()
             }
             .store(in: &backendCancellables)
@@ -735,6 +755,11 @@ final class SkinScriptEngine {
             .sink { [weak self] _ in
                 guard let self else { return }
                 if let script = self.playerCallbacks?.openStateOnChange { self.evaluate(script) }
+                if let script = self.playerCallbacks?.statusOnChange { self.evaluate(script) }
+                // currentPlaylist_onChange fires when new media has been opened and is ready.
+                if self.playerBackend?.openState == .mediaOpen {
+                    if let script = self.playerCallbacks?.currentPlaylistOnChange { self.evaluate(script) }
+                }
                 self.onStateChanged?()
             }
             .store(in: &backendCancellables)

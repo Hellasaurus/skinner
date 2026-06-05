@@ -132,11 +132,21 @@ public final class AVFoundationPlayer: PlayerBackend {
             startingFrame: startFrame,
             frameCount:    AVAudioFrameCount(remaining),
             at:            nil,
-            completionCallbackType: .dataPlayedBack
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.loadGeneration == generation else { return }
-                self.handleItemEnded()
+            completionCallbackType: .dataPlayedBack,
+            completionHandler: Self.makeCompletion(self, generation: generation)
+        )
+    }
+
+    // nonisolated so the returned closure is not @MainActor-isolated; AVFAudio calls it
+    // from its own internal queue, and a @MainActor closure would crash on that thread.
+    private nonisolated static func makeCompletion(
+        _ player: AVFoundationPlayer,
+        generation: Int
+    ) -> (AVAudioPlayerNodeCompletionCallbackType) -> Void {
+        { [weak player] _ in
+            Task { @MainActor [weak player] in
+                guard let player, player.loadGeneration == generation else { return }
+                player.handleItemEnded()
             }
         }
     }

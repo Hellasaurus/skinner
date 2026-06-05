@@ -348,13 +348,3 @@ private func makeGrayMask(region: [Bool], width: Int, height: Int) -> CGImage? {
 }
 
 // MARK: - Pixel helpers
-
-private func makeBitmapContext(width: Int, height: Int) -> CGContext? {
-    guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
-    return CGContext(data: nil,
-                     width: width, height: height,
-                     bitsPerComponent: 8, bytesPerRow: width * 4,
-                     space: space,
-                     bitmapInfo: CGBitmapInfo(
-                         rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).rawValue)
-}

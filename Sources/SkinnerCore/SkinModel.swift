@@ -182,11 +182,13 @@ public struct Slider: Sendable {
     public var direction: String?
     public var thumbImage: String?
     public var thumbDownImage: String?
-    public var foregroundImage: String?
+    public var backgroundImage: String? // static track backdrop
+    public var foregroundImage: String? // fill/progress track
     public var image: String?           // CustomSlider background
     public var positionImage: String?   // CustomSlider brightness-encoded map
     public var borderSize: Int?
     public var slide: Bool?
+    public var tiled: Bool
 }
 
 // MARK: - TextLabel

@@ -474,11 +474,13 @@ private extension WMSParser {
             direction: a.str("direction"),
             thumbImage: a.str("thumbimage"),
             thumbDownImage: a.str("thumbdownimage"),
+            backgroundImage: a.str("backgroundimage"),
             foregroundImage: a.str("foregroundimage"),
             image: a.str("image"),
             positionImage: a.str("positionimage"),
             borderSize: a.int("bordersize"),
-            slide: a.boolOpt("slide")
+            slide: a.boolOpt("slide"),
+            tiled: a.bool("tiled")
         )
     }
 

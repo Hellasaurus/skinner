@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 
 // MARK: - SkinCanvasView
 
@@ -27,9 +28,23 @@ public final class SkinCanvasView: NSView {
     private let bundle:          SkinBundle?
     private var dragOrigin:      NSPoint?
     private var activeSliderIdx: Int?
+    private var lastKnownMousePt: NSPoint?
     private var engine: SkinScriptEngine?
-    private var animatedSubviews:     [String: NSImageView] = [:]   // element id → NSImageView
-    private var animatedSubviewBases: [String: ElementBase] = [:]  // element id → base (for visibility sync)
+    private var animatedSubviews:              [String: NSImageView]            = [:]
+    private var animatedSubviewBases:          [String: ElementBase]            = [:]
+    private var animatedSubviewCurrentImage:   [String: String]                 = [:]
+    private var animatedSubviewTransparency:   [String: [(UInt8, UInt8, UInt8)]] = [:]
+    private var animatedSubviewWmsBackground:  [String: String]                  = [:]
+    private var completedOnePassAnimations:    Set<String>                       = []
+    /// IDs promoted at runtime by JS (e.g. mainShutter). These are interactive toggle elements.
+    private var interactiveAnimatedSubviews:  Set<String>                       = []
+    /// Lowercased image names whose drawing is handled by an NSImageView (including id-less
+    /// GIF subviews). CGContext must not draw these, or the static first frame would cover
+    /// the animated NSImageView and any elements drawn beneath it (e.g. the time text).
+    private var promotedGifNames:             Set<String>                       = []
+    /// Startup-animation IDs currently showing their WMS static fallback background
+    /// (e.g. introShutterAnim showing shutter_close_static.gif after a close animation).
+    private var startupFallbacksShowing:      Set<String>                       = []
 
     public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
     public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
@@ -40,9 +55,11 @@ public final class SkinCanvasView: NSView {
     public func setPlayerBackend(_ backend: any PlayerBackend) {
         playerBackend = backend
         engine?.onStateChanged = { [weak self] in
-            self?.updateLiveSliders()
-            self?.updateAnimatedSubviewVisibility()
-            if let b = self?.bounds { self?.setNeedsDisplay(b) }
+            guard let self else { return }
+            self.updateLiveSliders()
+            self.updateAnimatedSubviewVisibility()
+            self.recollect()
+            self.setNeedsDisplay(self.bounds)
         }
         engine?.playerBackend = backend
     }
@@ -51,6 +68,55 @@ public final class SkinCanvasView: NSView {
         let isPlaying = playerBackend?.playState == .playing
         for (id, iv) in animatedSubviews {
             guard let base = animatedSubviewBases[id] else { continue }
+
+            // Swap image when JS has changed backgroundImage (e.g. idle → playback GIF).
+            // Check BEFORE the completion guard so a new image assignment restarts the animation.
+            if let newName = engine?.state(for: id)?.backgroundImage?.lowercased(),
+               newName != animatedSubviewCurrentImage[id],
+               let bundle {
+                // A new image assignment clears any prior one-pass completion state.
+                completedOnePassAnimations.remove(id)
+                let extra = animatedSubviewTransparency[id] ?? []
+                let url   = bundle.assetURL(named: newName)
+                let img: NSImage?
+                var rawGif: NSImage? = nil
+                if newName.hasSuffix(".gif"),
+                   let raw = NSImage(contentsOf: url), gifIsAnimated(raw) {
+                    img = loadGifMagentaFree(url: url, extraTransparent: extra) ?? raw
+                    rawGif = raw
+                } else {
+                    img = cache.images[newName] ?? NSImage(contentsOf: url)
+                }
+                if let img {
+                    iv.image    = img
+                    iv.animates = newName.hasSuffix(".gif")
+                    iv.isHidden = false
+                    animatedSubviewCurrentImage[id] = newName
+                    if let raw = rawGif, iv.animates, let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+                        let interactive = interactiveAnimatedSubviews.contains(id)
+                        let isClose = newName.contains("close")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
+                            iv?.animates = false
+                            iv?.isHidden = true
+                            if interactive {
+                                // Show/hide the static fallback on overlapping startup elements
+                                // (e.g. introShutterAnim shows shutter_close_static.gif to cover flag_extra).
+                                if isClose { self?.restoreStartupFallbackImages() }
+                                else       { self?.rehideStartupFallbackImages()  }
+                            } else {
+                                self?.completedOnePassAnimations.insert(id)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // One-pass animations that have finished playing must stay hidden.
+            if completedOnePassAnimations.contains(id) {
+                iv.isHidden = true
+                continue
+            }
+
             // Subviews declared visible="false" in the WMS are playback-state animations.
             // Show them when playing; the skin JS doesn't reliably toggle them due to
             // visMark initialization ordering (e.g. Pulsar's playbackAnim/visMark=4 issue).
@@ -228,8 +294,8 @@ public final class SkinCanvasView: NSView {
             switch element {
             case .button(let b):
                 guard !elementIsHidden(b.base) else { continue }
-                let x  = (lc.resolve(b.base.left) ?? 0) + offset.x
-                let y  = (lc.resolve(b.base.top)  ?? 0) + offset.y
+                let x = liveCoord(b.base.id, attr: b.base.left, propName: "left", lc: lc) + offset.x
+                let y = liveCoord(b.base.id, attr: b.base.top,  propName: "top",  lc: lc) + offset.y
                 let md       = b.image.flatMap { cache.mapData[$0.lowercased()] }
                 let clipMask = b.clippingImage.flatMap { cache.clipMasks[$0.lowercased()] }
                 var w  = lc.resolve(b.base.width)  ?? CGFloat(md?.width  ?? 0)
@@ -268,17 +334,38 @@ public final class SkinCanvasView: NSView {
             switch element {
             case .slider(let s):
                 guard !elementIsHidden(s.base) else { continue }
-                let x    = (lc.resolve(s.base.left) ?? 0) + offset.x
-                let y    = (lc.resolve(s.base.top)  ?? 0) + offset.y
+                // Use engine-aware resolveCoord so jscript: expressions evaluate correctly.
+                let rawX = resolveCoord(s.base.left, lc: lc) ?? 0
+                let rawY = resolveCoord(s.base.top,  lc: lc) ?? 0
+                // Propagate computed positions back to JS proxies so sibling-reference
+                // jscript expressions (e.g. eq2.left = jscript:eq1.left+15) resolve correctly
+                // when subsequent sliders in the same parent are processed.
+                if let id = s.base.id {
+                    if case .jsExpr = s.base.left { engine?.evaluate("\(id).left = \(rawX)") }
+                    if case .jsExpr = s.base.top  { engine?.evaluate("\(id).top  = \(rawY)") }
+                }
+                let x = rawX + offset.x
+                let y = rawY + offset.y
                 let posMD = s.positionImage.flatMap { cache.mapData[$0.lowercased()] }
-                var w    = lc.resolve(s.base.width)  ?? CGFloat(posMD?.width  ?? 0)
-                var h    = lc.resolve(s.base.height) ?? CGFloat(posMD?.height ?? 0)
+                var w    = resolveCoord(s.base.width,  lc: lc) ?? CGFloat(posMD?.width  ?? 0)
+                var h    = resolveCoord(s.base.height, lc: lc) ?? CGFloat(posMD?.height ?? 0)
                 var fc   = 1
                 if let n = s.image, let img = cache.images[n.lowercased()],
                    let pd = posMD, pd.width > 0 {
                     fc = max(1, Int(img.size.width) / pd.width)
                     if w == 0 { w = CGFloat(pd.width)  }
                     if h == 0 { h = CGFloat(pd.height) }
+                }
+                // Fall back to track image dimensions for any still-missing axis.
+                if w == 0 || h == 0 {
+                    let trackImg = (s.backgroundImage ?? s.foregroundImage)
+                        .flatMap { cache.images[$0.lowercased()] }
+                    if w == 0 { w = trackImg?.size.width  ?? 0 }
+                    if h == 0 { h = trackImg?.size.height ?? 0 }
+                }
+                if w == 0 || h == 0, let n = s.thumbImage, let img = cache.images[n.lowercased()] {
+                    if w == 0 { w = img.size.width  }
+                    if h == 0 { h = img.size.height }
                 }
                 var rs = RenderedSlider(model: s,
                                         frame: CGRect(x: x, y: y, width: w, height: h),
@@ -388,8 +475,8 @@ public final class SkinCanvasView: NSView {
                                  offset: CGPoint) {
         for element in elements {
             guard case .subview(let sv) = element, !elementIsHidden(sv.base) else { continue }
-            let sx = (resolveCoord(sv.base.left, lc: lc) ?? 0) + offset.x
-            let sy = (resolveCoord(sv.base.top,  lc: lc) ?? 0) + offset.y
+            let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+            let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
             let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                          ?? sv.backgroundImage
             if let imgName = bgName,
@@ -397,6 +484,24 @@ public final class SkinCanvasView: NSView {
                 let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
                     .compactMap { $0.flatMap(parseAnyColor) }
                 paintMdIntoOpacity(md: md, ox: Int(sx), oy: Int(sy), extraColors: extra)
+            } else if let colorStr = sv.backgroundColor,
+                      !colorStr.isEmpty, colorStr.lowercased() != "none",
+                      let w = lc.resolve(sv.base.width).map(Int.init),
+                      let h = lc.resolve(sv.base.height).map(Int.init),
+                      w > 0, h > 0 {
+                // Solid-color subview interiors (no background image) are visually opaque
+                // and must be hittable — e.g. the EQ drawer in Headspace whose inner area
+                // is filled via backgroundColor rather than an image.
+                let ox = Int(sx), oy = Int(sy)
+                for row in 0 ..< h {
+                    let vy = oy + row
+                    guard vy >= 0, vy < bgHeight else { continue }
+                    for col in 0 ..< w {
+                        let vx = ox + col
+                        guard vx >= 0, vx < bgWidth else { continue }
+                        bgOpacity[vy * bgWidth + vx] = true
+                    }
+                }
             }
             paintBgOpacity(in: sv.children, lc: lc, offset: CGPoint(x: sx, y: sy))
         }
@@ -448,13 +553,7 @@ public final class SkinCanvasView: NSView {
                 guard !elementIsHidden(sv.base, live: true) else { continue }
                 let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
-                let svZ = sv.base.zIndex ?? 0
                 let childOffset = CGPoint(x: sx, y: sy)
-                // Only children with an *explicitly set* zIndex lower than the parent's go
-                // behind the background image.  Children with no zIndex (defaulting to 0)
-                // always draw above the background — they are the normal case.
-                let below = sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }
-                let above = sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }
                 let alpha = effectiveAlpha(for: sv.base)
                 let needsAlpha = alpha < 255
                 // Clip children to the subview's declared bounds when both dimensions are
@@ -475,22 +574,35 @@ public final class SkinCanvasView: NSView {
                     ctx.setAlpha(CGFloat(alpha) / 255.0)
                     ctx.beginTransparencyLayer(auxiliaryInfo: nil)
                 }
-                drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
-                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
-                // Skip if an animated NSImageView is handling this element.
+                // Fill backgroundColor before drawing the background image so the image sits on top.
+                // Only fill when we have explicit clip dimensions; otherwise size is unknown.
+                if let colorStr = sv.backgroundColor,
+                   colorStr.lowercased() != "none", !colorStr.isEmpty,
+                   let rgb = parseAnyColor(colorStr),
+                   let w = clipW, let h = clipH {
+                    NSColor(skinRGB: rgb).setFill()
+                    NSBezierPath.fill(NSRect(x: sx, y: sy, width: w, height: h))
+                }
+                // A subview's backgroundImage is always its background — draw it before all
+                // children regardless of their zIndex values.  Child zIndex governs stacking
+                // among siblings, not relative to the parent container's own background.
                 if sv.base.id.flatMap({ animatedSubviews[$0] }) == nil {
                     let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                                  ?? sv.backgroundImage
                     if let name = bgName,
                        cache.buttonGroupsByMappingImage[name.lowercased()] == nil,
                        !cache.clipImageNames.contains(name.lowercased()),
+                       // Also skip GIFs promoted to NSImageViews that have no id (e.g. intro
+                       // animations). Drawing their static first frame from cache would cover
+                       // any elements beneath them (e.g. the time text) permanently.
+                       !promotedGifNames.contains(name.lowercased()),
                        let img  = cache.images[name.lowercased()] {
                         let w = lc.resolve(sv.base.width)  ?? img.size.width
                         let h = lc.resolve(sv.base.height) ?? img.size.height
                         img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
                     }
                 }
-                drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
+                drawElements(sv.children, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
                 if needsAlpha { ctx.endTransparencyLayer() }
                 if needsGState { ctx.restoreGState() }
@@ -555,9 +667,20 @@ public final class SkinCanvasView: NSView {
                 let ty = (resolveCoord(t.base.top,    lc: lc) ?? 0) + offset.y
                 let tw =  resolveCoord(t.base.width,  lc: lc) ?? 100
                 let th =  resolveCoord(t.base.height, lc: lc) ?? 14
-                // JS-set value (e.g. metadata.value = ...) takes precedence over the WMS attribute.
-                let scriptValue = t.base.id.flatMap { engine?.state(for: $0)?.value }
-                let text = scriptValue ?? engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
+                // wmpprop:/jsExpr: bindings are always evaluated live so they reflect
+                // current playback state (e.g. time position string) rather than a stale
+                // JS proxy value set during a previous player state change (e.g. "00:00"
+                // written by onChangePlayerState when stopped). For literal/absent value
+                // attributes, JS proxy state is the authoritative source (e.g. metadata
+                // text set by updateMetadata).
+                let text: String
+                switch t.value {
+                case .wmpProp, .jsExpr:
+                    text = engine?.resolveText(t.value) ?? ""
+                default:
+                    let scriptValue = t.base.id.flatMap { engine?.state(for: $0)?.value }
+                    text = scriptValue ?? engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
+                }
                 guard !text.isEmpty else { continue }
                 drawTextLabel(text, in: NSRect(x: tx, y: ty, width: tw, height: th), label: t)
 
@@ -626,8 +749,11 @@ public final class SkinCanvasView: NSView {
         let cgRect = CGRect(origin: rect.origin, size: rect.size)
 
         ctx.saveGState()
-        if let clip = group.clipMask { ctx.clip(to: cgRect, mask: clip) }
-        if let full = group.assets.fullMask { ctx.clip(to: cgRect, mask: full) }
+        if let clip = group.clipMask {
+            ctx.clip(to: cgRect, mask: clip)
+        } else if let full = group.assets.fullMask {
+            ctx.clip(to: cgRect, mask: full)
+        }
         normal.draw(in: rect)
         ctx.restoreGState()
 
@@ -705,9 +831,52 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// Draws a slider track image using 3-slice (end-cap) rendering when tiled=true.
+    /// Cap size = half the image's minor dimension. The middle section is a single center
+    /// pixel (row for vertical, column for horizontal) stretched to fill, matching WMP behaviour.
+    private func drawSliderTrackImage(_ img: NSImage, in frame: NSRect, isVertical: Bool, tiled: Bool) {
+        let iw = img.size.width, ih = img.size.height
+        guard tiled else { img.draw(in: frame); return }
+        // NSImage y=0 is at the image visual-bottom; with respectFlipped:true in a flipped
+        // view the mapping is: NSImage y=ih-1 → dest top, NSImage y=0 → dest bottom.
+        if isVertical {
+            let cap = (iw / 2).rounded(.down)
+            guard cap > 0, ih > 2 * cap, frame.height > 2 * cap else { img.draw(in: frame); return }
+            // Single center row of the middle section (NSImage y = (ih-1)/2 rounded down)
+            let midY = ((ih - 1) / 2).rounded(.down)
+            img.draw(in: NSRect(x: frame.minX, y: frame.minY, width: iw, height: cap),
+                     from: NSRect(x: 0, y: ih - cap, width: iw, height: cap),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            img.draw(in: NSRect(x: frame.minX, y: frame.minY + cap, width: iw, height: frame.height - 2 * cap),
+                     from: NSRect(x: 0, y: midY, width: iw, height: 1),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            img.draw(in: NSRect(x: frame.minX, y: frame.maxY - cap, width: iw, height: cap),
+                     from: NSRect(x: 0, y: 0, width: iw, height: cap),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        } else {
+            let cap = (ih / 2).rounded(.down)
+            guard cap > 0, iw > 2 * cap, frame.width > 2 * cap else { img.draw(in: frame); return }
+            let midX = ((iw - 1) / 2).rounded(.down)
+            img.draw(in: NSRect(x: frame.minX, y: frame.minY, width: cap, height: ih),
+                     from: NSRect(x: 0, y: 0, width: cap, height: ih),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            img.draw(in: NSRect(x: frame.minX + cap, y: frame.minY, width: frame.width - 2 * cap, height: ih),
+                     from: NSRect(x: midX, y: 0, width: 1, height: ih),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            img.draw(in: NSRect(x: frame.maxX - cap, y: frame.minY, width: cap, height: ih),
+                     from: NSRect(x: iw - cap, y: 0, width: cap, height: ih),
+                     operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+    }
+
     private func drawStandardSlider(_ slider: RenderedSlider) {
         let frame = slider.frame
+        let isVertical = slider.model.direction?.lowercased() == "vertical"
 
+        if let bgName = slider.model.backgroundImage,
+           let bg = cache.images[bgName.lowercased()] {
+            drawSliderTrackImage(bg, in: frame, isVertical: isVertical, tiled: slider.model.tiled)
+        }
         if let trackName = slider.model.foregroundImage,
            let track = cache.images[trackName.lowercased()] {
             track.draw(in: frame)
@@ -720,19 +889,18 @@ public final class SkinCanvasView: NSView {
         let thumbH  = thumb.size.height
         let border  = CGFloat(slider.model.borderSize ?? 0)
         let v       = slider.value
-        let vertical = slider.model.direction?.lowercased() == "vertical"
 
         // borderSize is the distance from each edge to the thumb's CENTER at the extremes.
         // The thumb image can slightly clip at the edges; clamp to stay within the frame.
         let thumbRect: NSRect
-        if vertical {
+        if isVertical {
             let travel = max(0, frame.height - border * 2)
             let rawY   = frame.minY + border + (1 - v) * travel - thumbH / 2
             let thumbY = max(frame.minY, min(frame.maxY - thumbH, rawY))
             let thumbX = frame.minX + (frame.width - thumbW) / 2
             thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
         } else {
-            let travel = max(0, frame.width - border * 2)
+            let travel = max(0, frame.width  - border * 2)
             let rawX   = frame.minX + border + v * travel - thumbW / 2
             let thumbX = max(frame.minX, min(frame.maxX - thumbW, rawX))
             let thumbY = frame.minY + (frame.height - thumbH) / 2
@@ -840,12 +1008,12 @@ public final class SkinCanvasView: NSView {
         defer { dragOrigin = nil }
         let pt = convert(event.locationInWindow, from: nil)
         for i in groups.indices {
-            if let pressed = groups[i].pressedColor {
-                if groups[i].colorAt(pt) == pressed { fireGroupAction(groups[i], colorKey: pressed) }
-                groups[i].pressedColor = nil
-                setNeedsDisplay(bounds)
-                return
-            }
+            guard let pressed = groups[i].pressedColor else { continue }
+            let group = groups[i]           // snapshot before firing; action may rebuild groups
+            groups[i].pressedColor = nil
+            setNeedsDisplay(bounds)
+            if group.colorAt(pt) == pressed { fireGroupAction(group, colorKey: pressed) }
+            return
         }
         for i in buttons.indices.reversed() {
             guard buttons[i].isPressed else { continue }
@@ -926,6 +1094,7 @@ public final class SkinCanvasView: NSView {
 
     public override func mouseMoved(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
+        lastKnownMousePt = pt
         var changed = false
         var groupHitHandled = false
         for i in groups.indices.reversed() {
@@ -969,6 +1138,7 @@ public final class SkinCanvasView: NSView {
     }
 
     public override func mouseExited(with event: NSEvent) {
+        lastKnownMousePt = nil
         var changed = false
         for i in groups.indices where groups[i].hoveredColor != nil || groups[i].pressedColor != nil {
             groups[i].hoveredColor = nil; groups[i].pressedColor = nil; changed = true
@@ -1011,20 +1181,158 @@ public final class SkinCanvasView: NSView {
     /// Must be called whenever JS changes element positions (moveTo, direct property write).
     private func recollect() {
         let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
-        let savedValues = sliders.map { $0.value }
+
+        // Snapshot interactive state before rebuilding so a position-tick recollect
+        // between mouseDown and mouseUp doesn't swallow button clicks or lose hover.
+        let savedSliderValues  = sliders.map { $0.value }
+        let savedGroupCount    = groups.count
+        let savedGroupPressed  = groups.enumerated().compactMap { (i, g) -> (Int, String)? in
+            guard let p = g.pressedColor else { return nil }
+            return (i, p)
+        }
+        let savedButtonPressed = Set(buttons.compactMap { b -> String? in
+            b.isPressed ? b.model.base.id : nil
+        })
+
         groups  = collectGroups(in: skinView.elements,  offset: .zero, lc: lc)
         buttons = collectButtons(in: skinView.elements, offset: .zero, lc: lc)
         sliders = collectSliders(in: skinView.elements, offset: .zero, lc: lc)
-        for i in sliders.indices where i < savedValues.count {
-            sliders[i].value = savedValues[i]
+
+        for i in sliders.indices where i < savedSliderValues.count {
+            sliders[i].value = savedSliderValues[i]
+        }
+        // Only restore per-index pressed state when the group list is structurally identical
+        // (position-tick recollect). If the count changed (color scheme swap, visibility toggle)
+        // the indices no longer correspond and we leave pressedColor nil on all groups.
+        if groups.count == savedGroupCount {
+            for (i, p) in savedGroupPressed {
+                groups[i].pressedColor = p
+            }
+        }
+        for i in buttons.indices {
+            if let id = buttons[i].model.base.id, savedButtonPressed.contains(id) {
+                buttons[i].isPressed = true
+            }
+        }
+
+        reapplyHover()
+    }
+
+    private func reapplyHover() {
+        guard let pt = lastKnownMousePt else { return }
+        var groupHitHandled = false
+        for i in groups.indices.reversed() {
+            let hidden = elementIsHidden(groups[i].model.base, live: true)
+            let h: String? = (!hidden && !groupHitHandled) ? groups[i].colorAt(pt) : nil
+            if h != nil { groupHitHandled = true }
+            groups[i].hoveredColor = h
+        }
+        var buttonHitHandled = false
+        for i in buttons.indices.reversed() {
+            let hidden = elementIsHidden(buttons[i].model.base, live: true)
+            let h = !hidden && !buttonHitHandled && buttons[i].hitTest(pt)
+            if h { buttonHitHandled = true }
+            buttons[i].isHovered = h
         }
     }
 
     private func applyScriptChanges() {
         engine?.fireOnEndMoveCallbacks()
         recollect()
+        updateLiveSliders()
         updateAnimatedSubviewVisibility()
+        // Rebuild the click-through mask so elements moved by JS (e.g. sEqEar sliding open)
+        // register as clickable at their new positions.
+        buildBgOpacity()
+        if let bundle {
+            let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+            promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
+        }
         setNeedsDisplay(bounds)
+    }
+
+    /// Scans the element tree for subviews that have been dynamically assigned a GIF background
+    /// by JS (e.g. via `mainShutter.backgroundImage = "shutter_open2.gif"`) but don't yet have
+    /// an NSImageView. Creates one on demand so the animation plays correctly.
+    /// Called only from applyScriptChanges (user interactions), not on every position tick.
+    private func promoteNewGifSubviews(in elements: [SkinElement],
+                                        offset: CGPoint,
+                                        lc: LayoutContext,
+                                        bundle: SkinBundle) {
+        for element in sortedByZIndex(elements) {
+            guard case .subview(let sv) = element else { continue }
+            let x = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+            let y = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+            let co = CGPoint(x: x, y: y)
+
+            if let id = sv.base.id,
+               animatedSubviews[id] == nil,
+               !completedOnePassAnimations.contains(id),
+               let newName = engine?.state(for: id)?.backgroundImage?.lowercased(),
+               newName.hasSuffix(".gif"),
+               !cache.clipImageNames.contains(newName),
+               let raw = NSImage(contentsOf: bundle.assetURL(named: newName)),
+               gifIsAnimated(raw) {
+                let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
+                    .compactMap { $0.flatMap(parseAnyColor) }
+                let img = loadGifMagentaFree(url: bundle.assetURL(named: newName),
+                                              extraTransparent: extra) ?? raw
+                let w = lc.resolve(sv.base.width)  ?? img.size.width
+                let h = lc.resolve(sv.base.height) ?? img.size.height
+                let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                iv.image        = img
+                iv.animates     = true
+                iv.imageScaling = .scaleAxesIndependently
+                iv.isHidden     = elementIsHidden(sv.base, live: true)
+                addSubview(iv)
+                if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+                    let isClose = newName.contains("close")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
+                        iv?.animates = false
+                        iv?.isHidden = true
+                        if isClose { self?.restoreStartupFallbackImages() }
+                        else       { self?.rehideStartupFallbackImages()  }
+                    }
+                }
+                animatedSubviews[id]            = iv
+                animatedSubviewBases[id]        = sv.base
+                animatedSubviewCurrentImage[id] = newName
+                animatedSubviewTransparency[id] = extra
+                interactiveAnimatedSubviews.insert(id)
+            }
+
+            promoteNewGifSubviews(in: sv.children, offset: co, lc: lc, bundle: bundle)
+        }
+    }
+
+    /// After a close animation on an interactive element, find completed startup animations
+    /// whose WMS backgroundImage differs from their animated GIF and show them statically.
+    /// This lets e.g. introShutterAnim display shutter_close_static.gif to cover flag_extra.
+    private func restoreStartupFallbackImages() {
+        guard let bundle else { return }
+        for id in Array(completedOnePassAnimations) {
+            guard let iv  = animatedSubviews[id],
+                  let wms = animatedSubviewWmsBackground[id],
+                  let img = cache.images[wms]
+                            ?? NSImage(contentsOf: bundle.assetURL(named: wms))
+            else { continue }
+            iv.image    = img
+            iv.animates = false
+            iv.isHidden = false
+            completedOnePassAnimations.remove(id)
+            startupFallbacksShowing.insert(id)
+        }
+    }
+
+    /// After an open animation on an interactive element, hide any startup animations
+    /// that were showing their WMS static fallback.
+    private func rehideStartupFallbackImages() {
+        for id in startupFallbacksShowing {
+            guard let iv = animatedSubviews[id] else { continue }
+            iv.isHidden = true
+            completedOnePassAnimations.insert(id)
+        }
+        startupFallbacksShowing.removeAll()
     }
 
     // MARK: - Animated GIF subviews
@@ -1074,30 +1382,62 @@ public final class SkinCanvasView: NSView {
                 buildAnimatedSubviews(in: below, offset: co, lc: lc)
                 // Add this element's background as an NSImageView so it sits above the GIF below-children.
                 if let name = bgName,
-                   !cache.clipImageNames.contains(name.lowercased()),
-                   let img = NSImage(contentsOf: bundle.assetURL(named: name)) {
-                    // Use the pixel-accurate size from the asset cache rather than img.size,
-                    // which may be DPI-adjusted (e.g. screen_cover.png has a 300 DPI pHYs chunk).
-                    let cachedSize = cache.images[name.lowercased()]?.size
-                    let w  = lc.resolve(sv.base.width)  ?? cachedSize?.width  ?? img.size.width
-                    let h  = lc.resolve(sv.base.height) ?? cachedSize?.height ?? img.size.height
-                    let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
-                    iv.image        = img
-                    iv.animates     = name.lowercased().hasSuffix(".gif")
-                    iv.imageScaling = .scaleAxesIndependently
-                    iv.isHidden     = hidden
-                    addSubview(iv)
-                    if let id = sv.base.id {
-                        animatedSubviews[id]     = iv
-                        animatedSubviewBases[id] = sv.base
+                   !cache.clipImageNames.contains(name.lowercased()) {
+                    let lower = name.lowercased()
+                    let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
+                        .compactMap { $0.flatMap(parseAnyColor) }
+                    let img: NSImage?
+                    var rawGif: NSImage? = nil
+                    if lower.hasSuffix(".gif"),
+                       let raw = NSImage(contentsOf: bundle.assetURL(named: name)),
+                       gifIsAnimated(raw) {
+                        img = loadGifMagentaFree(url: bundle.assetURL(named: name),
+                                                  extraTransparent: extra) ?? raw
+                        rawGif = raw
+                    } else {
+                        img = cache.images[lower] ?? NSImage(contentsOf: bundle.assetURL(named: name))
+                    }
+                    if let img {
+                        // Use pixel-accurate size from the asset cache (img.size may be DPI-adjusted).
+                        let cachedSize = cache.images[lower]?.size
+                        let w  = lc.resolve(sv.base.width)  ?? cachedSize?.width  ?? img.size.width
+                        let h  = lc.resolve(sv.base.height) ?? cachedSize?.height ?? img.size.height
+                        let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                        iv.image        = img
+                        iv.animates     = lower.hasSuffix(".gif")
+                        iv.imageScaling = .scaleAxesIndependently
+                        iv.isHidden     = hidden
+                        addSubview(iv)
+                        if let raw = rawGif, let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+                            let animId = sv.base.id
+                            DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
+                                iv?.animates = false
+                                iv?.isHidden = true
+                                if let id = animId { self?.completedOnePassAnimations.insert(id) }
+                            }
+                        }
+                        promotedGifNames.insert(lower)
+                        if let id = sv.base.id {
+                            animatedSubviews[id]            = iv
+                            animatedSubviewBases[id]        = sv.base
+                            animatedSubviewCurrentImage[id] = lower
+                            animatedSubviewTransparency[id] = extra
+                            if let wms = sv.backgroundImage?.lowercased(), wms != lower {
+                                animatedSubviewWmsBackground[id] = wms
+                            }
+                        }
                     }
                 }
                 buildAnimatedSubviews(in: above, offset: co, lc: lc)
             } else {
                 if let name = bgName, name.lowercased().hasSuffix(".gif"),
                    !cache.clipImageNames.contains(name.lowercased()),
-                   let img  = NSImage(contentsOf: bundle.assetURL(named: name)),
-                   gifIsAnimated(img) {
+                   let raw  = NSImage(contentsOf: bundle.assetURL(named: name)),
+                   gifIsAnimated(raw) {
+                    let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
+                        .compactMap { $0.flatMap(parseAnyColor) }
+                    let img = loadGifMagentaFree(url: bundle.assetURL(named: name),
+                                                  extraTransparent: extra) ?? raw
                     let w  = lc.resolve(sv.base.width)  ?? img.size.width
                     let h  = lc.resolve(sv.base.height) ?? img.size.height
                     let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
@@ -1106,9 +1446,24 @@ public final class SkinCanvasView: NSView {
                     iv.imageScaling = .scaleAxesIndependently
                     iv.isHidden     = hidden
                     addSubview(iv)
+                    if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+                        let animId = sv.base.id
+                        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
+                            iv?.animates = false
+                            iv?.isHidden = true
+                            if let id = animId { self?.completedOnePassAnimations.insert(id) }
+                        }
+                    }
+                    promotedGifNames.insert(name.lowercased())
                     if let id = sv.base.id {
-                        animatedSubviews[id]     = iv
-                        animatedSubviewBases[id] = sv.base
+                        animatedSubviews[id]            = iv
+                        animatedSubviewBases[id]        = sv.base
+                        animatedSubviewCurrentImage[id] = name.lowercased()
+                        animatedSubviewTransparency[id] = extra
+                        let nameLower = name.lowercased()
+                        if let wms = sv.backgroundImage?.lowercased(), wms != nameLower {
+                            animatedSubviewWmsBackground[id] = wms
+                        }
                     }
                 }
                 // Only recurse into children of visible subviews.
@@ -1211,6 +1566,69 @@ private struct RenderedSlider {
 }
 
 // MARK: - File-local helpers
+
+/// Decodes every frame of an animated GIF, strips magenta (and any extra transparent
+/// colours) from each frame via a CGContext pixel pass, then re-encodes as a new animated
+/// GIF in memory.  Returns nil for single-frame images or on decode/encode failure.
+private func loadGifMagentaFree(url: URL,
+                                  extraTransparent: [(UInt8, UInt8, UInt8)] = []) -> NSImage? {
+    guard let raw = NSImage(contentsOf: url),
+          let rep = raw.representations.first as? NSBitmapImageRep,
+          let n   = rep.value(forProperty: .frameCount) as? Int, n > 1
+    else { return nil }
+
+    let destData = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(
+        destData, "com.compuserve.gif" as CFString, n, nil) else { return nil }
+
+    let fileProps: NSDictionary = [
+        kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: 0]
+    ]
+    CGImageDestinationSetProperties(dest, fileProps)
+
+    for i in 0 ..< n {
+        rep.setProperty(.currentFrame, withValue: NSNumber(value: i))
+        let delay = (rep.value(forProperty: .currentFrameDuration) as? Double) ?? 0.1
+        guard let cg  = rep.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let ctx = makeBitmapContext(width: cg.width, height: cg.height)
+        else { continue }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        guard let ptr = ctx.data else { continue }
+        let pixels = ptr.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
+        for j in 0 ..< cg.width * cg.height {
+            let o = j * 4
+            let r = pixels[o], g = pixels[o + 1], b = pixels[o + 2]
+            if isMagenta(r, g, b) ||
+               extraTransparent.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) {
+                pixels[o] = 0; pixels[o + 1] = 0; pixels[o + 2] = 0; pixels[o + 3] = 0
+            }
+        }
+        guard let clean = ctx.makeImage() else { continue }
+        let fProps: NSDictionary = [
+            kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: delay]
+        ]
+        CGImageDestinationAddImage(dest, clean, fProps)
+    }
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    return NSImage(data: destData as Data)
+}
+
+/// Returns the total single-pass duration (seconds) for GIFs that should play once,
+/// or nil for GIFs that loop forever.  GIFs without a Netscape loop extension play
+/// once by definition; those with loop-count 0 loop forever.
+private func gifOnePassDuration(_ img: NSImage, excludingLastFrame: Bool = false) -> Double? {
+    guard let rep = img.representations.first as? NSBitmapImageRep,
+          let n   = rep.value(forProperty: .frameCount) as? Int, n > 1
+    else { return nil }
+    if let loop = rep.value(forProperty: .loopCount) as? Int, loop == 0 { return nil }
+    var total: Double = 0
+    let limit = excludingLastFrame ? n - 1 : n
+    for i in 0 ..< limit {
+        rep.setProperty(.currentFrame, withValue: NSNumber(value: i))
+        total += (rep.value(forProperty: .currentFrameDuration) as? Double) ?? 0.1
+    }
+    return total
+}
 
 /// Returns true if the NSImage has more than one frame (i.e. is a real animated GIF).
 /// Single-frame GIFs used as shape masks return false and should be drawn by CGContext.

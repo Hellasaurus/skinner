@@ -1,3 +1,5 @@
+import AppKit
+
 /// Returns true when the pixel is the chroma-key magenta used by WMP skins.
 func isMagenta(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Bool {
     r > 240 && g < 15 && b > 240
@@ -18,6 +20,16 @@ func parseHexColor(_ hex: String) -> (UInt8, UInt8, UInt8)? {
     return (UInt8((value >> 16) & 0xFF),
             UInt8((value >> 8)  & 0xFF),
             UInt8(value         & 0xFF))
+}
+
+func makeBitmapContext(width: Int, height: Int) -> CGContext? {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    return CGContext(data: nil,
+                     width: width, height: height,
+                     bitsPerComponent: 8, bytesPerRow: width * 4,
+                     space: space,
+                     bitmapInfo: CGBitmapInfo(
+                         rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).rawValue)
 }
 
 /// Parses a WMP skin color string — hex `#RRGGBB` or CSS named color — into component bytes.
