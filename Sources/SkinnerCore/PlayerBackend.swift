@@ -61,6 +61,7 @@ public protocol PlayerBackend: AnyObject {
     var eqPresetCount: Int { get }
     func eqPresetTitle(at index: Int) -> String
     func applyEQPreset(at index: Int)
+    var currentEQPresetIndex: Int { get }   // -1 when no preset is active (custom/flat)
     var currentEQPresetTitle: String { get }
     func nextEQPreset()
     func previousEQPreset()

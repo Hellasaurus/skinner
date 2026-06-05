@@ -342,6 +342,7 @@ public final class AVFoundationPlayer: PlayerBackend {
         eqSubject.send()
     }
 
+    public var currentEQPresetIndex: Int { _currentPresetIndex }
     public private(set) var currentEQPresetTitle: String = ""
     private var _currentPresetIndex: Int = -1
 

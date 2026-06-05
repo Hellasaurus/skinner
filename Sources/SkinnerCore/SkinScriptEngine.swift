@@ -13,10 +13,11 @@ struct ElementScriptState {
     var enabled: Bool?
     var image: String?       // button/element image override (element.image = "foo.png")
     var value: String?       // text element value set via JS (e.g. metadata.value = ...)
+    var down: Bool?          // sticky button toggle state (element.down = true/false/"true"/"false")
 
     var isEmpty: Bool {
         visible == nil && backgroundImage == nil && alphaBlend == nil
-            && enabled == nil && image == nil && value == nil
+            && enabled == nil && image == nil && value == nil && down == nil
     }
 }
 
@@ -41,6 +42,7 @@ final class SkinScriptEngine {
 
     // Stored once at init time; JS callbacks fire these scripts when backend state changes.
     private let playerCallbacks: Player?
+    private let onTimerHandler: String?
     private var backendCancellables = Set<AnyCancellable>()
 
     var playerBackend: (any PlayerBackend)? {
@@ -64,6 +66,7 @@ final class SkinScriptEngine {
         guard let ctx = JSContext() else { return nil }
         self.context = ctx
         self.playerCallbacks = skinView.player
+        self.onTimerHandler = skinView.onTimer
 
         ctx.exceptionHandler = { _, exc in
             // Skin scripts routinely access WMP internals we don't implement;
@@ -105,6 +108,10 @@ final class SkinScriptEngine {
                    ti.isNumber, ti.toInt32() == 0 { break }
             }
         }
+        // Fire any pending onEndMove callbacks so elements whose visibility/enabled
+        // state is set by an onEndMove handler (e.g. hideTopBaseButtons) reflect the
+        // correct initial state before SkinCanvasView first collects hittable elements.
+        fireOnEndMoveCallbacks()
     }
 
     // MARK: - Script evaluation
@@ -127,6 +134,21 @@ final class SkinScriptEngine {
                 context.evaluateScript("try { \(script) } catch(e) {}")
             }
         }
+    }
+
+    /// Reads the current value of `view.timerInterval` from JS.
+    /// Returns the interval in milliseconds, or nil if it is 0 / non-numeric.
+    var currentTimerInterval: Int? {
+        guard let v = context.evaluateScript("view.timerInterval"),
+              v.isNumber else { return nil }
+        let i = Int(v.toInt32())
+        return i > 0 ? i : nil
+    }
+
+    /// Fires the view's `onTimer` handler once.  No-op if the skin has no onTimer.
+    func fireOnTimer() {
+        guard let handler = onTimerHandler, !handler.isEmpty else { return }
+        evaluate(handler)
     }
 
     /// Evaluates a JS expression and returns its value as a CGFloat, or nil if the
@@ -184,6 +206,17 @@ final class SkinScriptEngine {
 
     // MARK: - State readback
 
+    /// Returns true when JS explicitly set `element.backgroundImage = ""` — as opposed to
+    /// the property simply never having been written.  Used to hide NSImageViews whose
+    /// dynamic GIF was cleared by script (e.g. `centerShutterSub.backgroundImage = ""`).
+    func backgroundImageWasCleared(for id: String) -> Bool {
+        guard let proxy = proxies[id],
+              let v = proxy.forProperty("backgroundImage"),
+              !v.isUndefined, !v.isNull, v.isString else { return false }
+        let s = v.toString() ?? ""
+        return s.isEmpty
+    }
+
     func state(for id: String) -> ElementScriptState? {
         guard let proxy = proxies[id] else { return nil }
         var s = ElementScriptState()
@@ -193,6 +226,7 @@ final class SkinScriptEngine {
         s.enabled         = boolProp(proxy,   "enabled")
         s.image           = stringProp(proxy, "image")
         s.value           = stringProp(proxy, "value")
+        s.down            = downProp(proxy,   "down")
         return s.isEmpty ? nil : s
     }
 
@@ -277,6 +311,18 @@ final class SkinScriptEngine {
         let prefChangeBridge: @convention(block) (String, String) -> Void = { [weak self] key, value in
             MainActor.assumeIsolated {
                 if key == "exitview" && value == "true" { self?.onCloseView?(viewId) }
+                // WMP preference-relay: buttons call theme.savePreference('remoteCallPl','true') etc.
+                // The real player's controlView timer would poll these, but we don't run that view.
+                // Instead, call checkRemoteViewStatus() directly — it's defined in the same .js file
+                // that mainView loads, so it's available in this context.
+                if key.hasPrefix("remotecall") && value == "true" {
+                    // controlView normally relays these via its own 100ms timer, where
+                    // controlStatus is already false.  Since we call checkRemoteViewStatus()
+                    // directly from the pref-change bridge (no timer), force controlStatus
+                    // false so the function enters the remote-call processing branch instead
+                    // of the player-state-sync branch it takes on the very first invocation.
+                    self?.evaluate("controlStatus = false; (typeof checkRemoteViewStatus==='function')&&checkRemoteViewStatus()")
+                }
             }
         }
         ctx.setObject(prefChangeBridge, forKeyedSubscript: "_skinnerOnPrefChange" as NSString)
@@ -638,6 +684,9 @@ final class SkinScriptEngine {
         let eqReset: @convention(block) () -> Void = { [weak self] in
             MainActor.assumeIsolated { self?.playerBackend?.resetEQ() }
         }
+        let getEQCurrentPreset: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentEQPresetIndex ?? -1 }
+        }
         let getEQPresetTitle: @convention(block) () -> String = { [weak self] in
             MainActor.assumeIsolated { self?.playerBackend?.currentEQPresetTitle ?? "" }
         }
@@ -657,16 +706,21 @@ final class SkinScriptEngine {
             ("_skinnerSetMute",      setMute),      ("_skinnerOpenURL",      openURL),
             ("_skinnerGetEQEnabled",      getEQEnabled),   ("_skinnerSetEQEnabled",    setEQEnabled),
             ("_skinnerGetEQGain",         getEQGain),      ("_skinnerSetEQGain",       setEQGain),
-            ("_skinnerGetEQPresetCount",  getEQPresetCount),
-            ("_skinnerGetEQPresetTitleAt",getEQPresetTitleAt),
-            ("_skinnerEQNextPreset",      eqNextPreset),   ("_skinnerEQPrevPreset",    eqPrevPreset),
-            ("_skinnerEQReset",           eqReset),        ("_skinnerGetEQPresetTitle",getEQPresetTitle),
+            ("_skinnerGetEQPresetCount",   getEQPresetCount),
+            ("_skinnerGetEQCurrentPreset", getEQCurrentPreset),
+            ("_skinnerGetEQPresetTitleAt", getEQPresetTitleAt),
+            ("_skinnerEQNextPreset",       eqNextPreset),   ("_skinnerEQPrevPreset",    eqPrevPreset),
+            ("_skinnerEQReset",            eqReset),        ("_skinnerGetEQPresetTitle",getEQPresetTitle),
         ] { context.setObject(val, forKeyedSubscript: name) }
 
         context.evaluateScript("""
         Object.defineProperty(player, 'playState', { get: function() { return _skinnerGetPlayState(); }, configurable: true });
         Object.defineProperty(player, 'openState', { get: function() { return _skinnerGetOpenState(); }, configurable: true });
         Object.defineProperty(player, 'URL', { get: function() { return _skinnerGetURL(); }, set: function(v) { _skinnerOpenURL(v); }, configurable: true });
+        Object.defineProperty(player.currentPlaylist, 'count', {
+            get: function() { return _skinnerGetOpenState() == osMediaOpen ? 1 : 0; },
+            configurable: true
+        });
 
         player.controls.play        = function()     { _skinnerPlay();             };
         player.controls.pause       = function()     { _skinnerPause();            };
@@ -723,6 +777,10 @@ final class SkinScriptEngine {
             Object.defineProperty(eq, 'enabled', {
                 get: function()  { return _skinnerGetEQEnabled(); },
                 set: function(v) { _skinnerSetEQEnabled(v); },
+                configurable: true
+            });
+            Object.defineProperty(eq, 'currentPreset', {
+                get: function() { return _skinnerGetEQCurrentPreset(); },
                 configurable: true
             });
             Object.defineProperty(eq, 'currentPresetTitle', {
@@ -834,6 +892,21 @@ final class SkinScriptEngine {
         guard let v = proxy.forProperty(key), !v.isUndefined, !v.isNull else { return nil }
         if v.isNumber { return Int(v.toInt32()) }
         if v.isString, let n = Int(v.toString() ?? "") { return n }
+        return nil
+    }
+
+    /// Reads a `down` property that may be a boolean or the strings "true"/"false".
+    /// `toBool()` is not used because non-empty strings (including "false") are truthy in JS.
+    private func downProp(_ proxy: JSValue, _ key: String) -> Bool? {
+        guard let v = proxy.forProperty(key), !v.isUndefined, !v.isNull else { return nil }
+        if v.isBoolean { return v.toBool() }
+        if v.isString {
+            switch v.toString()?.lowercased() {
+            case "true":  return true
+            case "false": return false
+            default:      return nil
+            }
+        }
         return nil
     }
 }

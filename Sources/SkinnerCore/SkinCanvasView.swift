@@ -21,6 +21,7 @@ public final class SkinCanvasView: NSView {
     private var groups:          [RenderedGroup]  = []
     private var buttons:         [RenderedButton] = []
     private var sliders:         [RenderedSlider] = []
+    private var texts:           [RenderedText]   = []
     private var bgOpacity:       [Bool]           = []
     private var bgWidth          = 0
     private var bgHeight         = 0
@@ -28,6 +29,7 @@ public final class SkinCanvasView: NSView {
     private let bundle:          SkinBundle?
     private var dragOrigin:      NSPoint?
     private var activeSliderIdx: Int?
+    private var pressedTextIdx:  Int?
     private var lastKnownMousePt: NSPoint?
     private var engine: SkinScriptEngine?
     private var animatedSubviews:              [String: NSImageView]            = [:]
@@ -51,6 +53,7 @@ public final class SkinCanvasView: NSView {
     public var onDroppedURL: ((URL) -> Void)?
 
     private var playerBackend: (any PlayerBackend)?
+    private var timerWorkItem: DispatchWorkItem?
 
     public func setPlayerBackend(_ backend: any PlayerBackend) {
         playerBackend = backend
@@ -68,6 +71,15 @@ public final class SkinCanvasView: NSView {
         let isPlaying = playerBackend?.playState == .playing
         for (id, iv) in animatedSubviews {
             guard let base = animatedSubviewBases[id] else { continue }
+
+            // When JS explicitly clears backgroundImage (sets it to ""), hide the NSImageView.
+            if engine?.backgroundImageWasCleared(for: id) == true {
+                iv.animates = false
+                iv.isHidden = true
+                animatedSubviewCurrentImage.removeValue(forKey: id)
+                completedOnePassAnimations.remove(id)
+                continue
+            }
 
             // Swap image when JS has changed backgroundImage (e.g. idle → playback GIF).
             // Check BEFORE the completion guard so a new image assignment restarts the animation.
@@ -103,9 +115,10 @@ public final class SkinCanvasView: NSView {
                                 // (e.g. introShutterAnim shows shutter_close_static.gif to cover flag_extra).
                                 if isClose { self?.restoreStartupFallbackImages() }
                                 else       { self?.rehideStartupFallbackImages()  }
-                            } else {
-                                self?.completedOnePassAnimations.insert(id)
                             }
+                            // Mark hidden so updateAnimatedSubviewVisibility won't unhide it.
+                            // Cleared when a new image is assigned (next toggle).
+                            self?.completedOnePassAnimations.insert(id)
                         }
                     }
                 }
@@ -220,6 +233,7 @@ public final class SkinCanvasView: NSView {
         groups  = collectGroups(in: skinView.elements,  offset: .zero, lc: lc)
         buttons = collectButtons(in: skinView.elements, offset: .zero, lc: lc)
         sliders = collectSliders(in: skinView.elements, offset: .zero, lc: lc)
+        texts   = collectTexts(in: skinView.elements,  offset: .zero, lc: lc)
         buildBgOpacity()
         buildAnimatedSubviews(in: skinView.elements, offset: .zero, lc: lc)
         setupTracking()
@@ -253,7 +267,8 @@ public final class SkinCanvasView: NSView {
 
     private func collectGroups(in elements: [SkinElement],
                                 offset: CGPoint,
-                                lc: LayoutContext) -> [RenderedGroup] {
+                                lc: LayoutContext,
+                                ancestors: [ElementBase] = []) -> [RenderedGroup] {
         var result: [RenderedGroup] = []
         for element in sortedByZIndex(elements) {
             switch element {
@@ -273,12 +288,14 @@ public final class SkinCanvasView: NSView {
                 let clipMask = bg.clippingImage.flatMap { cache.clipMasks[$0.lowercased()] }
                 result.append(RenderedGroup(model: bg, assets: assets, mapData: mapData,
                                             frame: CGRect(x: x, y: y, width: w, height: h),
-                                            clipMask: clipMask))
+                                            clipMask: clipMask,
+                                            ancestorBases: ancestors))
             case .subview(let sv):
-                guard !elementIsHidden(sv.base) else { continue }
+                guard !elementIsHidden(sv.base), !sv.base.passThrough else { continue }
                 let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
-                result += collectGroups(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc)
+                result += collectGroups(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc,
+                                        ancestors: ancestors + [sv.base])
             default: break
             }
         }
@@ -288,7 +305,8 @@ public final class SkinCanvasView: NSView {
     /// Traversal order must exactly match `drawElements` so index counters stay in sync.
     private func collectButtons(in elements: [SkinElement],
                                  offset: CGPoint,
-                                 lc: LayoutContext) -> [RenderedButton] {
+                                 lc: LayoutContext,
+                                 ancestors: [ElementBase] = []) -> [RenderedButton] {
         var result: [RenderedButton] = []
         for element in sortedByZIndex(elements) {
             switch element {
@@ -310,15 +328,16 @@ public final class SkinCanvasView: NSView {
                 result.append(RenderedButton(model: b,
                                              frame: CGRect(x: x, y: y, width: w, height: h),
                                              mapData: md,
-                                             clipMask: clipMask))
+                                             clipMask: clipMask,
+                                             ancestorBases: ancestors))
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
-                let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
-                result += collectButtons(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
-                result += collectButtons(in: sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
+                let childAncestors = ancestors + [sv.base]
+                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
+                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
             default: break
             }
         }
@@ -328,7 +347,8 @@ public final class SkinCanvasView: NSView {
     /// Traversal order must exactly match `drawElements` so index counters stay in sync.
     private func collectSliders(in elements: [SkinElement],
                                  offset: CGPoint,
-                                 lc: LayoutContext) -> [RenderedSlider] {
+                                 lc: LayoutContext,
+                                 ancestors: [ElementBase] = []) -> [RenderedSlider] {
         var result: [RenderedSlider] = []
         for element in sortedByZIndex(elements) {
             switch element {
@@ -370,17 +390,48 @@ public final class SkinCanvasView: NSView {
                 var rs = RenderedSlider(model: s,
                                         frame: CGRect(x: x, y: y, width: w, height: h),
                                         frameCount: fc,
-                                        positionMapData: posMD)
+                                        positionMapData: posMD,
+                                        ancestorBases: ancestors)
                 rs.value = resolvedSliderValue(s)
                 result.append(rs)
             case .subview(let sv):
                 guard !elementIsHidden(sv.base) else { continue }
                 let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
-                let svZ = sv.base.zIndex ?? 0
                 let co  = CGPoint(x: sx, y: sy)
-                result += collectSliders(in: sv.children.filter { $0.base?.zIndex != nil && ($0.base?.zIndex ?? 0) < svZ }, offset: co, lc: lc)
-                result += collectSliders(in: sv.children.filter { $0.base?.zIndex == nil || ($0.base?.zIndex ?? 0) >= svZ }, offset: co, lc: lc)
+                let childAncestors = ancestors + [sv.base]
+                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
+                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
+            default: break
+            }
+        }
+        return result
+    }
+
+    private func collectTexts(in elements: [SkinElement],
+                               offset: CGPoint,
+                               lc: LayoutContext,
+                               ancestors: [ElementBase] = []) -> [RenderedText] {
+        var result: [RenderedText] = []
+        for element in sortedByZIndex(elements) {
+            switch element {
+            case .text(let t):
+                guard !elementIsHidden(t.base),
+                      t.base.onClick != nil || t.hoverForegroundColor != nil else { continue }
+                let x = (resolveCoord(t.base.left, lc: lc) ?? 0) + offset.x
+                let y = (resolveCoord(t.base.top,  lc: lc) ?? 0) + offset.y
+                let w =  resolveCoord(t.base.width,  lc: lc) ?? 100
+                let h =  resolveCoord(t.base.height, lc: lc) ?? 14
+                result.append(RenderedText(model: t, frame: CGRect(x: x, y: y, width: w, height: h),
+                                           ancestorBases: ancestors))
+            case .subview(let sv):
+                guard !elementIsHidden(sv.base), !sv.base.passThrough else { continue }
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+                let co = CGPoint(x: sx, y: sy)
+                let childAncestors = ancestors + [sv.base]
+                result += collectTexts(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
+                result += collectTexts(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
             default: break
             }
         }
@@ -574,6 +625,17 @@ public final class SkinCanvasView: NSView {
                     ctx.setAlpha(CGFloat(alpha) / 255.0)
                     ctx.beginTransparencyLayer(auxiliaryInfo: nil)
                 }
+                // Only children with a negative zIndex render behind the parent's background
+                // image (e.g. Headspace's vid_bkgd.bmp zIndex="-2" behind head.bmp, or
+                // Professional's visMask effects zIndex="-1" under the mask image).
+                // Positive-zIndex children always draw above the background regardless of the
+                // parent's own zIndex (e.g. Professional's buttons zIndex=1,2 inside a
+                // parent with zIndex=15 still appear above s_main_no.png).
+                // This split must match collectButtons/collectSliders so index order stays in sync.
+                let below = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
+                let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
+                drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
+                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
                 // Fill backgroundColor before drawing the background image so the image sits on top.
                 // Only fill when we have explicit clip dimensions; otherwise size is unknown.
                 if let colorStr = sv.backgroundColor,
@@ -583,18 +645,12 @@ public final class SkinCanvasView: NSView {
                     NSColor(skinRGB: rgb).setFill()
                     NSBezierPath.fill(NSRect(x: sx, y: sy, width: w, height: h))
                 }
-                // A subview's backgroundImage is always its background — draw it before all
-                // children regardless of their zIndex values.  Child zIndex governs stacking
-                // among siblings, not relative to the parent container's own background.
                 if sv.base.id.flatMap({ animatedSubviews[$0] }) == nil {
                     let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                                  ?? sv.backgroundImage
                     if let name = bgName,
                        cache.buttonGroupsByMappingImage[name.lowercased()] == nil,
                        !cache.clipImageNames.contains(name.lowercased()),
-                       // Also skip GIFs promoted to NSImageViews that have no id (e.g. intro
-                       // animations). Drawing their static first frame from cache would cover
-                       // any elements beneath them (e.g. the time text) permanently.
                        !promotedGifNames.contains(name.lowercased()),
                        let img  = cache.images[name.lowercased()] {
                         let w = lc.resolve(sv.base.width)  ?? img.size.width
@@ -602,7 +658,7 @@ public final class SkinCanvasView: NSView {
                         img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
                     }
                 }
-                drawElements(sv.children, offset: childOffset, lc: lc, ctx: ctx,
+                drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
                 if needsAlpha { ctx.endTransparencyLayer() }
                 if needsGState { ctx.restoreGState() }
@@ -682,14 +738,15 @@ public final class SkinCanvasView: NSView {
                     text = scriptValue ?? engine?.resolveText(t.value) ?? t.value?.literalString ?? ""
                 }
                 guard !text.isEmpty else { continue }
-                drawTextLabel(text, in: NSRect(x: tx, y: ty, width: tw, height: th), label: t)
+                let textIsHovered = texts.contains { abs($0.frame.minX - tx) < 1 && abs($0.frame.minY - ty) < 1 && $0.isHovered }
+                drawTextLabel(text, in: NSRect(x: tx, y: ty, width: tw, height: th), label: t, isHovered: textIsHovered)
 
             default: break
             }
         }
     }
 
-    private func drawTextLabel(_ text: String, in rect: NSRect, label: TextLabel) {
+    private func drawTextLabel(_ text: String, in rect: NSRect, label: TextLabel, isHovered: Bool = false) {
         let pointSize = CGFloat(label.fontSize ?? 10)
         let isBold   = label.fontStyle?.lowercased().contains("bold")   ?? false
         let isItalic = label.fontStyle?.lowercased().contains("italic") ?? false
@@ -704,7 +761,8 @@ public final class SkinCanvasView: NSView {
         } else {
             font = NSFont.systemFont(ofSize: pointSize)
         }
-        let fgRGB = parseAnyColor(label.foregroundColor ?? "#ffffff") ?? (0xff, 0xff, 0xff)
+        let fgColor = (isHovered ? label.hoverForegroundColor : nil) ?? label.foregroundColor ?? "#ffffff"
+        let fgRGB = parseAnyColor(fgColor) ?? (0xff, 0xff, 0xff)
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineBreakMode = .byClipping
         switch label.justification?.lowercased() {
@@ -781,10 +839,13 @@ public final class SkinCanvasView: NSView {
     }
 
     private func drawButton(_ button: RenderedButton, ctx: CGContext) {
+        let jsState = button.model.base.id.flatMap { engine?.state(for: $0) }
+        let jsImage = jsState?.image
+        let jsDown  = button.model.sticky && (jsState?.down == true)
         let name: String?
-        if button.isPressed      { name = button.model.downImage  ?? button.model.image }
-        else if button.isHovered { name = button.model.hoverImage ?? button.model.image }
-        else                     { name = button.model.image }
+        if button.isPressed || jsDown { name = button.model.downImage  ?? jsImage ?? button.model.image }
+        else if button.isHovered      { name = button.model.hoverImage ?? jsImage ?? button.model.image }
+        else                          { name = jsImage ?? button.model.image }
         guard let n = name, let img = cache.images[n.lowercased()] else { return }
         // Draw at natural pixel size from the button origin.  The declared button
         // width/height defines the interaction area; the parent subview's clip rect
@@ -942,16 +1003,15 @@ public final class SkinCanvasView: NSView {
     public override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
 
-        for i in sliders.indices.reversed() {
-            guard !elementIsHidden(sliders[i].model.base, live: true) else { continue }
-            if let norm = sliderNormalizedValue(at: pt, slider: sliders[i]) {
-                activeSliderIdx = i
-                applySlider(idx: i, normalized: norm, isMouseUp: false)
-                return
-            }
-        }
+        // Button groups use pixel-precise mapping-image hit tests and should take
+        // priority over sliders when their frames overlap (e.g. STALKER's EQ/PL
+        // button group sits on top of the volume slider).  If a click misses all
+        // mapped button pixels the group returns nil and the slider below catches it.
         for i in groups.indices.reversed() {
-            guard !elementIsHidden(groups[i].model.base, live: true) else { continue }
+            guard !elementIsHidden(groups[i].model.base, live: true),
+                  ancestorsVisible(groups[i].ancestorBases),
+                  !ancestorsPassThrough(groups[i].ancestorBases),
+                  elementIsEnabled(groups[i].model.base) else { continue }
             if let color = groups[i].colorAt(pt) {
                 groups[i].pressedColor = color
                 setNeedsDisplay(bounds)
@@ -959,10 +1019,33 @@ public final class SkinCanvasView: NSView {
             }
         }
         for i in buttons.indices.reversed() {
-            guard !elementIsHidden(buttons[i].model.base, live: true) else { continue }
+            guard !elementIsHidden(buttons[i].model.base, live: true),
+                  ancestorsVisible(buttons[i].ancestorBases),
+                  !ancestorsPassThrough(buttons[i].ancestorBases),
+                  elementIsEnabled(buttons[i].model.base) else { continue }
             guard buttons[i].hitTest(pt) else { continue }
             buttons[i].isPressed = true
             setNeedsDisplay(bounds)
+            return
+        }
+        for i in sliders.indices.reversed() {
+            guard !elementIsHidden(sliders[i].model.base, live: true),
+                  ancestorsVisible(sliders[i].ancestorBases),
+                  !ancestorsPassThrough(sliders[i].ancestorBases),
+                  elementIsEnabled(sliders[i].model.base) else { continue }
+            if let norm = sliderNormalizedValue(at: pt, slider: sliders[i]) {
+                activeSliderIdx = i
+                applySlider(idx: i, normalized: norm, isMouseUp: false)
+                return
+            }
+        }
+        for i in texts.indices.reversed() {
+            guard !elementIsHidden(texts[i].model.base, live: true),
+                  ancestorsVisible(texts[i].ancestorBases),
+                  !ancestorsPassThrough(texts[i].ancestorBases),
+                  elementIsEnabled(texts[i].model.base) else { continue }
+            guard texts[i].frame.contains(pt), texts[i].model.base.onClick != nil else { continue }
+            pressedTextIdx = i
             return
         }
         dragOrigin = NSEvent.mouseLocation
@@ -1017,10 +1100,19 @@ public final class SkinCanvasView: NSView {
         }
         for i in buttons.indices.reversed() {
             guard buttons[i].isPressed else { continue }
-            if buttons[i].hitTest(pt) { fireButtonAction(buttons[i]) }
+            let button = buttons[i]          // snapshot before firing; action may rebuild buttons
             buttons[i].isPressed = false
             setNeedsDisplay(bounds)
+            if button.hitTest(pt) { fireButtonAction(button) }
             return
+        }
+        if let i = pressedTextIdx {
+            pressedTextIdx = nil
+            guard texts.indices.contains(i),
+                  texts[i].frame.contains(pt),
+                  let script = texts[i].model.base.onClick else { return }
+            engine?.evaluate(script)
+            applyScriptChanges()
         }
     }
 
@@ -1098,15 +1190,15 @@ public final class SkinCanvasView: NSView {
         var changed = false
         var groupHitHandled = false
         for i in groups.indices.reversed() {
-            let hidden = elementIsHidden(groups[i].model.base, live: true)
-            let h: String? = (!hidden && !groupHitHandled) ? groups[i].colorAt(pt) : nil
+            let inactive = elementIsHidden(groups[i].model.base, live: true) || !ancestorsVisible(groups[i].ancestorBases) || ancestorsPassThrough(groups[i].ancestorBases) || !elementIsEnabled(groups[i].model.base)
+            let h: String? = (!inactive && !groupHitHandled) ? groups[i].colorAt(pt) : nil
             if h != nil { groupHitHandled = true }
             if h != groups[i].hoveredColor { groups[i].hoveredColor = h; changed = true }
         }
         var buttonHitHandled = false
         for i in buttons.indices.reversed() {
-            let hidden = elementIsHidden(buttons[i].model.base, live: true)
-            let h = !hidden && !buttonHitHandled && buttons[i].hitTest(pt)
+            let inactive = elementIsHidden(buttons[i].model.base, live: true) || !ancestorsVisible(buttons[i].ancestorBases) || ancestorsPassThrough(buttons[i].ancestorBases) || !elementIsEnabled(buttons[i].model.base)
+            let h = !inactive && !buttonHitHandled && buttons[i].hitTest(pt)
             if h { buttonHitHandled = true }
             if h != buttons[i].isHovered {
                 buttons[i].isHovered = h
@@ -1146,6 +1238,9 @@ public final class SkinCanvasView: NSView {
         for i in buttons.indices where buttons[i].isHovered || buttons[i].isPressed {
             buttons[i].isHovered = false; buttons[i].isPressed = false; changed = true
         }
+        for i in texts.indices where texts[i].isHovered {
+            texts[i].isHovered = false; changed = true
+        }
         if changed { setNeedsDisplay(bounds) }
     }
 
@@ -1170,6 +1265,13 @@ public final class SkinCanvasView: NSView {
     }
 
     private func fireButtonAction(_ button: RenderedButton) {
+        // Toggle sticky `down` before onClick: matches WMP's built-in toggle behavior.
+        // Open scripts explicitly set down=true; close scripts omit it, so the pre-toggle
+        // correctly reverts to false when no explicit reset is in the script.
+        if button.model.sticky, let id = button.model.base.id {
+            let cur = engine?.state(for: id)?.down ?? false
+            engine?.evaluate("\(id).down = \(cur ? "false" : "true")")
+        }
         if let script = button.model.base.onClick { engine?.evaluate(script); applyScriptChanges(); return }
         switch button.model.kind {
         case .mute:    playerBackend?.isMuted.toggle()
@@ -1197,6 +1299,7 @@ public final class SkinCanvasView: NSView {
         groups  = collectGroups(in: skinView.elements,  offset: .zero, lc: lc)
         buttons = collectButtons(in: skinView.elements, offset: .zero, lc: lc)
         sliders = collectSliders(in: skinView.elements, offset: .zero, lc: lc)
+        texts   = collectTexts(in: skinView.elements,  offset: .zero, lc: lc)
 
         for i in sliders.indices where i < savedSliderValues.count {
             sliders[i].value = savedSliderValues[i]
@@ -1222,18 +1325,35 @@ public final class SkinCanvasView: NSView {
         guard let pt = lastKnownMousePt else { return }
         var groupHitHandled = false
         for i in groups.indices.reversed() {
-            let hidden = elementIsHidden(groups[i].model.base, live: true)
-            let h: String? = (!hidden && !groupHitHandled) ? groups[i].colorAt(pt) : nil
+            let inactive = elementIsHidden(groups[i].model.base, live: true) || !ancestorsVisible(groups[i].ancestorBases) || ancestorsPassThrough(groups[i].ancestorBases) || !elementIsEnabled(groups[i].model.base)
+            let h: String? = (!inactive && !groupHitHandled) ? groups[i].colorAt(pt) : nil
             if h != nil { groupHitHandled = true }
             groups[i].hoveredColor = h
         }
         var buttonHitHandled = false
         for i in buttons.indices.reversed() {
-            let hidden = elementIsHidden(buttons[i].model.base, live: true)
-            let h = !hidden && !buttonHitHandled && buttons[i].hitTest(pt)
+            let inactive = elementIsHidden(buttons[i].model.base, live: true) || !ancestorsVisible(buttons[i].ancestorBases) || ancestorsPassThrough(buttons[i].ancestorBases) || !elementIsEnabled(buttons[i].model.base)
+            let h = !inactive && !buttonHitHandled && buttons[i].hitTest(pt)
             if h { buttonHitHandled = true }
             buttons[i].isHovered = h
         }
+        for i in texts.indices {
+            let inactive = elementIsHidden(texts[i].model.base, live: true) || !ancestorsVisible(texts[i].ancestorBases) || ancestorsPassThrough(texts[i].ancestorBases) || !elementIsEnabled(texts[i].model.base)
+            texts[i].isHovered = !inactive && texts[i].frame.contains(pt)
+        }
+    }
+
+    private func rescheduleTimer() {
+        timerWorkItem?.cancel()
+        timerWorkItem = nil
+        guard let ms = engine?.currentTimerInterval else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.engine?.fireOnTimer()
+            self.applyScriptChanges()
+        }
+        timerWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms), execute: item)
     }
 
     private func applyScriptChanges() {
@@ -1249,6 +1369,7 @@ public final class SkinCanvasView: NSView {
             promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
         }
         setNeedsDisplay(bounds)
+        rescheduleTimer()
     }
 
     /// Scans the element tree for subviews that have been dynamically assigned a GIF background
@@ -1292,6 +1413,7 @@ public final class SkinCanvasView: NSView {
                         iv?.isHidden = true
                         if isClose { self?.restoreStartupFallbackImages() }
                         else       { self?.rehideStartupFallbackImages()  }
+                        self?.completedOnePassAnimations.insert(id)
                     }
                 }
                 animatedSubviews[id]            = iv
@@ -1364,9 +1486,8 @@ public final class SkinCanvasView: NSView {
 
             let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                          ?? sv.backgroundImage
-            let svZ = sv.base.zIndex ?? 0
-            let below = sv.children.filter { ($0.base?.zIndex ?? 0) < svZ }
-            let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= svZ }
+            let below = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
+            let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
 
             // Check if any below-children are GIF subviews (will become NSImageViews).
             // If so, this element's background must also be an NSImageView added after
@@ -1475,6 +1596,22 @@ public final class SkinCanvasView: NSView {
     // MARK: - Visibility
 
     /// Script state takes precedence over the parsed `visible` attribute.
+    private func ancestorsVisible(_ bases: [ElementBase]) -> Bool {
+        bases.allSatisfy { !elementIsHidden($0, live: true) }
+    }
+
+    private func ancestorsPassThrough(_ bases: [ElementBase]) -> Bool {
+        bases.contains { $0.passThrough }
+    }
+
+    /// Returns false if the element has `enabled=false` in engine state or the WMS attribute.
+    /// Used for hit-testing only — disabled elements are visible but non-interactive.
+    private func elementIsEnabled(_ base: ElementBase) -> Bool {
+        if let id = base.id, let s = engine?.state(for: id), let en = s.enabled { return en }
+        if let en = base.enabled?.boolValue { return en }
+        return true
+    }
+
     /// `alphaBlend == 0` is treated as hidden (WMP skins use it to fade-out elements).
     /// Pass `live: true` during draw to evaluate `wmpenabled:` bindings against current player state.
     private func elementIsHidden(_ base: ElementBase, live: Bool = false) -> Bool {
@@ -1504,11 +1641,12 @@ public final class SkinCanvasView: NSView {
 // MARK: - RenderedGroup
 
 private struct RenderedGroup {
-    let model:    ButtonGroup
-    let assets:   ButtonGroupAssets
-    let mapData:  MapData?
-    let frame:    CGRect
-    let clipMask: CGImage?
+    let model:         ButtonGroup
+    let assets:        ButtonGroupAssets
+    let mapData:       MapData?
+    let frame:         CGRect
+    let clipMask:      CGImage?
+    let ancestorBases: [ElementBase]
     var hoveredColor: String? = nil
     var pressedColor: String? = nil
 
@@ -1535,10 +1673,11 @@ private struct RenderedGroup {
 // MARK: - RenderedButton
 
 private struct RenderedButton {
-    let model:    Button
-    let frame:    CGRect
-    let mapData:  MapData?
-    let clipMask: CGImage?
+    let model:         Button
+    let frame:         CGRect
+    let mapData:       MapData?
+    let clipMask:      CGImage?
+    let ancestorBases: [ElementBase]
     var isHovered = false
     var isPressed = false
 
@@ -1560,9 +1699,19 @@ private struct RenderedSlider {
     let frame:           CGRect
     let frameCount:      Int
     let positionMapData: MapData?
+    let ancestorBases:   [ElementBase]
     var value:           Double = 0
 
     var frameIndex: Int { max(0, min(frameCount - 1, Int(value * Double(frameCount - 1)))) }
+}
+
+// MARK: - RenderedText
+
+private struct RenderedText {
+    let model:         TextLabel
+    let frame:         CGRect
+    let ancestorBases: [ElementBase]
+    var isHovered: Bool = false
 }
 
 // MARK: - File-local helpers
