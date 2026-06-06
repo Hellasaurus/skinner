@@ -55,6 +55,12 @@ public final class SkinCanvasView: NSView {
     private var playerBackend: (any PlayerBackend)?
     private var timerWorkItem: DispatchWorkItem?
 
+    /// Set by AppDelegate to provide a visualization view for `<EFFECTS>` elements.
+    public var makeVisualizationProvider: (() -> any VisualizationProviding)?
+    private var vizProvider:   (any VisualizationProviding)?
+    private var vizConfigured  = false
+    private var vizCoverInfos: [VizCoverInfo] = []
+
     public func setPlayerBackend(_ backend: any PlayerBackend) {
         playerBackend = backend
         engine?.onStateChanged = { [weak self] in
@@ -65,6 +71,10 @@ public final class SkinCanvasView: NSView {
             self.setNeedsDisplay(self.bounds)
         }
         engine?.playerBackend = backend
+        if let vizProvider, !vizConfigured {
+            vizProvider.configure(backend: backend, presetPath: presetSearchPath())
+            vizConfigured = true
+        }
     }
 
     private func updateAnimatedSubviewVisibility() {
@@ -234,6 +244,7 @@ public final class SkinCanvasView: NSView {
         buttons = collectButtons(in: skinView.elements, offset: .zero, lc: lc)
         sliders = collectSliders(in: skinView.elements, offset: .zero, lc: lc)
         texts   = collectTexts(in: skinView.elements,  offset: .zero, lc: lc)
+        seedImplicitSubviewSizes(in: skinView.elements)
         buildBgOpacity()
         buildAnimatedSubviews(in: skinView.elements, offset: .zero, lc: lc)
         setupTracking()
@@ -261,6 +272,26 @@ public final class SkinCanvasView: NSView {
     private func liveCoord(_ id: String?, attr: AttributeValue?, propName: String, lc: LayoutContext) -> CGFloat {
         if let id, let v = engine?.evaluateNumber("\(id).\(propName)") { return v }
         return resolveCoord(attr, lc: lc) ?? 0
+    }
+
+    /// For subviews that have no explicit width/height in the WMS, seed the JS proxy
+    /// with the background image's pixel dimensions so sibling jscript: references like
+    /// `jscript:visMask.width` resolve correctly (e.g. for the <effects> element in Pulsar).
+    private func seedImplicitSubviewSizes(in elements: [SkinElement]) {
+        for element in elements {
+            guard case .subview(let sv) = element, let id = sv.base.id else { continue }
+            if sv.base.width == nil,
+               let name = sv.backgroundImage,
+               let img = cache.images[name.lowercased()] {
+                engine?.evaluate("\(id).width = \(img.size.width)")
+            }
+            if sv.base.height == nil,
+               let name = sv.backgroundImage,
+               let img = cache.images[name.lowercased()] {
+                engine?.evaluate("\(id).height = \(img.size.height)")
+            }
+            seedImplicitSubviewSizes(in: sv.children)
+        }
     }
 
     // MARK: - Collection
@@ -589,6 +620,7 @@ public final class SkinCanvasView: NSView {
         var si = 0
         drawElements(skinView.elements, offset: .zero, lc: lc, ctx: ctx,
                      buttonIdx: &bi, sliderIdx: &si)
+        renderVizCoverImages(lc: lc)
     }
 
     private func drawElements(_ elements: [SkinElement],
@@ -1210,6 +1242,22 @@ public final class SkinCanvasView: NSView {
         if changed { setNeedsDisplay(bounds) }
     }
 
+    // MARK: - Keyboard
+
+    public override var acceptsFirstResponder: Bool { true }
+
+    public override func keyDown(with event: NSEvent) {
+        guard let viz = vizProvider, !viz.view.isHidden else {
+            super.keyDown(with: event)
+            return
+        }
+        switch event.specialKey {
+        case NSEvent.SpecialKey.leftArrow:  viz.previousPreset()
+        case NSEvent.SpecialKey.rightArrow: viz.nextPreset()
+        default: super.keyDown(with: event)
+        }
+    }
+
     // MARK: - Drag and drop
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1319,6 +1367,12 @@ public final class SkinCanvasView: NSView {
         }
 
         reapplyHover()
+
+        // Visualization: find an <EFFECTS> element and position the overlay view.
+        let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+        if let (fx, frame, covers) = findEffects(in: skinView.elements, offset: .zero, lc: lc2) {
+            updateVisualizationView(for: fx, frame: frame, covers: covers)
+        }
     }
 
     private func reapplyHover() {
@@ -1341,6 +1395,194 @@ public final class SkinCanvasView: NSView {
             let inactive = elementIsHidden(texts[i].model.base, live: true) || !ancestorsVisible(texts[i].ancestorBases) || ancestorsPassThrough(texts[i].ancestorBases) || !elementIsEnabled(texts[i].model.base)
             texts[i].isHovered = !inactive && texts[i].frame.contains(pt)
         }
+    }
+
+    // MARK: - Visualization
+
+    private func findEffects(in elements: [SkinElement],
+                              offset: CGPoint,
+                              lc: LayoutContext,
+                              parentBgImage: NSImage? = nil,
+                              parentBgFrame: CGRect? = nil,
+                              parentSubview: Subview? = nil
+    ) -> (Effects, CGRect, covers: [(subview: Subview, bgImage: NSImage, frame: CGRect)])? {
+        for element in elements {
+            switch element {
+            case .effects(let fx):
+                // No visibility check — always find the element so the provider can be
+                // created once and its show/hide state tracked dynamically in updateVisualizationView.
+                let x = (resolveCoord(fx.base.left,   lc: lc) ?? 0) + offset.x
+                let y = (resolveCoord(fx.base.top,    lc: lc) ?? 0) + offset.y
+                let w =  resolveCoord(fx.base.width,  lc: lc) ?? bounds.width
+                let h =  resolveCoord(fx.base.height, lc: lc) ?? bounds.height
+                return (fx, CGRect(x: x, y: y, width: w, height: h), covers: [])
+            case .subview(let sv):
+                // Recurse regardless of visibility so nested effects elements are found
+                // even when their parent starts hidden (e.g. visMask in Pulsar).
+                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+                // Compute this subview's backgroundImage and frame to pass as parent context.
+                let svBgImg = sv.backgroundImage.flatMap { cache.images[$0.lowercased()] }
+                let svBgW   = lc.resolve(sv.base.width)  ?? (svBgImg?.size.width  ?? 0)
+                let svBgH   = lc.resolve(sv.base.height) ?? (svBgImg?.size.height ?? 0)
+                let svBgFrame = CGRect(x: sx, y: sy, width: svBgW, height: svBgH)
+                if var found = findEffects(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc,
+                                            parentBgImage: svBgImg, parentBgFrame: svBgFrame,
+                                            parentSubview: sv) {
+                    // If this subview has negative zIndex, its parent's backgroundImage
+                    // renders above it in draw(_:) and needs to cover the viz NSView too.
+                    // We carry the parent Subview model so we can later identify which of
+                    // its children are positive-zIndex and must appear above the cover.
+                    if (sv.base.zIndex ?? 0) < 0,
+                       let img = parentBgImage, let frm = parentBgFrame,
+                       let parentSv = parentSubview {
+                        found.covers.append((subview: parentSv, bgImage: img, frame: frm))
+                    }
+                    return found
+                }
+            default: break
+            }
+        }
+        return nil
+    }
+
+    private func updateVisualizationView(
+        for fx: Effects, frame: CGRect,
+        covers: [(subview: Subview, bgImage: NSImage, frame: CGRect)]
+    ) {
+        if vizProvider == nil, let factory = makeVisualizationProvider {
+            let provider = factory()
+            vizProvider  = provider
+            addSubview(provider.view, positioned: .above, relativeTo: nil)
+            if let backend = playerBackend, !vizConfigured {
+                provider.configure(backend: backend, presetPath: presetSearchPath())
+                vizConfigured = true
+            }
+            wireVizJSBindings(for: fx, provider: provider)
+            // Build a cover NSImageView for each image that must appear above the viz.
+            // The image is composited each draw() to include positive-zIndex children
+            // (play controls, seek bar, etc.) that otherwise live below all NSViews.
+            let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+            vizCoverInfos = covers.map { (sv, bgImage, coverFrame) in
+                let coverOffset = CGPoint(x: coverFrame.origin.x, y: coverFrame.origin.y)
+                let negChildren = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
+                // Count how many buttons/sliders come from negative-zIndex children so we
+                // know where in the global arrays the positive-zIndex children begin.
+                let buttonStart = collectButtons(in: negChildren, offset: coverOffset, lc: lc).count
+                let sliderStart = collectSliders(in: negChildren, offset: coverOffset, lc: lc).count
+                let iv = NSImageView(frame: coverFrame)
+                iv.image        = bgImage
+                iv.imageScaling = .scaleAxesIndependently
+                addSubview(iv)
+                return VizCoverInfo(subview: sv, bgImage: bgImage, frame: coverFrame,
+                                    buttonStart: buttonStart, sliderStart: sliderStart,
+                                    imageView: iv)
+            }
+        }
+        vizProvider?.view.frame = frame
+        vizProvider?.resize(to: frame.size)
+        for (i, cover) in covers.enumerated() where i < vizCoverInfos.count {
+            vizCoverInfos[i].frame     = cover.frame
+            vizCoverInfos[i].imageView.frame = cover.frame
+        }
+        if let provider = vizProvider {
+            let hidden = elementIsHidden(fx.base, live: true)
+            provider.view.isHidden   = hidden
+            provider.view.alphaValue = hidden ? 0 : CGFloat(effectiveAlpha(for: fx.base)) / 255.0
+        }
+    }
+
+    /// Called at the end of every draw(_:) cycle to update the viz cover NSImageViews.
+    /// Each cover composites its background image plus the positive-zIndex children of its
+    /// parent subview (buttons, sliders, groups) so they appear above the viz layer even
+    /// though Core Graphics drawing is always below all NSViews in the hierarchy.
+    private func renderVizCoverImages(lc: LayoutContext) {
+        guard !vizCoverInfos.isEmpty else { return }
+        for info in vizCoverInfos {
+            let sv    = info.subview
+            let frame = info.frame
+            guard frame.width > 0, frame.height > 0 else { continue }
+            let composite = NSImage(size: frame.size)
+            composite.lockFocusFlipped(true)
+            if let imgCtx = NSGraphicsContext.current?.cgContext {
+                // Shift canvas-coord drawing into image-local coordinates.
+                imgCtx.translateBy(x: -frame.origin.x, y: -frame.origin.y)
+                // Draw the parent background (e.g. head.bmp) at its absolute canvas rect.
+                info.bgImage.draw(in: frame)
+                // Draw the positive-zIndex children (play controls, seek, EQ/PL buttons, etc.)
+                // starting at the pre-computed index into the global buttons/sliders arrays.
+                let aboveChildren = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
+                var bi = info.buttonStart
+                var si = info.sliderStart
+                drawElements(aboveChildren,
+                             offset: CGPoint(x: frame.origin.x, y: frame.origin.y),
+                             lc: lc, ctx: imgCtx,
+                             buttonIdx: &bi, sliderIdx: &si)
+            }
+            composite.unlockFocus()
+            info.imageView.image = composite
+        }
+    }
+
+    private func wireVizJSBindings(for fx: Effects, provider: any VisualizationProviding) {
+        guard let engine, let id = fx.base.id, !id.isEmpty else { return }
+        engine.registerObject(
+            { [weak provider] in provider?.nextPreset() }     as @convention(block) () -> Void,
+            forKey: "_vizNext"
+        )
+        engine.registerObject(
+            { [weak provider] in provider?.previousPreset() } as @convention(block) () -> Void,
+            forKey: "_vizPrev"
+        )
+        engine.registerObject(
+            { [weak provider] in provider?.currentPresetName ?? "" } as @convention(block) () -> String,
+            forKey: "_vizPresetName"
+        )
+        engine.evaluate("""
+            if (typeof \(id) !== 'undefined') {
+                \(id).next = function() { _vizNext(); };
+                \(id).previous = function() { _vizPrev(); };
+                Object.defineProperty(\(id), 'effectTitle', {
+                    get: function() { return _vizPresetName(); },
+                    configurable: true
+                });
+            }
+        """)
+    }
+
+    private func presetSearchPath() -> URL? {
+        // 1. Bundled presets in the package/app bundle.
+        if let url = Bundle.module.url(forResource: "presets", withExtension: nil,
+                                       subdirectory: "projectM") {
+            return url
+        }
+        if let appResource = Bundle.main.resourceURL?.appendingPathComponent("presets"),
+           FileManager.default.fileExists(atPath: appResource.path) {
+            return appResource
+        }
+        if let appResource = Bundle.main.resourceURL?.appendingPathComponent("projectM/presets"),
+           FileManager.default.fileExists(atPath: appResource.path) {
+            return appResource
+        }
+
+        // 2. Repo-local presets during development.
+        let bundled = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()  // SkinnerCore/
+            .deletingLastPathComponent()  // Sources/
+            .deletingLastPathComponent()  // project root
+            .appendingPathComponent("vendor/presets-cream-of-the-crop")
+        if FileManager.default.fileExists(atPath: bundled.path) { return bundled }
+
+        let cwdBundled = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("vendor/presets-cream-of-the-crop")
+        if FileManager.default.fileExists(atPath: cwdBundled.path) { return cwdBundled }
+
+        // 3. Homebrew preset paths.
+        let arm = URL(fileURLWithPath: "/opt/homebrew/share/projectM/presets")
+        if FileManager.default.fileExists(atPath: arm.path) { return arm }
+        let intel = URL(fileURLWithPath: "/usr/local/share/projectM/presets")
+        if FileManager.default.fileExists(atPath: intel.path) { return intel }
+        return nil
     }
 
     private func rescheduleTimer() {
@@ -1636,6 +1878,17 @@ public final class SkinCanvasView: NSView {
         return base.alphaBlend ?? 255
     }
 
+}
+
+// MARK: - VizCoverInfo
+
+private struct VizCoverInfo {
+    let subview:     Subview
+    let bgImage:     NSImage
+    var frame:       CGRect     // updated each recollect() so renderVizCoverImages uses current position
+    let buttonStart: Int        // first index in global buttons[] belonging to positive-zIndex children
+    let sliderStart: Int        // first index in global sliders[] belonging to positive-zIndex children
+    let imageView:   NSImageView
 }
 
 // MARK: - RenderedGroup

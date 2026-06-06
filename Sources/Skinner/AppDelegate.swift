@@ -2,6 +2,7 @@ import AppKit
 import UniformTypeIdentifiers
 import SkinnerCore
 import SkinnerPlayer
+import SkinnerViz
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -99,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let canvas = SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
         canvas.onOpenView   = { [weak self] id in self?.openSecondaryView(id) }
         canvas.onDroppedURL = { [weak self] url in self?.openMedia(url) }
+        canvas.makeVisualizationProvider = { VisualizationView() }
         return canvas
     }
 

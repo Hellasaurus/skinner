@@ -365,6 +365,42 @@ public final class AVFoundationPlayer: PlayerBackend {
 
     static let bandFrequencies: [Float] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
+    // MARK: - PCM Tap
+
+    private let tapTable = TapTable()
+    private var engineTapActive = false
+
+    public func installPCMTap(handler: @escaping @Sendable ([Float]) -> Void) -> PCMTapToken {
+        let token = NSObject()
+        if tapTable.add(ObjectIdentifier(token), handler: handler) {
+            installEngineAudioTap()
+            engineTapActive = true
+        }
+        return token
+    }
+
+    public func removePCMTap(_ token: PCMTapToken) {
+        if tapTable.remove(ObjectIdentifier(token)), engineTapActive {
+            engine.mainMixerNode.removeTap(onBus: 0)
+            engineTapActive = false
+        }
+    }
+
+    private func installEngineAudioTap() {
+        // Delegate to nonisolated helper so the AVAudioNodeTapBlock is not @MainActor-isolated.
+        // AVFoundation invokes the block on its audio render thread; a block created inside
+        // @MainActor context would embed an executor check that crashes on that thread.
+        _installTap(on: engine.mainMixerNode, table: tapTable)
+    }
+
+    private nonisolated func _installTap(on node: AVAudioMixerNode, table: TapTable) {
+        node.installTap(onBus: 0, bufferSize: 1024, format: nil) { buf, _ in
+            guard let data = buf.floatChannelData else { return }
+            let samples = Array(UnsafeBufferPointer(start: data[0], count: Int(buf.frameLength)))
+            table.invoke(with: samples)
+        }
+    }
+
     static let builtInPresets: [(title: String, gains: [Float])] = [
         ("Flat",         [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0]),
         ("Classical",    [ 0,  0,  0,  0,  0,  0, -3, -3, -3, -4]),
@@ -379,6 +415,35 @@ public final class AVFoundationPlayer: PlayerBackend {
         ("Treble Boost", [ 0,  0,  0,  0,  0,  2,  3,  4,  5,  6]),
         ("Bass Boost",   [ 6,  5,  4,  2,  0,  0,  0,  0,  0,  0]),
     ]
+}
+
+// MARK: - TapTable
+
+private final class TapTable: @unchecked Sendable {
+    private var handlers: [ObjectIdentifier: @Sendable ([Float]) -> Void] = [:]
+    private let lock = NSLock()
+
+    /// Returns true if this was the first entry (caller should install the engine tap).
+    func add(_ id: ObjectIdentifier, handler: @escaping @Sendable ([Float]) -> Void) -> Bool {
+        lock.withLock {
+            let wasEmpty = handlers.isEmpty
+            handlers[id] = handler
+            return wasEmpty
+        }
+    }
+
+    /// Returns true if the table is now empty (caller should remove the engine tap).
+    func remove(_ id: ObjectIdentifier) -> Bool {
+        lock.withLock {
+            handlers.removeValue(forKey: id)
+            return handlers.isEmpty
+        }
+    }
+
+    func invoke(with samples: [Float]) {
+        let hs = lock.withLock { Array(handlers.values) }
+        for h in hs { h(samples) }
+    }
 }
 
 // MARK: - Helpers

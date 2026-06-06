@@ -121,6 +121,11 @@ final class SkinScriptEngine {
         context.evaluateScript("try { \(script) } catch(e) {}")
     }
 
+    /// Registers a Swift block as a global JS function or object.
+    func registerObject(_ object: Any, forKey key: String) {
+        context.setObject(object, forKeyedSubscript: key as NSString)
+    }
+
     /// Fires the `onEndMove` callback for every proxy whose `_moved` flag was set
     /// by a `moveTo` call during the preceding `evaluate()`.  Must be called after
     /// the script fully completes so state variables (e.g. `eqIsOpen`) are already

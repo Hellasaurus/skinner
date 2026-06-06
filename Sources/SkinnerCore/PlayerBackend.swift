@@ -68,4 +68,11 @@ public protocol PlayerBackend: AnyObject {
     func resetEQ()
 
     var eqPublisher: AnyPublisher<Void, Never> { get }
+
+    // PCM tap — handler is called on the audio render thread, must be @Sendable
+    @discardableResult
+    func installPCMTap(handler: @escaping @Sendable ([Float]) -> Void) -> PCMTapToken
+    func removePCMTap(_ token: PCMTapToken)
 }
+
+public typealias PCMTapToken = AnyObject

@@ -23,6 +23,7 @@ final class SkinWindow: NSWindow {
 
         contentView  = canvas
         skinCanvas   = canvas
+        makeFirstResponder(canvas)
 
         if let parent {
             let pf = parent.frame
