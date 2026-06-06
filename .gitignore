@@ -1,4 +1,5 @@
 .DS_Store
+/vendor/projectM.xcframework
 /.build
 /Packages
 xcuserdata/

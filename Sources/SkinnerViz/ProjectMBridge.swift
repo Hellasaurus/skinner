@@ -21,8 +21,12 @@ final class ProjectMBridge {
         let pl = projectm_playlist_create(h)
         playlist = pl
         if let path = presetPath {
-            projectm_playlist_add_path(pl, path.path, true, false)
+            print("[ProjectM] Loading presets from: \(path.path)")
+            let count = projectm_playlist_add_path(pl, path.path, true, false)
+            print("[ProjectM] Loaded \(count) presets")
             projectm_playlist_set_shuffle(pl, true)
+        } else {
+            print("[ProjectM] No preset path found — playlist will be empty")
         }
     }
 
@@ -50,11 +54,15 @@ final class ProjectMBridge {
     }
 
     func nextPreset() {
-        if let pl = playlist { projectm_playlist_play_next(pl, false) }
+        guard let pl = playlist else { print("[ProjectM] nextPreset: no playlist"); return }
+        projectm_playlist_play_next(pl, false)
+        print("[ProjectM] → next preset: \(currentPresetName)")
     }
 
     func previousPreset() {
-        if let pl = playlist { projectm_playlist_play_previous(pl, false) }
+        guard let pl = playlist else { print("[ProjectM] previousPreset: no playlist"); return }
+        projectm_playlist_play_previous(pl, false)
+        print("[ProjectM] ← previous preset: \(currentPresetName)")
     }
 
     var currentPresetName: String {

@@ -1248,12 +1248,17 @@ public final class SkinCanvasView: NSView {
 
     public override func keyDown(with event: NSEvent) {
         guard let viz = vizProvider, !viz.view.isHidden else {
+            print("[SkinCanvas] keyDown: vizProvider=\(vizProvider == nil ? "nil" : "set"), vizHidden=\(vizProvider?.view.isHidden ?? true) — passing to super")
             super.keyDown(with: event)
             return
         }
         switch event.specialKey {
-        case NSEvent.SpecialKey.leftArrow:  viz.previousPreset()
-        case NSEvent.SpecialKey.rightArrow: viz.nextPreset()
+        case NSEvent.SpecialKey.leftArrow:
+            print("[SkinCanvas] left arrow → previousPreset")
+            viz.previousPreset()
+        case NSEvent.SpecialKey.rightArrow:
+            print("[SkinCanvas] right arrow → nextPreset")
+            viz.nextPreset()
         default: super.keyDown(with: event)
         }
     }
@@ -1551,17 +1556,23 @@ public final class SkinCanvasView: NSView {
     }
 
     private func presetSearchPath() -> URL? {
+        let fm = FileManager.default
+        func hasPresets(_ url: URL) -> Bool {
+            guard let items = try? fm.contentsOfDirectory(atPath: url.path) else { return false }
+            return items.contains { !$0.hasPrefix(".") }
+        }
+
         // 1. Bundled presets in the package/app bundle.
         if let url = Bundle.module.url(forResource: "presets", withExtension: nil,
-                                       subdirectory: "projectM") {
+                                       subdirectory: "projectM"), hasPresets(url) {
             return url
         }
         if let appResource = Bundle.main.resourceURL?.appendingPathComponent("presets"),
-           FileManager.default.fileExists(atPath: appResource.path) {
+           hasPresets(appResource) {
             return appResource
         }
         if let appResource = Bundle.main.resourceURL?.appendingPathComponent("projectM/presets"),
-           FileManager.default.fileExists(atPath: appResource.path) {
+           hasPresets(appResource) {
             return appResource
         }
 
