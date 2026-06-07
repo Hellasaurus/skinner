@@ -639,8 +639,15 @@ public final class SkinCanvasView: NSView {
 
             case .subview(let sv):
                 guard !elementIsHidden(sv.base, live: true) else { continue }
-                let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+                var sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+                // Center horizontally when no explicit left is set and alignment is "center".
+                if sv.base.left == nil, sv.base.horizontalAlignment == .center {
+                    let elemW = lc.resolve(sv.base.width)
+                        ?? sv.backgroundImage.flatMap { cache.images[$0.lowercased()]?.size.width }
+                        ?? 0
+                    if elemW > 0 { sx = offset.x + (lc.viewWidth - elemW) / 2 }
+                }
                 let childOffset = CGPoint(x: sx, y: sy)
                 let alpha = effectiveAlpha(for: sv.base)
                 let needsAlpha = alpha < 255
@@ -691,9 +698,35 @@ public final class SkinCanvasView: NSView {
                        !cache.clipImageNames.contains(name.lowercased()),
                        !promotedGifNames.contains(name.lowercased()),
                        let img  = cache.images[name.lowercased()] {
-                        let w = lc.resolve(sv.base.width)  ?? img.size.width
-                        let h = lc.resolve(sv.base.height) ?? img.size.height
-                        img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
+                        let w: CGFloat
+                        if let explicitW = lc.resolve(sv.base.width) {
+                            w = explicitW
+                        } else if sv.base.horizontalAlignment == .stretch {
+                            let rightBound = elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.base.horizontalAlignment == .right else { return nil }
+                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                            }.min() ?? lc.viewWidth
+                            w = max(0, rightBound - sx)
+                        } else {
+                            w = img.size.width
+                        }
+                        let h: CGFloat
+                        if let explicitH = lc.resolve(sv.base.height) {
+                            h = explicitH
+                        } else if sv.base.verticalAlignment == .stretch {
+                            let botBound = elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.base.verticalAlignment == .bottom else { return nil }
+                                return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
+                            }.min() ?? lc.viewHeight
+                            h = max(0, botBound - sy)
+                        } else {
+                            h = img.size.height
+                        }
+                        if sv.backgroundTiled {
+                            drawTiledImage(img, in: NSRect(x: sx, y: sy, width: w, height: h), ctx: ctx)
+                        } else {
+                            img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
+                        }
                     }
                 }
                 drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
@@ -900,6 +933,24 @@ public final class SkinCanvasView: NSView {
         } else {
             img.draw(in: drawRect)
         }
+    }
+
+    private func drawTiledImage(_ img: NSImage, in destRect: NSRect, ctx: CGContext) {
+        let iw = img.size.width
+        let ih = img.size.height
+        guard iw > 0, ih > 0 else { return }
+        ctx.saveGState()
+        ctx.clip(to: destRect)
+        var ty = destRect.minY
+        while ty < destRect.maxY {
+            var tx = destRect.minX
+            while tx < destRect.maxX {
+                img.draw(in: NSRect(x: tx, y: ty, width: iw, height: ih))
+                tx += iw
+            }
+            ty += ih
+        }
+        ctx.restoreGState()
     }
 
     private func drawSlider(_ slider: RenderedSlider) {
@@ -1448,9 +1499,39 @@ public final class SkinCanvasView: NSView {
                 let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 // Compute this subview's backgroundImage and frame to pass as parent context.
+                // Apply stretch alignment when no explicit size is declared (same logic as drawElements).
                 let svBgImg = sv.backgroundImage.flatMap { cache.images[$0.lowercased()] }
-                let svBgW   = lc.resolve(sv.base.width)  ?? (svBgImg?.size.width  ?? 0)
-                let svBgH   = lc.resolve(sv.base.height) ?? (svBgImg?.size.height ?? 0)
+                let svBgW: CGFloat
+                if let explicitW = lc.resolve(sv.base.width) {
+                    svBgW = explicitW
+                } else if sv.base.horizontalAlignment == .stretch {
+                    let rightBound = elements.compactMap { e -> CGFloat? in
+                        guard case .subview(let s) = e, s.base.id != sv.base.id,
+                              s.base.horizontalAlignment == .right else { return nil }
+                        return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                    }.min() ?? lc.viewWidth
+                    svBgW = max(0, rightBound - sx)
+                } else {
+                    svBgW = svBgImg?.size.width ?? 0
+                }
+                let svBgH: CGFloat
+                if let explicitH = lc.resolve(sv.base.height) {
+                    svBgH = explicitH
+                } else if sv.base.verticalAlignment == .stretch {
+                    let botBound = elements.compactMap { e -> CGFloat? in
+                        guard case .subview(let s) = e, s.base.id != sv.base.id,
+                              s.base.verticalAlignment == .bottom else { return nil }
+                        return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
+                    }.min() ?? lc.viewHeight
+                    svBgH = max(0, botBound - sy)
+                } else {
+                    svBgH = svBgImg?.size.height ?? 0
+                }
+                // Seed resolved dimensions so nested jscript: references (e.g. jscript:visFrame.width) resolve.
+                if let id = sv.base.id {
+                    if svBgW > 0 { engine?.evaluate("\(id).width = \(svBgW)") }
+                    if svBgH > 0 { engine?.evaluate("\(id).height = \(svBgH)") }
+                }
                 let svBgFrame = CGRect(x: sx, y: sy, width: svBgW, height: svBgH)
                 if var found = findEffects(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc,
                                             parentBgImage: svBgImg, parentBgFrame: svBgFrame,
@@ -1499,8 +1580,32 @@ public final class SkinCanvasView: NSView {
                               let img = cache.images[bgName] else { continue }
                         let sibX = liveCoord(sib.base.id, attr: sib.base.left, propName: "left", lc: lc) + offset.x
                         let sibY = liveCoord(sib.base.id, attr: sib.base.top,  propName: "top",  lc: lc) + offset.y
-                        let sw   = lc.resolve(sib.base.width)  ?? img.size.width
-                        let sh   = lc.resolve(sib.base.height) ?? img.size.height
+                        let sw: CGFloat
+                        if let explicitW = lc.resolve(sib.base.width) {
+                            sw = explicitW
+                        } else if sib.base.horizontalAlignment == .stretch {
+                            let rightBound = elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.base.id != sib.base.id,
+                                      s.base.horizontalAlignment == .right else { return nil }
+                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                            }.min() ?? lc.viewWidth
+                            sw = max(0, rightBound - sibX)
+                        } else {
+                            sw = img.size.width
+                        }
+                        let sh: CGFloat
+                        if let explicitH = lc.resolve(sib.base.height) {
+                            sh = explicitH
+                        } else if sib.base.verticalAlignment == .stretch {
+                            let botBound = elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.base.id != sib.base.id,
+                                      s.base.verticalAlignment == .bottom else { return nil }
+                                return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
+                            }.min() ?? lc.viewHeight
+                            sh = max(0, botBound - sibY)
+                        } else {
+                            sh = img.size.height
+                        }
                         let sibFrame  = CGRect(x: sibX, y: sibY, width: sw, height: sh)
                         let vizFrame  = found.1
                         // Restrict the NSImageView to the viz frame: the portion of the sibling
@@ -1643,7 +1748,11 @@ public final class SkinCanvasView: NSView {
                 // Draw the background at its canvas rect. For parent covers frame==drawRect;
                 // for sibling covers drawRect is the full sibling rect while frame is the
                 // intersection with the viz — only the overlapping portion is painted.
-                info.bgImage.draw(in: info.drawRect)
+                if info.subview.backgroundTiled {
+                    drawTiledImage(info.bgImage, in: info.drawRect, ctx: imgCtx)
+                } else {
+                    info.bgImage.draw(in: info.drawRect)
+                }
                 // Draw positive-zIndex children of the cover subview.
                 let aboveChildren = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
                 let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
