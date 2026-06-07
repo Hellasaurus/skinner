@@ -87,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func closeSecondaryView(_ viewId: String) {
+        print("[Skinner] closeSecondaryView('\(viewId)'); keys=\(secondaryWindows.keys.sorted())")
         let key = secondaryWindows.keys.first {
             $0 == viewId || viewId.contains($0) || $0.contains(viewId)
         }

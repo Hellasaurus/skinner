@@ -309,6 +309,7 @@ final class SkinScriptEngine {
         ctx.setObject(openBridge, forKeyedSubscript: "_skinnerOpenView" as NSString)
 
         let closeBridge: @convention(block) (String) -> Void = { [weak self] id in
+            print("[Skinner] _skinnerCloseView('\(id)') fired; onCloseView=\(self?.onCloseView != nil)")
             self?.onCloseView?(id)
         }
         ctx.setObject(closeBridge, forKeyedSubscript: "_skinnerCloseView" as NSString)

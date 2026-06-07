@@ -1022,8 +1022,11 @@ public final class SkinCanvasView: NSView {
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
         guard bgWidth > 0 else { return super.hitTest(point) }
-        // point arrives in flipped view coords (y=0 at top); composite map uses same convention.
-        let px = Int(point.x), py = Int(point.y)
+        // point is in superview coords (non-flipped: y=0 at bottom of view).
+        // bgOpacity uses flipped coords (row 0 = visual top), so we must convert.
+        let localX = point.x - frame.minX
+        let localY = frame.height - (point.y - frame.minY)
+        let px = Int(localX), py = Int(localY)
         guard px >= 0, px < bgWidth, py >= 0, py < bgHeight else { return nil }
         guard bgOpacity[py * bgWidth + px] else { return nil }
         // Return self rather than delegating into subviews: all interaction is handled here,
@@ -1045,6 +1048,7 @@ public final class SkinCanvasView: NSView {
 
     public override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
+        print("[Skinner] mouseDown view=\(skinView.id ?? "?") pt=\(pt) buttons=\(buttons.count)")
 
         // Button groups use pixel-precise mapping-image hit tests and should take
         // priority over sliders when their frames overlap (e.g. STALKER's EQ/PL
@@ -1067,6 +1071,7 @@ public final class SkinCanvasView: NSView {
                   !ancestorsPassThrough(buttons[i].ancestorBases),
                   elementIsEnabled(buttons[i].model.base) else { continue }
             guard buttons[i].hitTest(pt) else { continue }
+            print("[Skinner] mouseDown: hit button[\(i)] id=\(buttons[i].model.base.id ?? "nil") frame=\(buttons[i].frame) onClick='\(buttons[i].model.base.onClick?.prefix(60) ?? "nil")'")
             buttons[i].isPressed = true
             setNeedsDisplay(bounds)
             return
@@ -1091,6 +1096,7 @@ public final class SkinCanvasView: NSView {
             pressedTextIdx = i
             return
         }
+        print("[Skinner] mouseDown: no interactive element hit, setting dragOrigin")
         dragOrigin = NSEvent.mouseLocation
     }
 
@@ -1337,7 +1343,10 @@ public final class SkinCanvasView: NSView {
             let cur = engine?.state(for: id)?.down ?? false
             engine?.evaluate("\(id).down = \(cur ? "false" : "true")")
         }
-        if let script = button.model.base.onClick { engine?.evaluate(script); applyScriptChanges(); return }
+        if let script = button.model.base.onClick {
+            print("[Skinner] fireButtonAction onClick='\(script.prefix(80))'")
+            engine?.evaluate(script); applyScriptChanges(); return
+        }
         switch button.model.kind {
         case .mute:    playerBackend?.isMuted.toggle()
         case .generic: print("[ACTION] button / \(button.model.base.id ?? button.model.image ?? "?")")
