@@ -767,6 +767,13 @@ final class SkinScriptEngine {
         player.currentmedia = player.currentMedia;
         """)
 
+        // Fire initial state callbacks so the skin's JS state machine reflects the current
+        // backend state immediately. Without this, if music was already playing when the skin
+        // loaded, playStateOnChange never fires (no state change occurs), and variables like
+        // visMark stay in their onLoad-only initial values instead of adjusting for "playing".
+        if let script = playerCallbacks?.playStateOnChange, !script.isEmpty { evaluate(script) }
+        if let script = playerCallbacks?.openStateOnChange,  !script.isEmpty { evaluate(script) }
+
         // Wire the eq object's band gains and preset methods to the live backend.
         context.evaluateScript("""
         (function() {

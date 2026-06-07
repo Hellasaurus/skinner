@@ -6,6 +6,8 @@ import projectM
 final class ProjectMBridge {
     private var handle:   projectm_handle?
     private var playlist: projectm_playlist_handle?
+    // Serializes renderFrame (CVDisplayLink thread) against preset/resize calls (main thread).
+    private let lock = NSLock()
 
     init(presetPath: URL?) {
         handle = projectm_create()
@@ -37,6 +39,8 @@ final class ProjectMBridge {
 
     func resize(width: Int, height: Int) {
         guard let h = handle, width > 0, height > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
         projectm_set_window_size(h, size_t(width), size_t(height))
     }
 
@@ -50,23 +54,31 @@ final class ProjectMBridge {
     /// Must be called with the OpenGL context active on the calling thread.
     func renderFrame() {
         guard let h = handle else { return }
+        lock.lock()
+        defer { lock.unlock() }
         projectm_opengl_render_frame(h)
     }
 
     func nextPreset() {
         guard let pl = playlist else { print("[ProjectM] nextPreset: no playlist"); return }
+        lock.lock()
         projectm_playlist_play_next(pl, false)
+        lock.unlock()
         print("[ProjectM] → next preset: \(currentPresetName)")
     }
 
     func previousPreset() {
         guard let pl = playlist else { print("[ProjectM] previousPreset: no playlist"); return }
+        lock.lock()
         projectm_playlist_play_previous(pl, false)
+        lock.unlock()
         print("[ProjectM] ← previous preset: \(currentPresetName)")
     }
 
     var currentPresetName: String {
         guard let pl = playlist else { return "" }
+        lock.lock()
+        defer { lock.unlock() }
         let pos = projectm_playlist_get_position(pl)
         guard let cstr = projectm_playlist_item(pl, pos) else { return "" }
         defer { projectm_playlist_free_string(cstr) }

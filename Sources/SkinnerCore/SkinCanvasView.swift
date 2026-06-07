@@ -58,6 +58,7 @@ public final class SkinCanvasView: NSView {
     /// Set by AppDelegate to provide a visualization view for `<EFFECTS>` elements.
     public var makeVisualizationProvider: (() -> any VisualizationProviding)?
     private var vizProvider:   (any VisualizationProviding)?
+    private var vizContainer:  NSView?
     private var vizConfigured  = false
     private var vizCoverInfos: [VizCoverInfo] = []
 
@@ -628,7 +629,11 @@ public final class SkinCanvasView: NSView {
                                lc: LayoutContext,
                                ctx: CGContext,
                                buttonIdx: inout Int,
-                               sliderIdx: inout Int) {
+                               sliderIdx: inout Int,
+                               buttonOverride: [RenderedButton]? = nil,
+                               sliderOverride: [RenderedSlider]? = nil) {
+        let btnArr = buttonOverride ?? buttons
+        let slrArr = sliderOverride ?? sliders
         for element in sortedByZIndex(elements) {
             switch element {
 
@@ -667,7 +672,8 @@ public final class SkinCanvasView: NSView {
                 let below = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
                 let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
                 drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
-                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
+                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx,
+                             buttonOverride: buttonOverride, sliderOverride: sliderOverride)
                 // Fill backgroundColor before drawing the background image so the image sits on top.
                 // Only fill when we have explicit clip dimensions; otherwise size is unknown.
                 if let colorStr = sv.backgroundColor,
@@ -691,7 +697,8 @@ public final class SkinCanvasView: NSView {
                     }
                 }
                 drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
-                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx)
+                             buttonIdx: &buttonIdx, sliderIdx: &sliderIdx,
+                             buttonOverride: buttonOverride, sliderOverride: sliderOverride)
                 if needsAlpha { ctx.endTransparencyLayer() }
                 if needsGState { ctx.restoreGState() }
 
@@ -716,15 +723,15 @@ public final class SkinCanvasView: NSView {
                 // even if it's dynamically hidden now — keeps the index in sync.
                 guard !elementIsHidden(b.base) else { continue }
                 defer { buttonIdx += 1 }
-                if !elementIsHidden(b.base, live: true), buttonIdx < buttons.count {
-                    drawButton(buttons[buttonIdx], ctx: ctx)
+                if !elementIsHidden(b.base, live: true), buttonIdx < btnArr.count {
+                    drawButton(btnArr[buttonIdx], ctx: ctx)
                 }
 
             case .slider(let s):
                 guard !elementIsHidden(s.base) else { continue }
                 defer { sliderIdx += 1 }
-                if !elementIsHidden(s.base, live: true), sliderIdx < sliders.count {
-                    drawSlider(sliders[sliderIdx])
+                if !elementIsHidden(s.base, live: true), sliderIdx < slrArr.count {
+                    drawSlider(slrArr[sliderIdx])
                 }
 
             case .playlist(let p):
@@ -1019,7 +1026,11 @@ public final class SkinCanvasView: NSView {
         let px = Int(point.x), py = Int(point.y)
         guard px >= 0, px < bgWidth, py >= 0, py < bgHeight else { return nil }
         guard bgOpacity[py * bgWidth + px] else { return nil }
-        return super.hitTest(point)
+        // Return self rather than delegating into subviews: all interaction is handled here,
+        // and visual subviews (animated GIFs, viz container, cover images) must not receive
+        // mouse events. Returning a subview would cause AppKit to call acceptsFirstMouse on
+        // it (returning false), so the first click after a window-activation would be eaten.
+        return self
     }
 
     // MARK: - Tracking areas
@@ -1245,6 +1256,7 @@ public final class SkinCanvasView: NSView {
     // MARK: - Keyboard
 
     public override var acceptsFirstResponder: Bool { true }
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     public override func keyDown(with event: NSEvent) {
         guard let viz = vizProvider, !viz.view.isHidden else {
@@ -1375,8 +1387,8 @@ public final class SkinCanvasView: NSView {
 
         // Visualization: find an <EFFECTS> element and position the overlay view.
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
-        if let (fx, frame, covers) = findEffects(in: skinView.elements, offset: .zero, lc: lc2) {
-            updateVisualizationView(for: fx, frame: frame, covers: covers)
+        if let (fx, frame, covers, ancestorAlpha) = findEffects(in: skinView.elements, offset: .zero, lc: lc2) {
+            updateVisualizationView(for: fx, frame: frame, covers: covers, ancestorAlpha: ancestorAlpha)
         }
     }
 
@@ -1410,7 +1422,7 @@ public final class SkinCanvasView: NSView {
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview, bgImage: NSImage, frame: CGRect)])? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], ancestorAlpha: Int)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -1420,7 +1432,7 @@ public final class SkinCanvasView: NSView {
                 let y = (resolveCoord(fx.base.top,    lc: lc) ?? 0) + offset.y
                 let w =  resolveCoord(fx.base.width,  lc: lc) ?? bounds.width
                 let h =  resolveCoord(fx.base.height, lc: lc) ?? bounds.height
-                return (fx, CGRect(x: x, y: y, width: w, height: h), covers: [])
+                return (fx, CGRect(x: x, y: y, width: w, height: h), covers: [], ancestorAlpha: 255)
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -1441,8 +1453,57 @@ public final class SkinCanvasView: NSView {
                     if (sv.base.zIndex ?? 0) < 0,
                        let img = parentBgImage, let frm = parentBgFrame,
                        let parentSv = parentSubview {
-                        found.covers.append((subview: parentSv, bgImage: img, frame: frm))
+                        found.covers.append((subview: parentSv, bgImage: img, frame: frm, drawRect: frm))
                     }
+                    // If the effects element itself has negative zIndex, this subview's own
+                    // backgroundImage (e.g. vis_mask_w.png in Plus! Professional) renders
+                    // above it in CGContext but falls behind the viz NSView — add it as a cover.
+                    let hasDirectNegEffects = sv.children.contains { child in
+                        guard (child.base?.zIndex ?? 0) < 0 else { return false }
+                        if case .effects = child { return true }
+                        return false
+                    }
+                    if hasDirectNegEffects, let img = svBgImg {
+                        found.covers.append((subview: sv, bgImage: img, frame: svBgFrame, drawRect: svBgFrame))
+                    }
+                    // Collect passThrough sibling subviews with a higher zIndex as overlay covers.
+                    // They render above the effects' parent in CGContext but behind NSViews —
+                    // adding them here places them correctly above the viz (e.g. over_base.png,
+                    // screen_glare.png in Plus! Professional).
+                    // Use the live backgroundImage (JS state preferred over WMS attribute) so we
+                    // see the correct image at the time the viz is first shown. Skip any sibling
+                    // whose live image is already in promotedGifNames — those are managed as
+                    // animated NSImageViews and are already above the viz without a separate cover
+                    // (e.g. introShutterAnim showing shutter_open2.gif, playback_anim.gif).
+                    let effectsParentZIndex = sv.base.zIndex ?? 0
+                    for sibling in sortedByZIndex(elements) {
+                        guard case .subview(let sib) = sibling,
+                              sib.base.id != sv.base.id,
+                              (sib.base.zIndex ?? 0) > effectsParentZIndex,
+                              !elementIsHidden(sib.base, live: true) else { continue }
+                        let liveBgName = (sib.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
+                                          ?? sib.backgroundImage)?.lowercased()
+                        guard let bgName = liveBgName,
+                              !promotedGifNames.contains(bgName),
+                              cache.buttonGroupsByMappingImage[bgName] == nil,
+                              !cache.clipImageNames.contains(bgName),
+                              let img = cache.images[bgName] else { continue }
+                        let sibX = liveCoord(sib.base.id, attr: sib.base.left, propName: "left", lc: lc) + offset.x
+                        let sibY = liveCoord(sib.base.id, attr: sib.base.top,  propName: "top",  lc: lc) + offset.y
+                        let sw   = lc.resolve(sib.base.width)  ?? img.size.width
+                        let sh   = lc.resolve(sib.base.height) ?? img.size.height
+                        let sibFrame  = CGRect(x: sibX, y: sibY, width: sw, height: sh)
+                        let vizFrame  = found.1
+                        // Restrict the NSImageView to the viz frame: the portion of the sibling
+                        // outside the viz is visible in CGContext and must not be covered by an
+                        // NSImageView (that would hide buttons drawn in CGContext in that region).
+                        guard sibFrame.intersects(vizFrame) else { continue }
+                        let coverFrame = sibFrame.intersection(vizFrame)
+                        found.covers.append((subview: sib, bgImage: img,
+                                             frame: coverFrame, drawRect: sibFrame))
+                    }
+                    // Propagate ancestor alpha: viz must be hidden when any ancestor's alpha is 0.
+                    found.ancestorAlpha = min(found.ancestorAlpha, effectiveAlpha(for: sv.base))
                     return found
                 }
             default: break
@@ -1453,12 +1514,34 @@ public final class SkinCanvasView: NSView {
 
     private func updateVisualizationView(
         for fx: Effects, frame: CGRect,
-        covers: [(subview: Subview, bgImage: NSImage, frame: CGRect)]
+        covers: [(subview: Subview, bgImage: NSImage, frame: CGRect, drawRect: CGRect)],
+        ancestorAlpha: Int = 255
     ) {
         if vizProvider == nil, let factory = makeVisualizationProvider {
             let provider = factory()
             vizProvider  = provider
-            addSubview(provider.view, positioned: .above, relativeTo: nil)
+
+            // Wrap the viz in a container for frame/visibility management.
+            // NSOpenGLView must NOT be inside a wantsLayer=true container — doing so
+            // places it in a layer-backed hierarchy and OpenGL stops rendering.
+            let container = NSView(frame: frame)
+            addSubview(container, positioned: .above, relativeTo: nil)
+            provider.view.frame = CGRect(origin: .zero, size: frame.size)
+            container.addSubview(provider.view)
+            vizContainer = container
+
+            // Apply vis_mask.gif as a CALayer mask if the skin provides one.
+            // The mask's grey pixels show the viz; white/transparent pixels hide it.
+            if let md = cache.mapData["vis_mask.gif"],
+               let maskImg = buildVisMaskLayerImage(from: md, targetSize: frame.size),
+               let layer = container.layer {
+                let maskLayer = CALayer()
+                maskLayer.contents = maskImg
+                maskLayer.frame = CGRect(origin: .zero, size: frame.size)
+                maskLayer.contentsGravity = .resize
+                layer.mask = maskLayer
+            }
+
             if let backend = playerBackend, !vizConfigured {
                 provider.configure(backend: backend, presetPath: presetSearchPath())
                 vizConfigured = true
@@ -1467,40 +1550,76 @@ public final class SkinCanvasView: NSView {
             // Build a cover NSImageView for each image that must appear above the viz.
             // The image is composited each draw() to include positive-zIndex children
             // (play controls, seek bar, etc.) that otherwise live below all NSViews.
-            let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
-            vizCoverInfos = covers.map { (sv, bgImage, coverFrame) in
-                let coverOffset = CGPoint(x: coverFrame.origin.x, y: coverFrame.origin.y)
-                let negChildren = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
-                // Count how many buttons/sliders come from negative-zIndex children so we
-                // know where in the global arrays the positive-zIndex children begin.
-                let buttonStart = collectButtons(in: negChildren, offset: coverOffset, lc: lc).count
-                let sliderStart = collectSliders(in: negChildren, offset: coverOffset, lc: lc).count
+            vizCoverInfos = covers.map { (sv, bgImage, coverFrame, drawRect) in
                 let iv = NSImageView(frame: coverFrame)
                 iv.image        = bgImage
                 iv.imageScaling = .scaleAxesIndependently
                 addSubview(iv)
                 return VizCoverInfo(subview: sv, bgImage: bgImage, frame: coverFrame,
-                                    buttonStart: buttonStart, sliderStart: sliderStart,
-                                    imageView: iv)
+                                    drawRect: drawRect, imageView: iv)
             }
         }
-        vizProvider?.view.frame = frame
+        vizContainer?.frame = frame
+        vizProvider?.view.frame = CGRect(origin: .zero, size: vizContainer?.bounds.size ?? frame.size)
         vizProvider?.resize(to: frame.size)
+        if let maskLayer = vizContainer?.layer?.mask {
+            maskLayer.frame = CGRect(origin: .zero, size: frame.size)
+        }
         for (i, cover) in covers.enumerated() where i < vizCoverInfos.count {
-            vizCoverInfos[i].frame     = cover.frame
+            vizCoverInfos[i].frame           = cover.frame
+            vizCoverInfos[i].drawRect        = cover.drawRect
             vizCoverInfos[i].imageView.frame = cover.frame
         }
         if let provider = vizProvider {
-            let hidden = elementIsHidden(fx.base, live: true)
+            let hidden = elementIsHidden(fx.base, live: true) || ancestorAlpha == 0
             provider.view.isHidden   = hidden
-            provider.view.alphaValue = hidden ? 0 : CGFloat(effectiveAlpha(for: fx.base)) / 255.0
+            vizContainer?.isHidden   = hidden
+            // Covers are only needed when the viz is live — when hidden, CGContext draws
+            // those elements (stone_base, over_base, etc.) correctly at their own z-order.
+            for info in vizCoverInfos { info.imageView.isHidden = hidden }
+            let combinedAlpha = min(effectiveAlpha(for: fx.base), ancestorAlpha)
+            provider.view.alphaValue = hidden ? 0 : CGFloat(combinedAlpha) / 255.0
         }
     }
 
+    /// Builds an RGBA CGImage suitable for use as a `CALayer.mask` contents, where
+    /// grey pixels in `md` become opaque (show the viz) and white/transparent/magenta
+    /// pixels become alpha=0 (hide the viz). Rows are flipped to match the top-down
+    /// coordinate system of macOS NSView backing layers (isGeometryFlipped=true).
+    private func buildVisMaskLayerImage(from md: MapData, targetSize: CGSize) -> CGImage? {
+        let tw = max(1, Int(targetSize.width))
+        let th = max(1, Int(targetSize.height))
+        var bytes = [UInt8](repeating: 0, count: tw * th * 4)
+        for dstRow in 0 ..< th {
+            // Flip rows: CGImage row 0 = visual top (matches isGeometryFlipped=true).
+            // MapData row 0 = visual bottom (CGContext order) → mirror to get visual top.
+            let srcRow = (dstRow * md.height / th)
+            for dstCol in 0 ..< tw {
+                let srcCol = min(md.width - 1, dstCol * md.width / tw)
+                let si = (srcRow * md.width + srcCol) * 4
+                guard si + 3 < md.bytes.count else { continue }
+                let r = md.bytes[si], g = md.bytes[si+1], b = md.bytes[si+2], a = md.bytes[si+3]
+                let visible = a > 10 && !isMagenta(r, g, b) && !(r > 240 && g > 240 && b > 240)
+                let alpha: UInt8 = visible ? 255 : 0
+                let di = (dstRow * tw + dstCol) * 4
+                bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
+            }
+        }
+        guard let space    = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: tw, height: th,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: tw * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
     /// Called at the end of every draw(_:) cycle to update the viz cover NSImageViews.
-    /// Each cover composites its background image plus the positive-zIndex children of its
-    /// parent subview (buttons, sliders, groups) so they appear above the viz layer even
-    /// though Core Graphics drawing is always below all NSViews in the hierarchy.
+    /// Each cover composites its background image, the positive-zIndex children of its
+    /// subview, and any global groups/buttons/sliders that intersect the cover frame but
+    /// live outside the cover subview's child tree (e.g. vol/seek sliders in Pulsar which
+    /// are siblings of visMask, not children of any cover subview).
     private func renderVizCoverImages(lc: LayoutContext) {
         guard !vizCoverInfos.isEmpty else { return }
         for info in vizCoverInfos {
@@ -1512,17 +1631,50 @@ public final class SkinCanvasView: NSView {
             if let imgCtx = NSGraphicsContext.current?.cgContext {
                 // Shift canvas-coord drawing into image-local coordinates.
                 imgCtx.translateBy(x: -frame.origin.x, y: -frame.origin.y)
-                // Draw the parent background (e.g. head.bmp) at its absolute canvas rect.
-                info.bgImage.draw(in: frame)
-                // Draw the positive-zIndex children (play controls, seek, EQ/PL buttons, etc.)
-                // starting at the pre-computed index into the global buttons/sliders arrays.
+                // Draw the background at its canvas rect. For parent covers frame==drawRect;
+                // for sibling covers drawRect is the full sibling rect while frame is the
+                // intersection with the viz — only the overlapping portion is painted.
+                info.bgImage.draw(in: info.drawRect)
+                // Draw positive-zIndex children of the cover subview.
                 let aboveChildren = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
-                var bi = info.buttonStart
-                var si = info.sliderStart
+                let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
+                let coverButtons  = collectButtons(in: aboveChildren, offset: coverOffset, lc: lc)
+                let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
+                var bi = 0
+                var si = 0
                 drawElements(aboveChildren,
-                             offset: CGPoint(x: frame.origin.x, y: frame.origin.y),
+                             offset: coverOffset,
                              lc: lc, ctx: imgCtx,
-                             buttonIdx: &bi, sliderIdx: &si)
+                             buttonIdx: &bi, sliderIdx: &si,
+                             buttonOverride: coverButtons, sliderOverride: coverSliders)
+                // Draw global groups/buttons/sliders that intersect the viz cover frame but
+                // live outside the cover subview's child tree. Skip any already drawn above.
+                let svId = sv.base.id
+                func isOwnedByCover(_ ancestors: [ElementBase]) -> Bool {
+                    guard let id = svId else { return false }
+                    return ancestors.contains { $0.id == id }
+                }
+                for group in groups {
+                    guard !elementIsHidden(group.model.base, live: true),
+                          ancestorsVisible(group.ancestorBases),
+                          group.frame.intersects(frame),
+                          !isOwnedByCover(group.ancestorBases) else { continue }
+                    drawGroup(group, frame: group.frame, ctx: imgCtx)
+                }
+                for button in buttons {
+                    guard !elementIsHidden(button.model.base, live: true),
+                          ancestorsVisible(button.ancestorBases),
+                          button.frame.intersects(frame),
+                          !isOwnedByCover(button.ancestorBases) else { continue }
+                    drawButton(button, ctx: imgCtx)
+                }
+                for slider in sliders {
+                    guard !elementIsHidden(slider.model.base, live: true),
+                          ancestorsVisible(slider.ancestorBases),
+                          slider.frame.intersects(frame),
+                          !isOwnedByCover(slider.ancestorBases) else { continue }
+                    drawSlider(slider)
+                }
             }
             composite.unlockFocus()
             info.imageView.image = composite
@@ -1557,6 +1709,27 @@ public final class SkinCanvasView: NSView {
 
     private func presetSearchPath() -> URL? {
         let fm = FileManager.default
+
+        // Resolves a top-level symlink inside `url` to its real target, so projectM's C
+        // scanner (which doesn't follow symlinks) gets a real directory path. Returns nil
+        // if no entry resolves to a real directory (e.g. broken relative symlink after bundle copy).
+        func resolveSymlink(_ url: URL) -> URL? {
+            guard let items = try? fm.contentsOfDirectory(atPath: url.path) else { return nil }
+            for item in items where !item.hasPrefix(".") {
+                let child = url.appendingPathComponent(item)
+                let resolved = child.resolvingSymlinksInPath()
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: resolved.path, isDirectory: &isDir), isDir.boolValue {
+                    if resolved.path != child.path {
+                        print("[SkinCanvas] resolved preset symlink: \(child.path) → \(resolved.path)")
+                    }
+                    return resolved
+                }
+            }
+            print("[SkinCanvas] bundle presets dir has no resolvable content, falling through")
+            return nil
+        }
+
         func hasPresets(_ url: URL) -> Bool {
             guard let items = try? fm.contentsOfDirectory(atPath: url.path) else { return false }
             return items.contains { !$0.hasPrefix(".") }
@@ -1564,8 +1737,9 @@ public final class SkinCanvasView: NSView {
 
         // 1. Bundled presets in the package/app bundle.
         if let url = Bundle.module.url(forResource: "presets", withExtension: nil,
-                                       subdirectory: "projectM"), hasPresets(url) {
-            return url
+                                       subdirectory: "projectM"), hasPresets(url),
+           let resolved = resolveSymlink(url) {
+            return resolved
         }
         if let appResource = Bundle.main.resourceURL?.appendingPathComponent("presets"),
            hasPresets(appResource) {
@@ -1894,12 +2068,12 @@ public final class SkinCanvasView: NSView {
 // MARK: - VizCoverInfo
 
 private struct VizCoverInfo {
-    let subview:     Subview
-    let bgImage:     NSImage
-    var frame:       CGRect     // updated each recollect() so renderVizCoverImages uses current position
-    let buttonStart: Int        // first index in global buttons[] belonging to positive-zIndex children
-    let sliderStart: Int        // first index in global sliders[] belonging to positive-zIndex children
-    let imageView:   NSImageView
+    let subview:   Subview
+    let bgImage:   NSImage
+    var frame:     CGRect       // NSImageView position; for sibling covers = intersection with viz frame
+    var drawRect:  CGRect       // canvas rect at which bgImage is drawn; equals frame for parent covers,
+                                // full sibling rect for sibling covers (image drawn offset into intersection)
+    let imageView: NSImageView
 }
 
 // MARK: - RenderedGroup
