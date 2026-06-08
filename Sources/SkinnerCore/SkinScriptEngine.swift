@@ -35,10 +35,13 @@ final class SkinScriptEngine {
 
     private let context: JSContext
     private var proxies: [String: JSValue] = [:]
+    private let bundleDirectory: URL
+    private var soundCache: [String: NSSound] = [:]
 
     var onOpenView:    ((String) -> Void)?
     var onCloseView:   ((String) -> Void)?
     var onStateChanged: (() -> Void)?
+    var onStartResize: ((String) -> Void)?
 
     // Stored once at init time; JS callbacks fire these scripts when backend state changes.
     private let playerCallbacks: Player?
@@ -65,6 +68,7 @@ final class SkinScriptEngine {
         guard let scriptFile = skinView.scriptFile, !scriptFile.isEmpty else { return nil }
         guard let ctx = JSContext() else { return nil }
         self.context = ctx
+        self.bundleDirectory = bundle.directory
         self.playerCallbacks = skinView.player
         self.onTimerHandler = skinView.onTimer
 
@@ -196,6 +200,13 @@ final class SkinScriptEngine {
         let js = "(function(){ try { var _r=(\(clean)); return (_r===null||_r===undefined)?null:String(_r); } catch(e){ return null; } })()"
         guard let result = context.evaluateScript(js), !result.isNull, !result.isUndefined else { return nil }
         return result.toString()
+    }
+
+    /// Updates `view.width` and `view.height` in the JS context after a window resize.
+    /// Must be called before recollecting elements so jscript: expressions that reference
+    /// view dimensions (e.g. `jscript:view.width - 32`) resolve to the new size.
+    func updateViewSize(width: CGFloat, height: CGFloat) {
+        context.evaluateScript("view.width = \(Int(width)); view.height = \(Int(height));")
     }
 
     /// Resolves an `AttributeValue` to a displayable string against the live JS context.
@@ -345,19 +356,48 @@ final class SkinScriptEngine {
         }
         ctx.setObject(openDialogBridge, forKeyedSubscript: "_skinnerOpenDialog" as NSString)
 
+        let startResizeBridge: @convention(block) (String) -> Void = { [weak self] mode in
+            self?.onStartResize?(mode)
+        }
+        ctx.setObject(startResizeBridge, forKeyedSubscript: "_skinnerStartResize" as NSString)
+
+        let playSoundBridge: @convention(block) (String) -> Void = { [weak self] filename in
+            guard let self else { return }
+            let lower = filename.lowercased()
+            let master: NSSound
+            if let cached = self.soundCache[lower] {
+                master = cached
+            } else {
+                let url = self.bundleDirectory.appendingPathComponent(filename)
+                guard let loaded = NSSound(contentsOf: url, byReference: false) else { return }
+                self.soundCache[lower] = loaded
+                master = loaded
+            }
+            // Copy so concurrent/overlapping plays each have their own playback state.
+            (master.copy() as? NSSound)?.play()
+        }
+        ctx.setObject(playSoundBridge, forKeyedSubscript: "_skinnerPlaySound" as NSString)
+
         // view — the current skin view; also aliased by the view's own id.
         // view.close() calls back into Swift so the window manager can close the window.
         let timerInterval = skinView.timerInterval ?? 0
+        let minW = Int(sizeCtx.resolve(skinView.minWidth)  ?? CGFloat(w))
+        let minH = Int(sizeCtx.resolve(skinView.minHeight) ?? CGFloat(h))
         ctx.evaluateScript("""
+        var _viewTimerInterval = \(timerInterval);
         var view = {
             width: \(w), height: \(h),
-            minWidth: \(w), minHeight: \(h),
-            timerInterval: \(timerInterval),
+            minWidth: \(minW), minHeight: \(minH),
+            get timerInterval()  { return _viewTimerInterval; },
+            set timerInterval(v) { _viewTimerInterval = v; },
+            get TimerInterval()  { return _viewTimerInterval; },
+            set TimerInterval(v) { _viewTimerInterval = v; },
             title: "",
             backgroundImage: "",
             close:               function() { _skinnerCloseView('\(viewId)'); },
             minimize:            function() {},
-            returnToMediaCenter: function() {}
+            returnToMediaCenter: function() {},
+            size:                function(mode) { _skinnerStartResize(mode); }
         };
         """)
         if !skinView.id.isEmpty, isValidJSIdentifier(skinView.id) {
@@ -417,7 +457,7 @@ final class SkinScriptEngine {
             openView:        function(id) { _skinnerOpenView(id); },
             closeView:       function(id) { _skinnerCloseView(id); },
             openDialog:      function(t, f) { return _skinnerOpenDialog(t, f) || null; },
-            playSound:       function(f) {},
+            playSound:       function(f) { _skinnerPlaySound(String(f)); },
             currentViewID:   ""
         };
         """)
