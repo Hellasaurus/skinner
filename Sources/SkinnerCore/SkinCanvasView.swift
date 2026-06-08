@@ -58,6 +58,7 @@ public final class SkinCanvasView: NSView {
     private var timerWorkItem: DispatchWorkItem?
     private var timerDeadline: DispatchTime = .now()
     private var timerLastInterval: Int = 0
+    private var moveTimer: Timer?
 
     /// Set by AppDelegate to provide a visualization view for `<EFFECTS>` elements.
     public var makeVisualizationProvider: (() -> any VisualizationProviding)?
@@ -2015,6 +2016,37 @@ public final class SkinCanvasView: NSView {
         }
         setNeedsDisplay(bounds)
         rescheduleTimer()
+        startMoveTimerIfNeeded()
+    }
+
+    private func startMoveTimerIfNeeded() {
+        guard moveTimer == nil, engine?.hasActiveMoves == true else { return }
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            MainActor.assumeIsolated { self.tickMovesStep() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        moveTimer = t
+    }
+
+    private func stopMoveTimer() {
+        moveTimer?.invalidate()
+        moveTimer = nil
+    }
+
+    private func tickMovesStep() {
+        guard let engine else { stopMoveTimer(); return }
+        let _ = engine.tickMoves()
+        engine.fireOnEndMoveCallbacks()
+        recollect()
+        setNeedsDisplay(bounds)
+        if !engine.hasActiveMoves {
+            stopMoveTimer()
+            buildBgOpacity()
+            updateLiveSliders()
+            updateAnimatedSubviewVisibility()
+            rescheduleTimer()
+        }
     }
 
     /// Scans the element tree for subviews that have been dynamically assigned a GIF background

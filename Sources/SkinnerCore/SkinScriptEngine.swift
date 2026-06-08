@@ -112,6 +112,8 @@ final class SkinScriptEngine {
                    ti.isNumber, ti.toInt32() == 0 { break }
             }
         }
+        // Allow runtime moveTo calls to animate; init-time moves were already instant.
+        ctx.evaluateScript("_skinnerInitializing = false")
         // Fire any pending onEndMove callbacks so elements whose visibility/enabled
         // state is set by an onEndMove handler (e.g. hideTopBaseButtons) reflect the
         // correct initial state before SkinCanvasView first collects hittable elements.
@@ -135,12 +137,19 @@ final class SkinScriptEngine {
     /// the script fully completes so state variables (e.g. `eqIsOpen`) are already
     /// in their final toggled state when `onEndMove` reads them.
     func fireOnEndMoveCallbacks() {
-        for proxy in proxies.values {
-            guard let moved = proxy.forProperty("_moved"), moved.toBool() else { continue }
-            proxy.setValue(false, forProperty: "_moved")
-            if let s = proxy.forProperty("_onEndMove"),
-               let script = s.toString(), !script.isEmpty, script != "undefined" {
-                context.evaluateScript("try { \(script) } catch(e) {}")
+        // Drain loop: a callback (e.g. SmallScrEndMove) may call moveto() on other
+        // elements, setting their _moved flag. Repeat passes until no new flags appear.
+        var fired = true
+        while fired {
+            fired = false
+            for proxy in proxies.values {
+                guard let moved = proxy.forProperty("_moved"), moved.toBool() else { continue }
+                proxy.setValue(false, forProperty: "_moved")
+                fired = true
+                if let s = proxy.forProperty("_onEndMove"),
+                   let script = s.toString(), !script.isEmpty, script != "undefined" {
+                    context.evaluateScript("try { \(script) } catch(e) {}")
+                }
             }
         }
     }
@@ -152,6 +161,39 @@ final class SkinScriptEngine {
               v.isNumber else { return nil }
         let i = Int(v.toInt32())
         return i > 0 ? i : nil
+    }
+
+    /// True when any proxy has an in-flight timed moveTo animation.
+    var hasActiveMoves: Bool {
+        proxies.values.contains { $0.forProperty("_animating")?.toBool() == true }
+    }
+
+    /// Advances all in-flight timed moveTo animations one step.
+    /// Completed moves are marked _moved=true so the caller can then call
+    /// fireOnEndMoveCallbacks() to chain into the next hop.
+    /// Returns true if any moves are still in progress after this tick.
+    func tickMoves() -> Bool {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        for proxy in proxies.values {
+            guard proxy.forProperty("_animating")?.toBool() == true else { continue }
+            guard let t0 = proxy.forProperty("_t0")?.toDouble(),
+                  let durMs = proxy.forProperty("_ms")?.toDouble(), durMs > 0,
+                  let sx = proxy.forProperty("_sx")?.toDouble(),
+                  let sy = proxy.forProperty("_sy")?.toDouble(),
+                  let tx = proxy.forProperty("_tx")?.toDouble(),
+                  let ty = proxy.forProperty("_ty")?.toDouble() else {
+                proxy.setValue(false, forProperty: "_animating")
+                continue
+            }
+            let t = min((nowMs - t0) / durMs, 1.0)
+            proxy.setValue(sx + (tx - sx) * t, forProperty: "left")
+            proxy.setValue(sy + (ty - sy) * t, forProperty: "top")
+            if t >= 1.0 {
+                proxy.setValue(false, forProperty: "_animating")
+                proxy.setValue(true,  forProperty: "_moved")
+            }
+        }
+        return hasActiveMoves
     }
 
     /// Fires the view's `onTimer` handler once.  No-op if the skin has no onTimer.
@@ -286,14 +328,26 @@ final class SkinScriptEngine {
         var psReconnecting  = 11;
         var psLast          = 12;
 
+        // True during the synchronous onLoad/onTimer init pump so moveTo is instant.
+        // Cleared before runtime so user-triggered moveTo calls animate.
+        var _skinnerInitializing = true;
+
         // Prototype shared by every element proxy.
-        // moveTo / alphaBlendTo execute synchronously (no animation).
-        // onEndMove is NOT fired here — it must fire after the calling script fully
-        // completes (so state toggles like eqIsOpen have already been applied).
-        // _moved is set as a deferred marker; Swift calls fireOnEndMoveCallbacks()
-        // after evaluate() returns.
+        // During init (_skinnerInitializing) or when ms<=0: moves are instant and
+        // _moved is set immediately so fireOnEndMoveCallbacks() handles them.
+        // At runtime with ms>0: _animating is set and Swift drives interpolation via
+        // tickMoves(), firing _moved/onEndMove when each move completes.
         var _EP = {
-            moveTo: function(x, y, ms) { this.left = x; this.top = y; this._moved = true; },
+            moveTo: function(x, y, ms) {
+                if (!ms || ms <= 0 || _skinnerInitializing) {
+                    this.left = x; this.top = y; this._moved = true;
+                } else {
+                    this._sx = this.left || 0; this._sy = this.top || 0;
+                    this._tx = x; this._ty = y; this._ms = ms;
+                    this._t0 = Date.now();
+                    this._animating = true;
+                }
+            },
             alphaBlendTo:        function(v, ms)    { this.alphaBlend = v; },
             setColumnResizeMode: function(col, mode) {},
             appendItem:          function(text)      {},

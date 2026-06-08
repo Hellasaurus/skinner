@@ -170,23 +170,25 @@ private extension WMSParser {
         let ns = tag as NSString
         let matches = regex.matches(in: tag, range: NSRange(location: 0, length: ns.length))
 
-        var seen: Set<String> = []
-        var removals: [NSRange] = []
+        // Keep last occurrence of each attribute (WMP lenient-parser behavior).
+        // Collect all ranges per name, then remove all but the last.
+        var rangesByName: [String: [NSRange]] = [:]
         for m in matches {
             guard let nameRange = Range(m.range(at: 2), in: tag) else { continue }
             let name = tag[nameRange].lowercased()
-            if seen.contains(name) {
-                removals.append(m.range) // remove the entire `\s+ name="value"` span
-            } else {
-                seen.insert(name)
-            }
+            rangesByName[name, default: []].append(m.range)
+        }
+        var removals: [NSRange] = []
+        for ranges in rangesByName.values where ranges.count > 1 {
+            removals.append(contentsOf: ranges.dropLast())
         }
 
         if removals.isEmpty { return tag }
 
-        // Apply in reverse to preserve index validity.
+        // Sort descending by location so each removal doesn't shift subsequent ranges.
+        removals.sort { $0.location > $1.location }
         var result = tag
-        for range in removals.reversed() {
+        for range in removals {
             guard let r = Range(range, in: result) else { continue }
             result.removeSubrange(r)
         }
@@ -327,13 +329,15 @@ private extension WMSParser {
             return .slider(buildSlider(node, kind: .volume))
         case "balanceslider":
             return .slider(buildSlider(node, kind: .balance))
-        case "text":
+        case "text", "statustext", "currentpositiontext":
             return .text(buildText(node))
+        case "returnbutton":
+            return .button(buildButton(node, kind: .generic))
         case "effects", "wmpeffects":
             return .effects(buildEffects(node))
         case "video", "wmpvideo":
             return .video(buildVideo(node))
-        case "playlist":
+        case "playlist", "itemsplaylist":
             return .playlist(buildPlaylist(node))
         case "player":
             return .player(buildPlayer(node))
