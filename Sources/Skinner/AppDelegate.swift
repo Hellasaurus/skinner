@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var bundle: SkinBundle?
     private var secondaryWindows: [String: SkinWindow] = [:]
     private var player: AVFoundationPlayer?
+    private(set) var currentSkinURL: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
@@ -37,22 +38,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Skin loading
 
     private func open(_ url: URL) {
+        let isSwap = window != nil
         do {
             let b = try SkinLoader.load(from: url)
             let t = try WMSParser.parse(contentsOf: b.wmsFile)
 
             guard let view = t.mainView else {
-                showError("Skin has no views.")
+                presentLoadError("Skin has no views.", isSwap: isSwap)
                 return
             }
 
-            let c  = AssetCache.build(from: b, theme: t)
+            let c = AssetCache.build(from: b, theme: t)
+
+            // Commit state only after a successful load so a failed swap leaves the old skin intact.
+            if isSwap {
+                secondaryWindows.values.forEach { $0.close() }
+                secondaryWindows.removeAll()
+                window?.close()
+                window = nil
+            }
+
             theme  = t
             cache  = c
             bundle = b
+            currentSkinURL = url
 
-            let p = AVFoundationPlayer()
-            player = p
+            if player == nil { player = AVFoundationPlayer() }
+            let p = player!
 
             let canvas = makeCanvas(skinView: view, cache: c, bundle: b)
             let mainId = view.id
@@ -67,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
         } catch {
             print("[Skinner] Load error: \(error)")
-            showError(error.localizedDescription)
+            presentLoadError(error.localizedDescription, isSwap: isSwap)
         }
     }
 
@@ -120,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openMedia(url)
     }
 
-    // MARK: - Skin picker (startup)
+    // MARK: - Skin picker
 
     private func pickSkin() {
         let panel = NSOpenPanel()
@@ -135,6 +147,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         open(url)
+    }
+
+    @objc private func pickSkinFromMenu() {
+        let panel = NSOpenPanel()
+        panel.title                = "Open WMP Skin"
+        panel.allowedContentTypes  = []
+        panel.allowsOtherFileTypes = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles       = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        open(url)
+    }
+
+    @objc private func nextSkin() { stepSkin(by: +1) }
+    @objc private func prevSkin() { stepSkin(by: -1) }
+
+    private func stepSkin(by delta: Int) {
+        guard let current = currentSkinURL else { return }
+        let siblings = skinSiblings(of: current)
+        guard !siblings.isEmpty else { return }
+        let currentPath = current.standardized.path
+        let idx = siblings.firstIndex { $0.standardized.path == currentPath } ?? 0
+        let next = siblings[(idx + delta + siblings.count) % siblings.count]
+        open(next)
+    }
+
+    private func skinSiblings(of url: URL) -> [URL] {
+        let parent = url.deletingLastPathComponent()
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: parent,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ) else { return [] }
+
+        return entries.filter { entry in
+            let ext = entry.pathExtension.lowercased()
+            if ext == "wmz" { return true }
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            return isDir
+        }
+        .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
     }
 
     // MARK: - Menu
@@ -152,9 +206,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fileItem = NSMenuItem(title: "File", action: nil, keyEquivalent: "")
         let fileMenu = NSMenu(title: "File")
+
         fileMenu.addItem(NSMenuItem(title: "Open Media…",
                                     action: #selector(pickMediaFromMenu),
                                     keyEquivalent: "o"))
+
+        let openSkinItem = NSMenuItem(title: "Open Skin…",
+                                      action: #selector(pickSkinFromMenu),
+                                      keyEquivalent: "O")
+        openSkinItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(openSkinItem)
+
+        fileMenu.addItem(.separator())
+
+        let nextItem = NSMenuItem(title: "Next Skin",
+                                  action: #selector(nextSkin),
+                                  keyEquivalent: "]")
+        fileMenu.addItem(nextItem)
+
+        let prevItem = NSMenuItem(title: "Previous Skin",
+                                  action: #selector(prevSkin),
+                                  keyEquivalent: "[")
+        fileMenu.addItem(prevItem)
+
         fileItem.submenu = fileMenu
         menu.addItem(fileItem)
 
@@ -163,12 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Error presentation
 
-    private func showError(_ message: String) {
+    private func presentLoadError(_ message: String, isSwap: Bool) {
         let alert = NSAlert()
-        alert.messageText     = "Failed to load skin"
+        alert.messageText      = "Failed to load skin"
         alert.informativeText  = message
         alert.alertStyle       = .critical
         alert.runModal()
-        NSApp.terminate(nil)
+        if !isSwap { NSApp.terminate(nil) }
     }
 }
