@@ -27,8 +27,13 @@ let package = Package(
             path: "Sources/SkinnerPlayer"
         ),
         .target(
+            name: "CrashGuard",
+            path: "Sources/CrashGuard",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "SkinnerViz",
-            dependencies: ["SkinnerCore", "projectM"],
+            dependencies: ["SkinnerCore", "projectM", "CrashGuard"],
             path: "Sources/SkinnerViz",
             linkerSettings: [.linkedLibrary("c++")]
         ),

@@ -49,6 +49,9 @@ public final class SkinCanvasView: NSView {
     /// Startup-animation IDs currently showing their WMS static fallback background
     /// (e.g. introShutterAnim showing shutter_close_static.gif after a close animation).
     private var startupFallbacksShowing:      Set<String>                       = []
+    /// Ref-counted groups of cover NSImageViews that sit above intro GIF NSImageViews.
+    /// Each entry is removed when its GIF's one-pass animation completes.
+    private var gifCoverGroups: [String: GifCoverGroup] = [:]
 
     public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
     public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
@@ -2140,6 +2143,31 @@ public final class SkinCanvasView: NSView {
 
     // MARK: - Animated GIF subviews
 
+    /// Tracks NSImageViews that temporarily cover one-pass intro GIF NSImageViews.
+    /// All views hide once every associated GIF finishes playing.
+    private final class GifCoverGroup {
+        var remaining: Int
+        var views: [NSImageView] = []
+        init(remaining: Int) { self.remaining = remaining }
+        @MainActor func oneCompleted() {
+            remaining -= 1
+            if remaining <= 0 { views.forEach { $0.isHidden = true } }
+        }
+    }
+
+    /// Associates a cover NSImageView with a set of GIF element IDs.
+    /// Reuses an existing group if any ID already has one; otherwise creates a new one.
+    private func addGifCover(_ iv: NSImageView, forGifIds ids: [String]) {
+        let group: GifCoverGroup
+        if let existing = ids.lazy.compactMap({ self.gifCoverGroups[$0] }).first {
+            group = existing
+        } else {
+            group = GifCoverGroup(remaining: ids.count)
+            for id in ids { gifCoverGroups[id] = group }
+        }
+        group.views.append(iv)
+    }
+
     /// Walks the element tree and creates an `NSImageView` (animates=true) for every
     /// subview whose effective background image is a GIF file.  Views are added in
     /// ascending z-order so higher-z elements appear on top.
@@ -2151,11 +2179,15 @@ public final class SkinCanvasView: NSView {
     /// (e.g. XBOX screenCover/intro_anim), those children are added first, then the
     /// parent's background is added as an NSImageView so it sits above them.  This is
     /// necessary because CGContext drawing (draw()) is always behind every NSImageView.
+    /// Returns IDs of one-pass GIF NSImageViews created (visible, with an element ID).
+    /// Higher-z siblings and passthrough parents use these IDs to register cover views.
+    @discardableResult
     private func buildAnimatedSubviews(in elements: [SkinElement],
                                         offset: CGPoint,
-                                        lc: LayoutContext) {
-        guard let bundle else { return }
+                                        lc: LayoutContext) -> [String] {
+        guard let bundle else { return [] }
         var gifNSViewAddedToList = false
+        var createdGifIds: [String] = []
         for element in sortedByZIndex(elements) {
             guard case .subview(let sv) = element else { continue }
             let hidden = elementIsHidden(sv.base)
@@ -2271,7 +2303,14 @@ public final class SkinCanvasView: NSView {
                                 iv?.isHidden = true
                                 if let self, let id = animId { self.completedOnePassAnimations.insert(id) }
                             }
+                            // Dismiss any covers waiting on this GIF.
+                            if let self, let id = animId {
+                                self.gifCoverGroups[id]?.oneCompleted()
+                                self.gifCoverGroups.removeValue(forKey: id)
+                            }
                         }
+                        // Track visible one-pass GIFs; higher-z siblings will cover them.
+                        if !hidden, let id = sv.base.id { createdGifIds.append(id) }
                     }
                     promotedGifNames.insert(name.lowercased())
                     if let id = sv.base.id {
@@ -2302,11 +2341,50 @@ public final class SkinCanvasView: NSView {
                     iv.isHidden     = hidden
                     addSubview(iv)
                     promotedGifNames.insert(name.lowercased())
+                } else if !hidden, !createdGifIds.isEmpty,
+                          let name = bgName,
+                          !name.lowercased().hasSuffix(".gif"),
+                          !cache.clipImageNames.contains(name.lowercased()),
+                          !promotedGifNames.contains(name.lowercased()),
+                          let img = cache.images[name.lowercased()] {
+                    // This element's z-index is above a one-pass intro GIF. NSImageViews
+                    // always render above CGContext, so the GIF would bleed through.
+                    // Add a temporary cover NSImageView that hides when the GIF finishes.
+                    let w  = lc.resolve(sv.base.width)  ?? img.size.width
+                    let h  = lc.resolve(sv.base.height) ?? img.size.height
+                    let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                    iv.image        = img
+                    iv.animates     = false
+                    iv.imageScaling = .scaleAxesIndependently
+                    addSubview(iv)
+                    addGifCover(iv, forGifIds: createdGifIds)
                 }
-                // Only recurse into children of visible subviews.
-                if !hidden { buildAnimatedSubviews(in: sv.children, offset: co, lc: lc) }
+                // Recurse into visible children; propagate one-pass GIF IDs upward.
+                if !hidden {
+                    let childGifIds = buildAnimatedSubviews(in: sv.children, offset: co, lc: lc)
+                    if !childGifIds.isEmpty {
+                        // passthrough parent: its background must sit above child GIF NSImageViews.
+                        if sv.base.passThrough,
+                           let name = bgName,
+                           !name.lowercased().hasSuffix(".gif"),
+                           !cache.clipImageNames.contains(name.lowercased()),
+                           !promotedGifNames.contains(name.lowercased()),
+                           let img = cache.images[name.lowercased()] {
+                            let w  = lc.resolve(sv.base.width)  ?? img.size.width
+                            let h  = lc.resolve(sv.base.height) ?? img.size.height
+                            let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+                            iv.image        = img
+                            iv.animates     = false
+                            iv.imageScaling = .scaleAxesIndependently
+                            addSubview(iv)
+                            addGifCover(iv, forGifIds: childGifIds)
+                        }
+                        createdGifIds += childGifIds
+                    }
+                }
             }
         }
+        return createdGifIds
     }
 
     // MARK: - Visibility

@@ -1,5 +1,14 @@
 import Foundation
 import projectM
+import CrashGuard
+
+// Top-level @convention(c) trampoline: passes the projectm_handle stored in ctx
+// to projectm_opengl_render_frame.  Cannot be a closure — C function pointers
+// cannot capture Swift context.
+private func _renderFrameC(_ ctx: UnsafeMutableRawPointer?) {
+    guard let ctx = ctx else { return }
+    projectm_opengl_render_frame(OpaquePointer(ctx))
+}
 
 /// Swift wrapper around the projectM C API.
 /// All methods must be called with the owning OpenGL context active (caller's responsibility).
@@ -10,6 +19,7 @@ final class ProjectMBridge {
     private let lock = NSLock()
 
     init(presetPath: URL?) {
+        crashGuard_install()
         handle = projectm_create()
         guard let h = handle else { return }
 
@@ -54,9 +64,16 @@ final class ProjectMBridge {
     /// Must be called with the OpenGL context active on the calling thread.
     func renderFrame() {
         guard let h = handle else { return }
+        // Acquire lock manually (no defer) so unlock is guaranteed even when
+        // crashGuard_execute catches a SIGSEGV/SIGBUS inside projectM and
+        // returns false instead of unwinding past a defer.
         lock.lock()
-        defer { lock.unlock() }
-        projectm_opengl_render_frame(h)
+        let success = crashGuard_execute(_renderFrameC, UnsafeMutableRawPointer(h))
+        lock.unlock()
+        if !success {
+            print("[ProjectM] render crash caught for preset '\(currentPresetName)' — skipping")
+            nextPreset()
+        }
     }
 
     func nextPreset() {
