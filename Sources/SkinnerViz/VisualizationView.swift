@@ -37,6 +37,7 @@ public final class VisualizationView: NSOpenGLView, VisualizationProviding {
     private var tapToken:                      PCMTapToken?
     private weak var backend: (any PlayerBackend)?
     private var configured   = false
+    private var isMigrating  = false
 
     // MARK: - VisualizationProviding
 
@@ -83,15 +84,33 @@ public final class VisualizationView: NSOpenGLView, VisualizationProviding {
     public func nextPreset()     { state.bridge?.nextPreset() }
     public func previousPreset() { state.bridge?.previousPreset() }
 
+    /// Stop the display link and mark this view as mid-migration so `viewWillMove(toWindow: nil)`
+    /// doesn't perform full teardown when the view is pulled out of the old canvas hierarchy.
+    /// Call this before closing the old skin window. The display link restarts automatically
+    /// in `viewDidMoveToWindow` when the view lands in the new canvas.
+    public func beginMigration() {
+        guard configured else { return }
+        isMigrating = true
+        if let dl = displayLink { CVDisplayLinkStop(dl) }
+        displayLink = nil
+    }
+
     // MARK: - Lifecycle
 
     public override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        guard newWindow == nil else { return }
+        guard newWindow == nil, !isMigrating else { return }
         if let token = tapToken, let b = backend { b.removePCMTap(token) }
         tapToken = nil
         if let dl = displayLink { CVDisplayLinkStop(dl) }
         displayLink = nil
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, isMigrating, configured else { return }
+        isMigrating = false
+        startDisplayLink()
     }
 
     public override func reshape() {

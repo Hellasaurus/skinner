@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var secondaryWindows: [String: SkinWindow] = [:]
     private var player: AVFoundationPlayer?
     private(set) var currentSkinURL: URL?
+    private var sharedViz: VisualizationView?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
@@ -52,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Commit state only after a successful load so a failed swap leaves the old skin intact.
             if isSwap {
+                sharedViz?.beginMigration()
                 secondaryWindows.values.forEach { $0.close() }
                 secondaryWindows.removeAll()
                 window?.close()
@@ -66,7 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if player == nil { player = AVFoundationPlayer() }
             let p = player!
 
+            if sharedViz == nil { sharedViz = VisualizationView() }
+
             let canvas = makeCanvas(skinView: view, cache: c, bundle: b)
+            canvas.prebuiltVisualizationProvider = sharedViz
             let mainId = view.id
             canvas.onCloseView = { [weak self] id in
                 if id == mainId { self?.window?.close() }
@@ -91,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let skinView = theme?.views.first(where: { $0.id == viewId }),
               let cache, let bundle else { return }
         let canvas = makeCanvas(skinView: skinView, cache: cache, bundle: bundle)
+        canvas.makeVisualizationProvider = { VisualizationView() }
         canvas.onCloseView = { [weak self] id in self?.closeSecondaryView(id) }
         if let player { canvas.setPlayerBackend(player) }
         let win = SkinWindow(canvas: canvas, relativeTo: window)
@@ -113,7 +119,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let canvas = SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
         canvas.onOpenView   = { [weak self] id in self?.openSecondaryView(id) }
         canvas.onDroppedURL = { [weak self] url in self?.openMedia(url) }
-        canvas.makeVisualizationProvider = { VisualizationView() }
         return canvas
     }
 

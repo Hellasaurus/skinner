@@ -62,6 +62,8 @@ public final class SkinCanvasView: NSView {
 
     /// Set by AppDelegate to provide a visualization view for `<EFFECTS>` elements.
     public var makeVisualizationProvider: (() -> any VisualizationProviding)?
+    /// Pre-built provider to reuse across skin swaps. Takes precedence over `makeVisualizationProvider`.
+    public var prebuiltVisualizationProvider: (any VisualizationProviding)?
     private var vizProvider:   (any VisualizationProviding)?
     private var vizContainer:  NSView?
     private var vizConfigured  = false
@@ -1717,9 +1719,11 @@ public final class SkinCanvasView: NSView {
         covers: [(subview: Subview, bgImage: NSImage, frame: CGRect, drawRect: CGRect)],
         ancestorAlpha: Int = 255
     ) {
-        if vizProvider == nil, let factory = makeVisualizationProvider {
-            let provider = factory()
+        if vizProvider == nil, let provider = prebuiltVisualizationProvider ?? makeVisualizationProvider?() {
             vizProvider  = provider
+
+            // Detach from the previous canvas hierarchy (skin swap); no-op on first launch.
+            provider.view.removeFromSuperview()
 
             // Wrap the viz in a container for frame/visibility management.
             // NSOpenGLView must NOT be inside a wantsLayer=true container — doing so
