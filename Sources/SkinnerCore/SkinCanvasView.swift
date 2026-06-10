@@ -26,9 +26,13 @@ public final class SkinCanvasView: NSView {
     private var bgWidth          = 0
     private var bgHeight         = 0
     private var bgMask:          CGImage?         = nil
+    private var lastBgOpacitySignature: [BgOpacitySigEntry]?
+    private var lastBgSignatureSize: (w: Int, h: Int) = (0, 0)
+    private var opacityMaskCache: [OpacityMaskKey: [Bool]] = [:]
     private let bundle:          SkinBundle?
     private var dragOrigin:      NSPoint?
     private var resizeDragState: (startPt: NSPoint, startFrame: NSRect)?
+    private var isResizingFromJS = false
     private var activeSliderIdx: Int?
     private var didFinishInit    = false
     private var pressedTextIdx:  Int?
@@ -265,6 +269,12 @@ public final class SkinCanvasView: NSView {
             guard let self, let win = self.window else { return }
             self.resizeDragState = (startPt: NSEvent.mouseLocation, startFrame: win.frame)
         }
+        engine?.onViewResize = { [weak self] w, h in
+            guard let self, let win = self.window, w > 0, h > 0 else { return }
+            self.isResizingFromJS = true
+            win.setContentSize(NSSize(width: w, height: h))
+            self.isResizingFromJS = false
+        }
 
         wantsLayer = true
         let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
@@ -286,7 +296,11 @@ public final class SkinCanvasView: NSView {
 
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        guard didFinishInit, skinView.resizable, newSize.width > 0, newSize.height > 0 else { return }
+        guard didFinishInit, newSize.width > 0, newSize.height > 0 else { return }
+        // When JS triggers the resize (view.width = X), skip re-entrant JS evaluation here;
+        // applyScriptChanges() runs after evaluate() returns and handles the full update.
+        if isResizingFromJS { return }
+        guard skinView.resizable else { return }
         engine?.updateViewSize(width: newSize.width, height: newSize.height)
         recollect()
         buildBgOpacity()
@@ -310,7 +324,7 @@ public final class SkinCanvasView: NSView {
     /// This is necessary because skins call `element.left = newPos` to reposition subviews
     /// at runtime, but the WMS attribute still holds the original expression.
     private func liveCoord(_ id: String?, attr: AttributeValue?, propName: String, lc: LayoutContext) -> CGFloat {
-        if let id, let v = engine?.evaluateNumber("\(id).\(propName)") { return v }
+        if let id, let v = engine?.liveNumber(id: id, property: propName) { return v }
         return resolveCoord(attr, lc: lc) ?? 0
     }
 
@@ -441,8 +455,8 @@ public final class SkinCanvasView: NSView {
                 // jscript expressions (e.g. eq2.left = jscript:eq1.left+15) resolve correctly
                 // when subsequent sliders in the same parent are processed.
                 if let id = s.base.id {
-                    if case .jsExpr = s.base.left { engine?.evaluate("\(id).left = \(rawX)") }
-                    if case .jsExpr = s.base.top  { engine?.evaluate("\(id).top  = \(rawY)") }
+                    if case .jsExpr = s.base.left { engine?.setLiveNumber(id: id, property: "left", value: rawX) }
+                    if case .jsExpr = s.base.top  { engine?.setLiveNumber(id: id, property: "top",  value: rawY) }
                 }
                 let x = rawX + offset.x
                 let y = rawY + offset.y
@@ -523,6 +537,19 @@ public final class SkinCanvasView: NSView {
     private func buildBgOpacity() {
         let vw = Int(bounds.width), vh = Int(bounds.height)
         guard vw > 0, vh > 0 else { return }
+        let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
+
+        // Most applyScriptChanges() calls (e.g. periodic onTimer ticks driving the
+        // visualizer) don't move, hide, or re-image any subview. Skip the full
+        // per-pixel rebuild + CGImage mask creation when nothing that affects the
+        // map has changed since the last build.
+        let signature = bgOpacitySignature(in: skinView.elements, lc: lc, offset: .zero)
+        if (vw, vh) == lastBgSignatureSize, signature == lastBgOpacitySignature {
+            return
+        }
+        lastBgSignatureSize = (vw, vh)
+        lastBgOpacitySignature = signature
+
         bgWidth  = vw
         bgHeight = vh
         bgOpacity = Array(repeating: false, count: vw * vh)
@@ -533,11 +560,35 @@ public final class SkinCanvasView: NSView {
            let md = cache.mapData[imgName.lowercased()] {
             let extra: [(UInt8, UInt8, UInt8)] = [skinView.clippingColor, skinView.transparencyColor]
                 .compactMap { $0.flatMap(parseAnyColor) }
-            paintMdIntoOpacity(md: md, ox: 0, oy: 0, extraColors: extra)
+            paintMdIntoOpacity(md: md, ox: 0, oy: 0, imageKey: imgName.lowercased(), extraColors: extra)
         }
-        let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         paintBgOpacity(in: skinView.elements, lc: lc, offset: .zero)
         bgMask = makeBgMask()
+    }
+
+    /// Captures everything that affects `bgOpacity`'s contents for a subview tree:
+    /// each visible subview's resolved position and its current background image.
+    /// Two signatures comparing equal means `buildBgOpacity` would produce an
+    /// identical map, so the rebuild can be skipped.
+    private struct BgOpacitySigEntry: Equatable {
+        let x: Int
+        let y: Int
+        let bgImage: String?
+    }
+
+    private func bgOpacitySignature(in elements: [SkinElement],
+                                     lc: LayoutContext,
+                                     offset: CGPoint) -> [BgOpacitySigEntry] {
+        var result: [BgOpacitySigEntry] = []
+        for element in elements {
+            guard case .subview(let sv) = element, !elementIsHidden(sv.base) else { continue }
+            let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+            let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+            let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage } ?? sv.backgroundImage
+            result.append(BgOpacitySigEntry(x: Int(sx), y: Int(sy), bgImage: bgName))
+            result += bgOpacitySignature(in: sv.children, lc: lc, offset: CGPoint(x: sx, y: sy))
+        }
+        return result
     }
 
     /// Converts the boolean `bgOpacity` map into a CGImage mask suitable for
@@ -563,6 +614,37 @@ public final class SkinCanvasView: NSView {
                        intent: .defaultIntent)
     }
 
+    /// Identifies a precomputed per-image opacity mask: an image's pixels combined
+    /// with the clipping/transparency colors that exclude additional pixels from
+    /// being hittable. Both are static for a given subview, so the mask can be
+    /// computed once and reused across every `buildBgOpacity` rebuild.
+    private struct OpacityMaskKey: Hashable {
+        let imageName: String
+        let extraColors: [UInt32]
+    }
+
+    /// Returns (computing and caching if needed) a `[Bool]` the same dimensions as
+    /// `md`, in the same row order as `md.bytes`, where `true` means the pixel is
+    /// opaque, non-magenta, and doesn't match any of `extraColors`. Hoists the
+    /// per-pixel `isMagenta`/`colorMatches` checks out of `paintMdIntoOpacity` since
+    /// they depend only on the image and its (static) clipping/transparency colors.
+    private func opacityMask(for md: MapData, imageKey: String,
+                              extraColors: [(UInt8, UInt8, UInt8)]) -> [Bool] {
+        let key = OpacityMaskKey(imageName: imageKey,
+                                  extraColors: extraColors.map { UInt32($0.0) << 16 | UInt32($0.1) << 8 | UInt32($0.2) })
+        if let cached = opacityMaskCache[key] { return cached }
+        var mask = [Bool](repeating: false, count: md.width * md.height)
+        for px in 0 ..< (md.width * md.height) {
+            let i = px * 4
+            let r = md.bytes[i], g = md.bytes[i+1], b = md.bytes[i+2], a = md.bytes[i+3]
+            guard a > 128, !isMagenta(r, g, b) else { continue }
+            if extraColors.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { continue }
+            mask[px] = true
+        }
+        opacityMaskCache[key] = mask
+        return mask
+    }
+
     /// Paints one image's non-transparent pixels into the composite opacity map.
     ///
     /// `dstW`/`dstH` let the caller specify the destination size when the image will
@@ -573,9 +655,11 @@ public final class SkinCanvasView: NSView {
     /// bgOpacity uses flipped view order (row 0 = visual top). The two are mirrored here.
     private func paintMdIntoOpacity(md: MapData, ox: Int, oy: Int,
                                      dstW: Int = 0, dstH: Int = 0,
+                                     imageKey: String,
                                      extraColors: [(UInt8, UInt8, UInt8)]) {
         let destW = dstW > 0 ? dstW : md.width
         let destH = dstH > 0 ? dstH : md.height
+        let mask = opacityMask(for: md, imageKey: imageKey, extraColors: extraColors)
 
         for viewRow in 0 ..< destH {
             let vy = oy + viewRow
@@ -589,10 +673,7 @@ public final class SkinCanvasView: NSView {
                 guard vx >= 0, vx < bgWidth else { continue }
                 let srcCol = min(md.width - 1, viewCol * md.width / destW)
 
-                let i = (cgRow * md.width + srcCol) * 4
-                let r = md.bytes[i], g = md.bytes[i+1], b = md.bytes[i+2], a = md.bytes[i+3]
-                guard a > 128, !isMagenta(r, g, b) else { continue }
-                if extraColors.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { continue }
+                guard mask[cgRow * md.width + srcCol] else { continue }
                 bgOpacity[vy * bgWidth + vx] = true
             }
         }
@@ -614,7 +695,7 @@ public final class SkinCanvasView: NSView {
                let md = cache.mapData[imgName.lowercased()] {
                 let extra: [(UInt8, UInt8, UInt8)] = [sv.clippingColor, sv.base.transparencyColor]
                     .compactMap { $0.flatMap(parseAnyColor) }
-                paintMdIntoOpacity(md: md, ox: Int(sx), oy: Int(sy), extraColors: extra)
+                paintMdIntoOpacity(md: md, ox: Int(sx), oy: Int(sy), imageKey: imgName.lowercased(), extraColors: extra)
             } else if let colorStr = sv.backgroundColor,
                       !colorStr.isEmpty, colorStr.lowercased() != "none",
                       let w = lc.resolve(sv.base.width).map(Int.init),
@@ -1687,8 +1768,8 @@ public final class SkinCanvasView: NSView {
                 }
                 // Seed resolved dimensions so nested jscript: references (e.g. jscript:visFrame.width) resolve.
                 if let id = sv.base.id {
-                    if svBgW > 0 { engine?.evaluate("\(id).width = \(svBgW)") }
-                    if svBgH > 0 { engine?.evaluate("\(id).height = \(svBgH)") }
+                    if svBgW > 0 { engine?.setLiveNumber(id: id, property: "width",  value: svBgW) }
+                    if svBgH > 0 { engine?.setLiveNumber(id: id, property: "height", value: svBgH) }
                 }
                 let svBgFrame = CGRect(x: sx, y: sy, width: svBgW, height: svBgH)
                 if var found = findEffects(in: sv.children, offset: CGPoint(x: sx, y: sy), lc: lc,
@@ -2109,16 +2190,25 @@ public final class SkinCanvasView: NSView {
         recollect()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
-        // Rebuild the click-through mask so elements moved by JS (e.g. sEqEar sliding open)
-        // register as clickable at their new positions.
-        buildBgOpacity()
         if let bundle {
             let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
             promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
         }
         setNeedsDisplay(bounds)
         rescheduleTimer()
+        // Stamp _t0 for any newly-queued moveTo animations AFTER the setup work above
+        // so the animation clock starts from when the timer can first fire, not from
+        // when moveTo() was called.
+        engine?.stampNewAnimationStartTimes()
         startMoveTimerIfNeeded()
+        // Defer the click-through mask rebuild so it doesn't block the animation timer
+        // from starting (e.g. a drawer toggle that also flips view.width/visible right
+        // before moveto). Elements moved by JS register as clickable one runloop tick late.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.buildBgOpacity()
+            self.setNeedsDisplay(self.bounds)
+        }
     }
 
     private func startMoveTimerIfNeeded() {
@@ -2144,10 +2234,16 @@ public final class SkinCanvasView: NSView {
         setNeedsDisplay(bounds)
         if !engine.hasActiveMoves {
             stopMoveTimer()
-            buildBgOpacity()
             updateLiveSliders()
             updateAnimatedSubviewVisibility()
             rescheduleTimer()
+            // Defer the expensive bgOpacity rebuild so the run loop can render the
+            // final frame before the mask recompute blocks the main thread.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.buildBgOpacity()
+                self.setNeedsDisplay(self.bounds)
+            }
         }
     }
 

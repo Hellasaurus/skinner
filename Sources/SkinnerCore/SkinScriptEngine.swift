@@ -42,6 +42,7 @@ final class SkinScriptEngine {
     var onCloseView:   ((String) -> Void)?
     var onStateChanged: (() -> Void)?
     var onStartResize: ((String) -> Void)?
+    var onViewResize:  ((CGFloat, CGFloat) -> Void)?
 
     // Stored once at init time; JS callbacks fire these scripts when backend state changes.
     private let playerCallbacks: Player?
@@ -168,6 +169,21 @@ final class SkinScriptEngine {
         proxies.values.contains { $0.forProperty("_animating")?.toBool() == true }
     }
 
+    /// Stamps `_t0` with the current time for any proxy whose animation has not yet
+    /// received a start time (_t0 == -1).  Called from applyScriptChanges() so the
+    /// animation clock begins AFTER the expensive setup work (buildBgOpacity, jscript:
+    /// evaluations) rather than when moveTo() was called in JS — which could be
+    /// 50–150 ms earlier on complex skins, consuming the full 120 ms budget before
+    /// the first timer tick fires.  Already-running animations (t0 > 0) are untouched.
+    func stampNewAnimationStartTimes() {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        for proxy in proxies.values {
+            guard proxy.forProperty("_animating")?.toBool() == true else { continue }
+            guard let t0 = proxy.forProperty("_t0")?.toDouble(), t0 < 0 else { continue }
+            proxy.setValue(nowMs, forProperty: "_t0")
+        }
+    }
+
     /// Advances all in-flight timed moveTo animations one step.
     /// Completed moves are marked _moved=true so the caller can then call
     /// fireOnEndMoveCallbacks() to chain into the next hop.
@@ -176,13 +192,17 @@ final class SkinScriptEngine {
         let nowMs = Date().timeIntervalSince1970 * 1000
         for proxy in proxies.values {
             guard proxy.forProperty("_animating")?.toBool() == true else { continue }
-            guard let t0 = proxy.forProperty("_t0")?.toDouble(),
+            guard let t0 = proxy.forProperty("_t0")?.toDouble(), t0 >= 0,
                   let durMs = proxy.forProperty("_ms")?.toDouble(), durMs > 0,
                   let sx = proxy.forProperty("_sx")?.toDouble(),
                   let sy = proxy.forProperty("_sy")?.toDouble(),
                   let tx = proxy.forProperty("_tx")?.toDouble(),
                   let ty = proxy.forProperty("_ty")?.toDouble() else {
-                proxy.setValue(false, forProperty: "_animating")
+                // _t0 < 0 means stampNewAnimationStartTimes hasn't run yet; skip this tick.
+                // Any other guard failure signals a corrupt proxy — cancel the animation.
+                if proxy.forProperty("_t0")?.toDouble() ?? 0 >= 0 {
+                    proxy.setValue(false, forProperty: "_animating")
+                }
                 continue
             }
             let t = min((nowMs - t0) / durMs, 1.0)
@@ -220,6 +240,26 @@ final class SkinScriptEngine {
         return result?.toBool() ?? false
     }
 
+    /// Direct read of `id.<property>` (e.g. an element's live `left`/`top`) without
+    /// compiling/evaluating a wrapper script. `left`/`top` are plain stored properties
+    /// on the proxy (seeded in registerProxy, updated by moveTo/tickMoves), so a
+    /// property lookup is equivalent to `evaluateNumber("\(id).\(property)")` but
+    /// orders of magnitude cheaper — this is called for every element on every
+    /// recollect(), including every 60fps animation tick.
+    func liveNumber(id: String, property: String) -> CGFloat? {
+        guard let v = proxies[id]?.forProperty(property), v.isNumber else { return nil }
+        let d = v.toDouble()
+        return d.isNaN ? nil : CGFloat(d)
+    }
+
+    /// Direct write of `id.<property> = value` without compiling/evaluating a wrapper
+    /// script — the write counterpart to `liveNumber`. Used to propagate computed
+    /// positions/sizes back to proxies (e.g. for sibling jscript: references) during
+    /// recollect() without paying per-call JS compilation cost.
+    func setLiveNumber(id: String, property: String, value: CGFloat) {
+        proxies[id]?.setValue(Double(value), forProperty: property)
+    }
+
     func evaluateNumber(_ expr: String) -> CGFloat? {
         guard !expr.isEmpty else { return nil }
         // WMS JScript attribute values often end with ";".  Wrapping as `(EXPR;)` causes
@@ -245,10 +285,10 @@ final class SkinScriptEngine {
     }
 
     /// Updates `view.width` and `view.height` in the JS context after a window resize.
-    /// Must be called before recollecting elements so jscript: expressions that reference
-    /// view dimensions (e.g. `jscript:view.width - 32`) resolve to the new size.
+    /// Writes the backing variables directly to avoid triggering the view.width setter
+    /// (which would fire the onViewResize callback and cause a resize loop).
     func updateViewSize(width: CGFloat, height: CGFloat) {
-        context.evaluateScript("view.width = \(Int(width)); view.height = \(Int(height));")
+        context.evaluateScript("_viewWidth = \(Int(width)); _viewHeight = \(Int(height));")
     }
 
     /// Resolves an `AttributeValue` to a displayable string against the live JS context.
@@ -344,7 +384,7 @@ final class SkinScriptEngine {
                 } else {
                     this._sx = this.left || 0; this._sy = this.top || 0;
                     this._tx = x; this._ty = y; this._ms = ms;
-                    this._t0 = Date.now();
+                    this._t0 = -1;
                     this._animating = true;
                 }
             },
@@ -415,6 +455,11 @@ final class SkinScriptEngine {
         }
         ctx.setObject(startResizeBridge, forKeyedSubscript: "_skinnerStartResize" as NSString)
 
+        let viewSizeBridge: @convention(block) (Double, Double) -> Void = { [weak self] w, h in
+            self?.onViewResize?(CGFloat(w), CGFloat(h))
+        }
+        ctx.setObject(viewSizeBridge, forKeyedSubscript: "_skinnerSetViewSize" as NSString)
+
         let playSoundBridge: @convention(block) (String) -> Void = { [weak self] filename in
             guard let self else { return }
             let lower = filename.lowercased()
@@ -439,8 +484,13 @@ final class SkinScriptEngine {
         let minH = Int(sizeCtx.resolve(skinView.minHeight) ?? CGFloat(h))
         ctx.evaluateScript("""
         var _viewTimerInterval = \(timerInterval);
+        var _viewWidth  = \(w);
+        var _viewHeight = \(h);
         var view = {
-            width: \(w), height: \(h),
+            get width()  { return _viewWidth;  },
+            set width(v) { if (v !== _viewWidth)  { _viewWidth  = v; _skinnerSetViewSize(v, _viewHeight); } },
+            get height() { return _viewHeight; },
+            set height(v){ if (v !== _viewHeight) { _viewHeight = v; _skinnerSetViewSize(_viewWidth, v);  } },
             minWidth: \(minW), minHeight: \(minH),
             get timerInterval()  { return _viewTimerInterval; },
             set timerInterval(v) { _viewTimerInterval = v; },
