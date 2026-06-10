@@ -219,6 +219,7 @@ public struct Effects: Sendable {
     public var windowed: Bool
     public var alphaBlend: Int?
     public var clippingColor: String?
+    public var clippingImage: String?
 }
 
 // MARK: - Video

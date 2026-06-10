@@ -56,6 +56,13 @@ public final class SkinCanvasView: NSView {
     /// Ref-counted groups of cover NSImageViews that sit above intro GIF NSImageViews.
     /// Each entry is removed when its GIF's one-pass animation completes.
     private var gifCoverGroups: [String: GifCoverGroup] = [:]
+    /// Frames of looping-GIF NSImageViews (e.g. eyes_anim.gif). Buttons whose frame
+    /// intersects one of these have their hover/press state images composited into
+    /// per-button cover NSImageViews (`buttonOverlayCoverViews`) added above the GIF,
+    /// since CGContext drawing always sits below NSImageViews regardless of zIndex.
+    private var gifOverlayFrames:         [(frame: CGRect, zIndex: Int)] = []
+    private var buttonOverlayCoverViews:  [String: NSImageView] = [:]
+    private var buttonOverlayCoverSigs:   [String: String]      = [:]
 
     public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
     public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
@@ -75,6 +82,7 @@ public final class SkinCanvasView: NSView {
     private var vizContainer:  NSView?
     private var vizConfigured  = false
     private var vizCoverInfos: [VizCoverInfo] = []
+    private var lastVizCoverSignatures: [[VizCoverSigEntry]]?
 
     public func setPlayerBackend(_ backend: any PlayerBackend) {
         playerBackend = backend
@@ -751,6 +759,79 @@ public final class SkinCanvasView: NSView {
         drawElements(skinView.elements, offset: .zero, lc: lc, ctx: ctx,
                      buttonIdx: &bi, sliderIdx: &si)
         renderVizCoverImages(lc: lc)
+        renderButtonOverlayCovers(lc: lc)
+    }
+
+    /// Redraws cover NSImageViews for buttons whose frame falls inside a looping-GIF
+    /// NSImageView (see `gifOverlayFrames`), so their hover/press images remain
+    /// visible above the GIF.
+    private func renderButtonOverlayCovers(lc: LayoutContext) {
+        guard !gifOverlayFrames.isEmpty else { return }
+        for button in buttons {
+            let buttonZ = button.model.base.zIndex ?? button.ancestorBases.last?.zIndex ?? 0
+            guard gifOverlayFrames.contains(where: { $0.frame.intersects(button.frame) && buttonZ > $0.zIndex }) else { continue }
+            // Buttons here often have no `id` (e.g. Halloween's m_vis_prev/next), so key
+            // covers by image name + frame, which is stable across recollects.
+            let key = "\(button.model.image ?? "")|\(Int(button.frame.minX))|\(Int(button.frame.minY))"
+            let hidden = elementIsHidden(button.model.base, live: true) || !ancestorsVisible(button.ancestorBases)
+            let iv = buttonOverlayCoverViews[key] ?? {
+                let new = NSImageView(frame: button.frame)
+                new.imageScaling = .scaleAxesIndependently
+                addSubview(new)
+                buttonOverlayCoverViews[key] = new
+                return new
+            }()
+            iv.isHidden = hidden
+            guard !hidden else { continue }
+            if iv.frame != button.frame { iv.frame = button.frame }
+
+            let js  = button.model.base.id.flatMap { engine?.state(for: $0) }
+            let sig = "\(button.isPressed)|\(button.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"
+            if buttonOverlayCoverSigs[key] == sig, iv.image != nil { continue }
+            buttonOverlayCoverSigs[key] = sig
+
+            let composite = NSImage(size: button.frame.size)
+            composite.lockFocusFlipped(true)
+            if let imgCtx = NSGraphicsContext.current?.cgContext {
+                imgCtx.translateBy(x: -button.frame.origin.x, y: -button.frame.origin.y)
+                drawButton(button, ctx: imgCtx)
+            }
+            composite.unlockFocus()
+            iv.image = composite
+        }
+
+        // Same treatment for buttongroups (e.g. Halloween's m_min minimize/close
+        // cluster) whose frame overlaps a looping-GIF NSImageView.
+        for group in groups {
+            let groupZ = group.model.base.zIndex ?? group.ancestorBases.last?.zIndex ?? 0
+            guard gifOverlayFrames.contains(where: { $0.frame.intersects(group.frame) && groupZ > $0.zIndex }) else { continue }
+            let key = "g:\(group.model.image ?? "")|\(Int(group.frame.minX))|\(Int(group.frame.minY))"
+            let hidden = elementIsHidden(group.model.base, live: true) || !ancestorsVisible(group.ancestorBases)
+            let iv = buttonOverlayCoverViews[key] ?? {
+                let new = NSImageView(frame: group.frame)
+                new.imageScaling = .scaleAxesIndependently
+                addSubview(new)
+                buttonOverlayCoverViews[key] = new
+                return new
+            }()
+            iv.isHidden = hidden
+            guard !hidden else { continue }
+            if iv.frame != group.frame { iv.frame = group.frame }
+
+            let enabledStates = group.model.elements.map { String(buttonElementIsEnabled($0)) }.joined(separator: ",")
+            let sig = "\(group.hoveredColor ?? "")|\(group.pressedColor ?? "")|\(enabledStates)"
+            if buttonOverlayCoverSigs[key] == sig, iv.image != nil { continue }
+            buttonOverlayCoverSigs[key] = sig
+
+            let composite = NSImage(size: group.frame.size)
+            composite.lockFocusFlipped(true)
+            if let imgCtx = NSGraphicsContext.current?.cgContext {
+                imgCtx.translateBy(x: -group.frame.origin.x, y: -group.frame.origin.y)
+                drawGroup(group, frame: group.frame, ctx: imgCtx)
+            }
+            composite.unlockFocus()
+            iv.image = composite
+        }
     }
 
     private func drawElements(_ elements: [SkinElement],
@@ -827,8 +908,15 @@ public final class SkinCanvasView: NSView {
                        !cache.clipImageNames.contains(name.lowercased()),
                        !promotedGifNames.contains(name.lowercased()),
                        let img  = cache.images[name.lowercased()] {
+                        // An explicit width/height larger than the image's native size is
+                        // treated as a layout/click-area bound, not a stretch target — e.g.
+                        // Secura declares display/eanim subviews at the full 420x420 view
+                        // size while Displaybg.gif/Displaybg2.gif are 105x105. Only honor an
+                        // explicit size that's <= native (legitimate downscale/crop) or when
+                        // tiling/stretch-alignment is explicitly requested.
                         let w: CGFloat
-                        if let explicitW = lc.resolve(sv.base.width) {
+                        if let explicitW = lc.resolve(sv.base.width),
+                           explicitW <= img.size.width || sv.backgroundTiled {
                             w = explicitW
                         } else if sv.base.horizontalAlignment == .stretch {
                             let rightBound = elements.compactMap { e -> CGFloat? in
@@ -840,7 +928,8 @@ public final class SkinCanvasView: NSView {
                             w = img.size.width
                         }
                         let h: CGFloat
-                        if let explicitH = lc.resolve(sv.base.height) {
+                        if let explicitH = lc.resolve(sv.base.height),
+                           explicitH <= img.size.height || sv.backgroundTiled {
                             h = explicitH
                         } else if sv.base.verticalAlignment == .stretch {
                             let botBound = elements.compactMap { e -> CGFloat? in
@@ -1619,11 +1708,11 @@ public final class SkinCanvasView: NSView {
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         let viewBgImg   = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
         let viewBgFrame = viewBgImg.map { CGRect(origin: .zero, size: $0.size) }
-        if let (fx, frame, covers, ancestorAlpha, maskImageName) = findEffects(
+        if let (fx, frame, covers, subviewCovers, ancestorAlpha, maskImageName) = findEffects(
             in: skinView.elements, offset: .zero, lc: lc2,
             parentBgImage: viewBgImg, parentBgFrame: viewBgFrame
         ) {
-            updateVisualizationView(for: fx, frame: frame, covers: covers,
+            updateVisualizationView(for: fx, frame: frame, covers: covers, subviewCovers: subviewCovers,
                                     ancestorAlpha: ancestorAlpha, maskImageName: maskImageName)
         }
     }
@@ -1656,13 +1745,55 @@ public final class SkinCanvasView: NSView {
 
     // MARK: - Visualization
 
+    /// Resolves a sibling subview's absolute frame for viz-cover collection. `fallbackSize`
+    /// supplies width/height when neither an explicit dimension nor stretch alignment applies
+    /// (e.g. the sibling's own backgroundImage size, or .zero for subviews with no image of
+    /// their own — those are only kept as covers when they have children, see callers).
+    private func siblingCoverFrame(for sib: Subview, in elements: [SkinElement],
+                                    offset: CGPoint, lc: LayoutContext,
+                                    fallbackSize: CGSize) -> CGRect {
+        let sibX = liveCoord(sib.base.id, attr: sib.base.left, propName: "left", lc: lc) + offset.x
+        let sibY = liveCoord(sib.base.id, attr: sib.base.top,  propName: "top",  lc: lc) + offset.y
+        // See drawElements: don't upscale a background image beyond its native size
+        // unless tiling/stretch-alignment is requested.
+        let sw: CGFloat
+        if let explicitW = lc.resolve(sib.base.width),
+           explicitW <= fallbackSize.width || fallbackSize.width == 0 || sib.backgroundTiled {
+            sw = explicitW
+        } else if sib.base.horizontalAlignment == .stretch {
+            let rightBound = elements.compactMap { e -> CGFloat? in
+                guard case .subview(let s) = e, s.base.id != sib.base.id,
+                      s.base.horizontalAlignment == .right else { return nil }
+                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+            }.min() ?? lc.viewWidth
+            sw = max(0, rightBound - sibX)
+        } else {
+            sw = fallbackSize.width
+        }
+        let sh: CGFloat
+        if let explicitH = lc.resolve(sib.base.height),
+           explicitH <= fallbackSize.height || fallbackSize.height == 0 || sib.backgroundTiled {
+            sh = explicitH
+        } else if sib.base.verticalAlignment == .stretch {
+            let botBound = elements.compactMap { e -> CGFloat? in
+                guard case .subview(let s) = e, s.base.id != sib.base.id,
+                      s.base.verticalAlignment == .bottom else { return nil }
+                return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
+            }.min() ?? lc.viewHeight
+            sh = max(0, botBound - sibY)
+        } else {
+            sh = fallbackSize.height
+        }
+        return CGRect(x: sibX, y: sibY, width: sw, height: sh)
+    }
+
     private func findEffects(in elements: [SkinElement],
                               offset: CGPoint,
                               lc: LayoutContext,
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], ancestorAlpha: Int, maskImageName: String?)? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, maskImageName: String?)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -1674,6 +1805,7 @@ public final class SkinCanvasView: NSView {
                 let h =  resolveCoord(fx.base.height, lc: lc) ?? bounds.height
                 let vizFrame = CGRect(x: x, y: y, width: w, height: h)
                 var topCovers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)] = []
+                var topSubviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = []
                 // When effects is a direct child of the view (parentSubview == nil), the
                 // regular cover-collection in case .subview never runs. Collect covers here:
                 // sibling subviews with higher zIndex + the view's own backgroundImage.
@@ -1685,53 +1817,39 @@ public final class SkinCanvasView: NSView {
                         topCovers.append((subview: nil, bgImage: img,
                                           frame: vizFrame.intersection(frm), drawRect: frm))
                     }
-                    // Sibling subviews with higher zIndex that have backgroundImages overlapping the viz.
+                    // Sibling subviews with higher zIndex that overlap the viz.
                     for sibling in sortedByZIndex(elements) {
                         guard case .subview(let sib) = sibling,
                               (sib.base.zIndex ?? 0) > fxZIndex,
                               !elementIsHidden(sib.base, live: true) else { continue }
                         let liveBgName = (sib.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                                           ?? sib.backgroundImage)?.lowercased()
-                        guard let bgName = liveBgName,
-                              !promotedGifNames.contains(bgName),
-                              cache.buttonGroupsByMappingImage[bgName] == nil,
-                              !cache.clipImageNames.contains(bgName),
-                              let img = cache.images[bgName] else { continue }
-                        let sibX = liveCoord(sib.base.id, attr: sib.base.left, propName: "left", lc: lc) + offset.x
-                        let sibY = liveCoord(sib.base.id, attr: sib.base.top,  propName: "top",  lc: lc) + offset.y
-                        let sw: CGFloat
-                        if let explicitW = lc.resolve(sib.base.width) {
-                            sw = explicitW
-                        } else if sib.base.horizontalAlignment == .stretch {
-                            let rightBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.id != sib.base.id,
-                                      s.base.horizontalAlignment == .right else { return nil }
-                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
-                            }.min() ?? lc.viewWidth
-                            sw = max(0, rightBound - sibX)
-                        } else {
-                            sw = img.size.width
+                        let validImg: NSImage? = {
+                            guard let bgName = liveBgName,
+                                  !promotedGifNames.contains(bgName),
+                                  cache.buttonGroupsByMappingImage[bgName] == nil,
+                                  !cache.clipImageNames.contains(bgName) else { return nil }
+                            return cache.images[bgName]
+                        }()
+                        let sibFrame = siblingCoverFrame(for: sib, in: elements, offset: offset, lc: lc,
+                                                          fallbackSize: validImg?.size ?? .zero)
+                        guard sibFrame.width > 0, sibFrame.height > 0,
+                              sibFrame.intersects(vizFrame) else { continue }
+                        if let img = validImg {
+                            topCovers.append((subview: sib, bgImage: img,
+                                              frame: sibFrame.intersection(vizFrame), drawRect: sibFrame))
+                        } else if !sib.children.isEmpty {
+                            // No usable backgroundImage of its own, but it has content (e.g. a
+                            // sliding drawer like Headspace's sEqEar) that draws above the viz
+                            // in normal z-order. Promote its whole subtree as a cover.
+                            topSubviewCovers.append((subview: sib,
+                                                      frame: sibFrame.intersection(vizFrame),
+                                                      containerOffset: offset))
                         }
-                        let sh: CGFloat
-                        if let explicitH = lc.resolve(sib.base.height) {
-                            sh = explicitH
-                        } else if sib.base.verticalAlignment == .stretch {
-                            let botBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.id != sib.base.id,
-                                      s.base.verticalAlignment == .bottom else { return nil }
-                                return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
-                            }.min() ?? lc.viewHeight
-                            sh = max(0, botBound - sibY)
-                        } else {
-                            sh = img.size.height
-                        }
-                        let sibFrame = CGRect(x: sibX, y: sibY, width: sw, height: sh)
-                        guard sibFrame.intersects(vizFrame) else { continue }
-                        topCovers.append((subview: sib, bgImage: img,
-                                          frame: sibFrame.intersection(vizFrame), drawRect: sibFrame))
                     }
                 }
-                return (fx, vizFrame, covers: topCovers, ancestorAlpha: 255, maskImageName: nil)
+                return (fx, vizFrame, covers: topCovers, subviewCovers: topSubviewCovers,
+                        ancestorAlpha: 255, maskImageName: fx.clippingImage?.lowercased())
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -1740,8 +1858,11 @@ public final class SkinCanvasView: NSView {
                 // Compute this subview's backgroundImage and frame to pass as parent context.
                 // Apply stretch alignment when no explicit size is declared (same logic as drawElements).
                 let svBgImg = sv.backgroundImage.flatMap { cache.images[$0.lowercased()] }
+                // See drawElements: don't upscale a background image beyond its native size
+                // unless tiling/stretch-alignment is requested.
                 let svBgW: CGFloat
-                if let explicitW = lc.resolve(sv.base.width) {
+                if let explicitW = lc.resolve(sv.base.width),
+                   explicitW <= (svBgImg?.size.width ?? explicitW) || sv.backgroundTiled {
                     svBgW = explicitW
                 } else if sv.base.horizontalAlignment == .stretch {
                     let rightBound = elements.compactMap { e -> CGFloat? in
@@ -1754,7 +1875,8 @@ public final class SkinCanvasView: NSView {
                     svBgW = svBgImg?.size.width ?? 0
                 }
                 let svBgH: CGFloat
-                if let explicitH = lc.resolve(sv.base.height) {
+                if let explicitH = lc.resolve(sv.base.height),
+                   explicitH <= (svBgImg?.size.height ?? explicitH) || sv.backgroundTiled {
                     svBgH = explicitH
                 } else if sv.base.verticalAlignment == .stretch {
                     let botBound = elements.compactMap { e -> CGFloat? in
@@ -1805,9 +1927,9 @@ public final class SkinCanvasView: NSView {
                         } else {
                             tcIsWhite = false
                         }
-                        if tcIsWhite, let bgName = sv.backgroundImage?.lowercased() {
+                        if tcIsWhite, let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
                             found.maskImageName = bgName
-                        } else {
+                        } else if !tcIsWhite || found.maskImageName == nil {
                             found.covers.append((subview: sv, bgImage: img, frame: svBgFrame, drawRect: svBgFrame))
                         }
                     }
@@ -1828,48 +1950,32 @@ public final class SkinCanvasView: NSView {
                               !elementIsHidden(sib.base, live: true) else { continue }
                         let liveBgName = (sib.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                                           ?? sib.backgroundImage)?.lowercased()
-                        guard let bgName = liveBgName,
-                              !promotedGifNames.contains(bgName),
-                              cache.buttonGroupsByMappingImage[bgName] == nil,
-                              !cache.clipImageNames.contains(bgName),
-                              let img = cache.images[bgName] else { continue }
-                        let sibX = liveCoord(sib.base.id, attr: sib.base.left, propName: "left", lc: lc) + offset.x
-                        let sibY = liveCoord(sib.base.id, attr: sib.base.top,  propName: "top",  lc: lc) + offset.y
-                        let sw: CGFloat
-                        if let explicitW = lc.resolve(sib.base.width) {
-                            sw = explicitW
-                        } else if sib.base.horizontalAlignment == .stretch {
-                            let rightBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.id != sib.base.id,
-                                      s.base.horizontalAlignment == .right else { return nil }
-                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
-                            }.min() ?? lc.viewWidth
-                            sw = max(0, rightBound - sibX)
-                        } else {
-                            sw = img.size.width
-                        }
-                        let sh: CGFloat
-                        if let explicitH = lc.resolve(sib.base.height) {
-                            sh = explicitH
-                        } else if sib.base.verticalAlignment == .stretch {
-                            let botBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.id != sib.base.id,
-                                      s.base.verticalAlignment == .bottom else { return nil }
-                                return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
-                            }.min() ?? lc.viewHeight
-                            sh = max(0, botBound - sibY)
-                        } else {
-                            sh = img.size.height
-                        }
-                        let sibFrame  = CGRect(x: sibX, y: sibY, width: sw, height: sh)
+                        let validImg: NSImage? = {
+                            guard let bgName = liveBgName,
+                                  !promotedGifNames.contains(bgName),
+                                  cache.buttonGroupsByMappingImage[bgName] == nil,
+                                  !cache.clipImageNames.contains(bgName) else { return nil }
+                            return cache.images[bgName]
+                        }()
                         let vizFrame  = found.1
-                        // Restrict the NSImageView to the viz frame: the portion of the sibling
-                        // outside the viz is visible in CGContext and must not be covered by an
-                        // NSImageView (that would hide buttons drawn in CGContext in that region).
-                        guard sibFrame.intersects(vizFrame) else { continue }
-                        let coverFrame = sibFrame.intersection(vizFrame)
-                        found.covers.append((subview: sib, bgImage: img,
-                                             frame: coverFrame, drawRect: sibFrame))
+                        let sibFrame = siblingCoverFrame(for: sib, in: elements, offset: offset, lc: lc,
+                                                          fallbackSize: validImg?.size ?? .zero)
+                        guard sibFrame.width > 0, sibFrame.height > 0,
+                              sibFrame.intersects(vizFrame) else { continue }
+                        if let img = validImg {
+                            // Restrict the NSImageView to the viz frame: the portion of the sibling
+                            // outside the viz is visible in CGContext and must not be covered by an
+                            // NSImageView (that would hide buttons drawn in CGContext in that region).
+                            found.covers.append((subview: sib, bgImage: img,
+                                                 frame: sibFrame.intersection(vizFrame), drawRect: sibFrame))
+                        } else if !sib.children.isEmpty {
+                            // No usable backgroundImage of its own, but it has content (e.g. a
+                            // sliding drawer like Headspace's sEqEar) that draws above the viz
+                            // in normal z-order. Promote its whole subtree as a cover.
+                            found.subviewCovers.append((subview: sib,
+                                                         frame: sibFrame.intersection(vizFrame),
+                                                         containerOffset: offset))
+                        }
                     }
                     // Propagate ancestor alpha: viz must be hidden when any ancestor's alpha is 0.
                     found.ancestorAlpha = min(found.ancestorAlpha, effectiveAlpha(for: sv.base))
@@ -1884,6 +1990,7 @@ public final class SkinCanvasView: NSView {
     private func updateVisualizationView(
         for fx: Effects, frame: CGRect,
         covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)],
+        subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = [],
         ancestorAlpha: Int = 255,
         maskImageName: String? = nil
     ) {
@@ -1941,6 +2048,17 @@ public final class SkinCanvasView: NSView {
                 return VizCoverInfo(subview: sv, bgImage: bgImage, frame: coverFrame,
                                     drawRect: drawRect, imageView: iv)
             }
+            // Whole-subtree covers (e.g. a sliding drawer with no backgroundImage of its
+            // own): composited via drawElements over the subview's full tree, see
+            // renderVizCoverImages. Added on top so they draw above the image-based covers.
+            vizCoverInfos += subviewCovers.map { (sv, coverFrame, containerOffset) in
+                let iv = NSImageView(frame: coverFrame)
+                iv.imageScaling = .scaleAxesIndependently
+                addSubview(iv)
+                return VizCoverInfo(subview: sv, bgImage: NSImage(), frame: coverFrame,
+                                    drawRect: coverFrame, imageView: iv,
+                                    isFullSubviewCover: true, containerOffset: containerOffset)
+            }
         }
         vizContainer?.frame = frame
         vizProvider?.view.frame = CGRect(origin: .zero, size: vizContainer?.bounds.size ?? frame.size)
@@ -1952,6 +2070,27 @@ public final class SkinCanvasView: NSView {
             vizCoverInfos[i].frame           = cover.frame
             vizCoverInfos[i].drawRect        = cover.drawRect
             vizCoverInfos[i].imageView.frame = cover.frame
+        }
+        // Whole-subtree covers are matched by subview id rather than position, since a
+        // sibling can appear/disappear from `subviewCovers` as it moves in and out of the
+        // viz frame (e.g. Headspace's sEqEar drawer always overlaps slightly via its "ear",
+        // but other skins' drawers might not). Missing entries collapse to a zero frame so
+        // renderVizCoverImages skips and hides them.
+        let subviewCoversById = Dictionary(uniqueKeysWithValues: subviewCovers.compactMap {
+            sc -> (String, (subview: Subview, frame: CGRect, containerOffset: CGPoint))? in
+            guard let id = sc.subview.base.id else { return nil }
+            return (id, sc)
+        })
+        for i in vizCoverInfos.indices where vizCoverInfos[i].isFullSubviewCover {
+            if let id = vizCoverInfos[i].subview?.base.id, let sc = subviewCoversById[id] {
+                vizCoverInfos[i].frame           = sc.frame
+                vizCoverInfos[i].drawRect        = sc.frame
+                vizCoverInfos[i].containerOffset = sc.containerOffset
+            } else {
+                vizCoverInfos[i].frame    = .zero
+                vizCoverInfos[i].drawRect = .zero
+            }
+            vizCoverInfos[i].imageView.frame = vizCoverInfos[i].frame
         }
         if let provider = vizProvider {
             let hidden = elementIsHidden(fx.base, live: true) || ancestorAlpha == 0
@@ -2005,10 +2144,125 @@ public final class SkinCanvasView: NSView {
     /// are siblings of visMask, not children of any cover subview).
     private func renderVizCoverImages(lc: LayoutContext) {
         guard !vizCoverInfos.isEmpty else { return }
+        var newSignatures: [[VizCoverSigEntry]] = []
+
+        // Elements owned by a whole-subtree cover (e.g. Headspace's sEqEar drawer) are
+        // drawn entirely by that cover's own drawElements pass below — exclude them from
+        // every other cover's "extra" groups/buttons/sliders so they aren't composited twice.
+        let fullSubviewCoverIds: Set<String> = Set(vizCoverInfos.compactMap {
+            $0.isFullSubviewCover ? $0.subview?.base.id : nil
+        })
+
         for info in vizCoverInfos {
             let sv    = info.subview
             let frame = info.frame
-            guard frame.width > 0, frame.height > 0 else { continue }
+            guard frame.width > 0, frame.height > 0 else { newSignatures.append([]); continue }
+
+            if info.isFullSubviewCover, let sv {
+                let elementsArr: [SkinElement] = [.subview(sv)]
+                let subButtons = collectButtons(in: elementsArr, offset: info.containerOffset, lc: lc)
+                let subSliders = collectSliders(in: elementsArr, offset: info.containerOffset, lc: lc)
+                let subGroups  = collectGroups(in: elementsArr, offset: info.containerOffset, lc: lc)
+
+                var sig: [VizCoverSigEntry] = [
+                    VizCoverSigEntry(id: "__frame", x: Int(frame.minX), y: Int(frame.minY),
+                                     w: Int(frame.width), h: Int(frame.height), extra: "")
+                ]
+                for b in subButtons {
+                    let js = b.model.base.id.flatMap { engine?.state(for: $0) }
+                    sig.append(vizCoverSigEntry(id: b.model.base.id, frame: b.frame,
+                        extra: "\(b.isPressed)|\(b.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"))
+                }
+                for s in subSliders {
+                    sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame,
+                        extra: "\(s.frameIndex)|\(s.value)"))
+                }
+                for g in subGroups {
+                    sig.append(vizCoverSigEntry(id: g.model.base.id, frame: g.frame,
+                        extra: "\(g.hoveredColor ?? "")|\(g.pressedColor ?? "")"))
+                }
+                newSignatures.append(sig)
+
+                let coverIdx = newSignatures.count - 1
+                if let last = lastVizCoverSignatures, coverIdx < last.count, last[coverIdx] == sig,
+                   info.imageView.image != nil {
+                    continue
+                }
+
+                let composite = NSImage(size: frame.size)
+                composite.lockFocusFlipped(true)
+                if let imgCtx = NSGraphicsContext.current?.cgContext {
+                    imgCtx.translateBy(x: -frame.origin.x, y: -frame.origin.y)
+                    var bi = 0
+                    var si = 0
+                    drawElements(elementsArr, offset: info.containerOffset, lc: lc, ctx: imgCtx,
+                                 buttonIdx: &bi, sliderIdx: &si,
+                                 buttonOverride: subButtons, sliderOverride: subSliders)
+                }
+                composite.unlockFocus()
+                info.imageView.image = composite
+                continue
+            }
+
+            // Draw positive-zIndex children of the cover subview (nil for view-level covers).
+            let aboveChildren = sv?.children.filter { ($0.base?.zIndex ?? 0) >= 0 } ?? []
+            let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
+            let coverButtons  = collectButtons(in: aboveChildren, offset: coverOffset, lc: lc)
+            let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
+
+            // Global groups/buttons/sliders that intersect the viz cover frame but live
+            // outside the cover subview's child tree (already drawn via aboveChildren).
+            let svId = sv?.base.id
+            func isOwnedByCover(_ ancestors: [ElementBase]) -> Bool {
+                if ancestors.contains(where: { eb in eb.id.map(fullSubviewCoverIds.contains) ?? false }) {
+                    return true
+                }
+                guard let id = svId else { return false }
+                return ancestors.contains { $0.id == id }
+            }
+            let extraGroups = groups.filter {
+                !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
+                    && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+            }
+            let extraButtons = buttons.filter {
+                !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
+                    && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+            }
+            let extraSliders = sliders.filter {
+                !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
+                    && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+            }
+
+            // Cheap signature of everything the composite below depends on. Skips the
+            // (slow, ~35-40ms) NSImage.lockFocus-based composite rebuild when nothing
+            // the cover draws has changed — critical during 60fps moveTo animations of
+            // unrelated elements (e.g. Headspace's drawer slides), which previously
+            // capped the redraw rate at ~25fps regardless of how cheap recollect() was.
+            var sig: [VizCoverSigEntry] = [
+                VizCoverSigEntry(id: "__frame", x: Int(frame.minX), y: Int(frame.minY),
+                                 w: Int(frame.width), h: Int(frame.height),
+                                 extra: "\(ObjectIdentifier(info.bgImage))")
+            ]
+            for b in coverButtons + extraButtons {
+                let js = b.model.base.id.flatMap { engine?.state(for: $0) }
+                sig.append(vizCoverSigEntry(id: b.model.base.id, frame: b.frame,
+                    extra: "\(b.isPressed)|\(b.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"))
+            }
+            for s in coverSliders + extraSliders {
+                sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: "\(s.frameIndex)"))
+            }
+            for g in extraGroups {
+                sig.append(vizCoverSigEntry(id: g.model.base.id, frame: g.frame,
+                    extra: "\(g.hoveredColor ?? "")|\(g.pressedColor ?? "")"))
+            }
+            newSignatures.append(sig)
+
+            let coverIdx = newSignatures.count - 1
+            if let last = lastVizCoverSignatures, coverIdx < last.count, last[coverIdx] == sig,
+               info.imageView.image != nil {
+                continue
+            }
+
             let composite = NSImage(size: frame.size)
             composite.lockFocusFlipped(true)
             if let imgCtx = NSGraphicsContext.current?.cgContext {
@@ -2022,11 +2276,6 @@ public final class SkinCanvasView: NSView {
                 } else {
                     info.bgImage.draw(in: info.drawRect)
                 }
-                // Draw positive-zIndex children of the cover subview (nil for view-level covers).
-                let aboveChildren = sv?.children.filter { ($0.base?.zIndex ?? 0) >= 0 } ?? []
-                let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
-                let coverButtons  = collectButtons(in: aboveChildren, offset: coverOffset, lc: lc)
-                let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
                 var bi = 0
                 var si = 0
                 drawElements(aboveChildren,
@@ -2034,38 +2283,14 @@ public final class SkinCanvasView: NSView {
                              lc: lc, ctx: imgCtx,
                              buttonIdx: &bi, sliderIdx: &si,
                              buttonOverride: coverButtons, sliderOverride: coverSliders)
-                // Draw global groups/buttons/sliders that intersect the viz cover frame but
-                // live outside the cover subview's child tree. Skip any already drawn above.
-                let svId = sv?.base.id
-                func isOwnedByCover(_ ancestors: [ElementBase]) -> Bool {
-                    guard let id = svId else { return false }
-                    return ancestors.contains { $0.id == id }
-                }
-                for group in groups {
-                    guard !elementIsHidden(group.model.base, live: true),
-                          ancestorsVisible(group.ancestorBases),
-                          group.frame.intersects(frame),
-                          !isOwnedByCover(group.ancestorBases) else { continue }
-                    drawGroup(group, frame: group.frame, ctx: imgCtx)
-                }
-                for button in buttons {
-                    guard !elementIsHidden(button.model.base, live: true),
-                          ancestorsVisible(button.ancestorBases),
-                          button.frame.intersects(frame),
-                          !isOwnedByCover(button.ancestorBases) else { continue }
-                    drawButton(button, ctx: imgCtx)
-                }
-                for slider in sliders {
-                    guard !elementIsHidden(slider.model.base, live: true),
-                          ancestorsVisible(slider.ancestorBases),
-                          slider.frame.intersects(frame),
-                          !isOwnedByCover(slider.ancestorBases) else { continue }
-                    drawSlider(slider)
-                }
+                for group in extraGroups { drawGroup(group, frame: group.frame, ctx: imgCtx) }
+                for button in extraButtons { drawButton(button, ctx: imgCtx) }
+                for slider in extraSliders { drawSlider(slider) }
             }
             composite.unlockFocus()
             info.imageView.image = composite
         }
+        lastVizCoverSignatures = newSignatures
     }
 
     private func wireVizJSBindings(for fx: Effects, provider: any VisualizationProviding) {
@@ -2354,6 +2579,44 @@ public final class SkinCanvasView: NSView {
         group.views.append(iv)
     }
 
+    /// A looping GIF NSImageView always renders above all CGContext drawing, so a
+    /// higher-zIndex sibling's opaque background (e.g. main_back.png's wood frame)
+    /// can't naturally cover the GIF's overflow margins (e.g. eyes_anim.gif bleeding
+    /// past its cutout). For each higher-z sibling whose background overlaps `frame`,
+    /// crop that background to the overlap and add it as a cover NSImageView above
+    /// the GIF — leaving the sibling's own CGContext drawing (and any buttons drawn
+    /// above it elsewhere) untouched, so this doesn't shadow button hover states.
+    private func addBackgroundOverflowCovers(forFrame frame: CGRect, zIndex: Int,
+                                              in elements: [SkinElement],
+                                              offset: CGPoint, lc: LayoutContext) {
+        for sibling in elements {
+            guard case .subview(let sib) = sibling,
+                  (sib.base.zIndex ?? 0) > zIndex,
+                  !elementIsHidden(sib.base) else { continue }
+            let bgName = (sib.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
+                          ?? sib.backgroundImage)?.lowercased()
+            guard let bgName,
+                  !bgName.hasSuffix(".gif"),
+                  cache.buttonGroupsByMappingImage[bgName] == nil,
+                  !cache.clipImageNames.contains(bgName),
+                  let img = cache.images[bgName] else { continue }
+            let sx = (resolveCoord(sib.base.left, lc: lc) ?? 0) + offset.x
+            let sy = (resolveCoord(sib.base.top,  lc: lc) ?? 0) + offset.y
+            let sw = lc.resolve(sib.base.width)  ?? img.size.width
+            let sh = lc.resolve(sib.base.height) ?? img.size.height
+            let overlap = frame.intersection(CGRect(x: sx, y: sy, width: sw, height: sh))
+            guard !overlap.isEmpty else { continue }
+            let cover = NSImage(size: overlap.size)
+            cover.lockFocusFlipped(true)
+            img.draw(in: NSRect(x: sx - overlap.minX, y: sy - overlap.minY, width: sw, height: sh))
+            cover.unlockFocus()
+            let civ = NSImageView(frame: overlap)
+            civ.image        = cover
+            civ.imageScaling = .scaleAxesIndependently
+            addSubview(civ)
+        }
+    }
+
     /// Walks the element tree and creates an `NSImageView` (animates=true) for every
     /// subview whose effective background image is a GIF file.  Views are added in
     /// ascending z-order so higher-z elements appear on top.
@@ -2469,6 +2732,15 @@ public final class SkinCanvasView: NSView {
                     iv.isHidden     = hidden
                     addSubview(iv)
                     gifNSViewAddedToList = true
+                    if !hidden {
+                        let gifFrame = NSRect(x: x, y: y, width: w, height: h)
+                        addBackgroundOverflowCovers(forFrame: gifFrame, zIndex: sv.base.zIndex ?? 0,
+                                                     in: elements, offset: offset, lc: lc)
+                        // Buttons whose frame falls inside the GIF's NSImageView would have
+                        // their hover/down images drawn by CGContext, which always sits below
+                        // NSImageViews — give each such button its own cover NSImageView.
+                        gifOverlayFrames.append((frame: gifFrame, zIndex: sv.base.zIndex ?? 0))
+                    }
                     if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                         let animId = sv.base.id
                         let animIsClose = name.lowercased().contains("close")
@@ -2635,6 +2907,27 @@ private struct VizCoverInfo {
     var drawRect:  CGRect       // canvas rect at which bgImage is drawn; equals frame for parent covers,
                                 // full sibling rect for sibling covers (image drawn offset into intersection)
     let imageView: NSImageView
+    /// True when `subview`'s entire tree (background + children) is composited via
+    /// `drawElements` rather than drawing `bgImage` + the cover subview's own positive
+    /// children. Used for siblings with no backgroundImage of their own (e.g. a sliding
+    /// drawer) that still need to render above the viz NSView. See `renderVizCoverImages`.
+    var isFullSubviewCover: Bool = false
+    /// Offset at which `subview`'s own left/top resolve to its absolute canvas frame.
+    /// Only meaningful when `isFullSubviewCover` is true.
+    var containerOffset: CGPoint = .zero
+}
+
+/// One drawn element's contribution to a viz cover composite's cache signature.
+/// See `renderVizCoverImages`.
+private struct VizCoverSigEntry: Equatable {
+    let id:    String
+    let x, y, w, h: Int
+    let extra: String
+}
+
+private func vizCoverSigEntry(id: String?, frame: CGRect, extra: String) -> VizCoverSigEntry {
+    VizCoverSigEntry(id: id ?? "", x: Int(frame.minX), y: Int(frame.minY),
+                     w: Int(frame.width), h: Int(frame.height), extra: extra)
 }
 
 // MARK: - RenderedGroup

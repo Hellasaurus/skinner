@@ -519,7 +519,8 @@ private extension WMSParser {
             currentPresetOnChange: a.str("currentpreset_onchange"),
             windowed: a.bool("windowed", default: true),
             alphaBlend: a.int("alphablend"),
-            clippingColor: a.str("clippingcolor")
+            clippingColor: a.str("clippingcolor"),
+            clippingImage: a.str("clippingimage")
         )
     }
 

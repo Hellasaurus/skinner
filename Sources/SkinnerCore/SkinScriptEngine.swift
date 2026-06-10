@@ -35,6 +35,11 @@ final class SkinScriptEngine {
 
     private let context: JSContext
     private var proxies: [String: JSValue] = [:]
+    // Caches state(for:) results between script evaluations. Drawing/animation ticks
+    // call state(for:) several times per element per frame; each lookup crosses the
+    // JSC bridge ~7x, which dominated draw() time during 60fps moveTo animations.
+    // Invalidated whenever skin script runs (the only thing that can change these props).
+    private var stateCache: [String: ElementScriptState?] = [:]
     private let bundleDirectory: URL
     private var soundCache: [String: NSSound] = [:]
 
@@ -125,6 +130,7 @@ final class SkinScriptEngine {
 
     func evaluate(_ script: String) {
         guard !script.isEmpty else { return }
+        invalidateStateCache()
         context.evaluateScript("try { \(script) } catch(e) {}")
     }
 
@@ -149,6 +155,7 @@ final class SkinScriptEngine {
                 fired = true
                 if let s = proxy.forProperty("_onEndMove"),
                    let script = s.toString(), !script.isEmpty, script != "undefined" {
+                    invalidateStateCache()
                     context.evaluateScript("try { \(script) } catch(e) {}")
                 }
             }
@@ -316,7 +323,11 @@ final class SkinScriptEngine {
     }
 
     func state(for id: String) -> ElementScriptState? {
-        guard let proxy = proxies[id] else { return nil }
+        if let cached = stateCache[id] { return cached }
+        guard let proxy = proxies[id] else {
+            stateCache[id] = .some(nil)
+            return nil
+        }
         var s = ElementScriptState()
         s.visible         = boolProp(proxy,   "visible")
         s.backgroundImage = stringProp(proxy, "backgroundImage")
@@ -325,7 +336,13 @@ final class SkinScriptEngine {
         s.image           = stringProp(proxy, "image")
         s.value           = stringProp(proxy, "value")
         s.down            = downProp(proxy,   "down")
-        return s.isEmpty ? nil : s
+        let result: ElementScriptState? = s.isEmpty ? nil : s
+        stateCache[id] = .some(result)
+        return result
+    }
+
+    private func invalidateStateCache() {
+        stateCache.removeAll()
     }
 
     // MARK: - WMP constants + element prototype
