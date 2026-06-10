@@ -130,7 +130,7 @@ public final class SkinCanvasView: NSView {
                     iv.animates = newName.hasSuffix(".gif")
                     iv.isHidden = false
                     animatedSubviewCurrentImage[id] = newName
-                    if let raw = rawGif, iv.animates, let dur = gifOnePassDuration(raw, excludingLastFrame: false) {
+                    if let raw = rawGif, iv.animates, let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                         let interactive = interactiveAnimatedSubviews.contains(id)
                         let isClose = newName.contains("close")
                         let gifIsOpen = newName.contains("open")
@@ -2190,6 +2190,12 @@ public final class SkinCanvasView: NSView {
         recollect()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
+        // Rebuild the click-through mask synchronously so the upcoming draw (below)
+        // reflects elements' new positions/images. Deferring this to a later runloop
+        // turn caused one stale-mask frame to be drawn first, flashing the background
+        // through areas a moved/covering element no longer leaves transparent.
+        // Cheap in the common (no-op) case via the signature check in buildBgOpacity().
+        buildBgOpacity()
         if let bundle {
             let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
             promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
@@ -2201,14 +2207,6 @@ public final class SkinCanvasView: NSView {
         // when moveTo() was called.
         engine?.stampNewAnimationStartTimes()
         startMoveTimerIfNeeded()
-        // Defer the click-through mask rebuild so it doesn't block the animation timer
-        // from starting (e.g. a drawer toggle that also flips view.width/visible right
-        // before moveto). Elements moved by JS register as clickable one runloop tick late.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.buildBgOpacity()
-            self.setNeedsDisplay(self.bounds)
-        }
     }
 
     private func startMoveTimerIfNeeded() {
@@ -2237,13 +2235,10 @@ public final class SkinCanvasView: NSView {
             updateLiveSliders()
             updateAnimatedSubviewVisibility()
             rescheduleTimer()
-            // Defer the expensive bgOpacity rebuild so the run loop can render the
-            // final frame before the mask recompute blocks the main thread.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.buildBgOpacity()
-                self.setNeedsDisplay(self.bounds)
-            }
+            // Rebuild the mask synchronously (before the setNeedsDisplay above is
+            // flushed) so the final frame doesn't draw with the pre-animation mask
+            // and flash the background through the shutter's new position.
+            buildBgOpacity()
         }
     }
 
@@ -2281,7 +2276,7 @@ public final class SkinCanvasView: NSView {
                 iv.imageScaling = .scaleAxesIndependently
                 iv.isHidden     = elementIsHidden(sv.base, live: true)
                 addSubview(iv)
-                if let dur = gifOnePassDuration(raw, excludingLastFrame: false) {
+                if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                     let isClose = newName.contains("close")
                     DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
                         iv?.animates = false
@@ -2435,7 +2430,7 @@ public final class SkinCanvasView: NSView {
                         iv.isHidden     = hidden
                         addSubview(iv)
                         gifNSViewAddedToList = true
-                        if let raw = rawGif, let dur = gifOnePassDuration(raw, excludingLastFrame: false) {
+                        if let raw = rawGif, let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                             let animId = sv.base.id
                             DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
                                 iv?.animates = false
@@ -2474,7 +2469,7 @@ public final class SkinCanvasView: NSView {
                     iv.isHidden     = hidden
                     addSubview(iv)
                     gifNSViewAddedToList = true
-                    if let dur = gifOnePassDuration(raw, excludingLastFrame: false) {
+                    if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                         let animId = sv.base.id
                         let animIsClose = name.lowercased().contains("close")
                         let animIsOpen  = name.lowercased().contains("open")
