@@ -16,7 +16,7 @@ import ImageIO
 public final class SkinCanvasView: NSView {
 
     private let skinView: SkinView
-    private let cache:    AssetCache
+    let cache:            AssetCache
 
     private var groups:          [RenderedGroup]  = []
     private var buttons:         [RenderedButton] = []
@@ -25,7 +25,7 @@ public final class SkinCanvasView: NSView {
     private var bgOpacity:       [Bool]           = []
     private var bgWidth          = 0
     private var bgHeight         = 0
-    private var bgMask:          CGImage?         = nil
+    var bgMask:                  CGImage?         = nil
     private var lastBgOpacitySignature: [BgOpacitySigEntry]?
     private var lastBgSignatureSize: (w: Int, h: Int) = (0, 0)
     private var opacityMaskCache: [OpacityMaskKey: [Bool]] = [:]

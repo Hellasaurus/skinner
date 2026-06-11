@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var player: AVFoundationPlayer?
     private(set) var currentSkinURL: URL?
     private var sharedViz: VisualizationView?
+    private var debugStdin: DebugStdinController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
@@ -29,6 +30,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Optional second argument: path to a media file to open immediately.
         if let mediaPath = args.dropFirst().first {
             openMedia(URL(fileURLWithPath: mediaPath))
+        }
+
+        if ProcessInfo.processInfo.environment["SKINNER_DEBUG_STDIN"] != nil {
+            debugStdin = DebugStdinController(
+                mainCanvas: { [weak self] in self?.window?.skinCanvas },
+                secondaryCanvas: { [weak self] id in self?.secondaryWindows[id]?.skinCanvas }
+            )
         }
     }
 
@@ -49,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            let c = AssetCache.build(from: b, theme: t)
+            let c = AssetCache.build(from: b, theme: t, imageOverrides: imageOverridesFromEnvironment())
 
             // Commit state only after a successful load so a failed swap leaves the old skin intact.
             if isSwap {

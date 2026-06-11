@@ -1,0 +1,5 @@
+<theme id="synth_transparency" title="Transparency Test" author="SkinnerTests">
+<view id="mainView" titleBar="false" backgroundColor="none" width="32" height="32">
+<subview id="bg" left="0" top="0" width="32" height="32" backgroundImage="background.png" transparencyColor="#ff00ff" />
+</view>
+</theme>

@@ -45,7 +45,8 @@ let package = Package(
         .testTarget(
             name: "SkinnerCoreTests",
             dependencies: ["SkinnerCore"],
-            path: "Tests/SkinnerCoreTests"
+            path: "Tests/SkinnerCoreTests",
+            exclude: ["Fixtures"]
         ),
     ]
 )

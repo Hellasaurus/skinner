@@ -59,7 +59,8 @@ public final class AssetCache {
 
     // MARK: - Factory
 
-    public static func build(from bundle: SkinBundle, theme: Theme) -> AssetCache {
+    public static func build(from bundle: SkinBundle, theme: Theme,
+                              imageOverrides: [String: ImageOverride] = [:]) -> AssetCache {
         var filenames = Set<String>()
         for view in theme.views {
             collectFilenames(from: view.elements, into: &filenames)
@@ -77,7 +78,9 @@ public final class AssetCache {
         for name in filenames {
             let url = bundle.assetURL(named: name)
             let key = name.lowercased()
-            if let img = loadMagentaFree(url: url, extraTransparent: extraTransparentColors[key] ?? []) { images[key]  = img }
+            if let img = loadMagentaFree(url: url, extraTransparent: extraTransparentColors[key] ?? []) {
+                images[key] = imageOverrides[key]?.apply(to: img) ?? img
+            }
             if let md  = loadMapData(url: url)     { mapData[key] = md }
         }
 
@@ -93,7 +96,9 @@ public final class AssetCache {
             for fileURL in entries
             where scriptImageExts.contains(fileURL.pathExtension.lowercased()) {
                 let key = fileURL.lastPathComponent.lowercased()
-                if images[key]  == nil, let img = loadMagentaFree(url: fileURL, extraTransparent: extraTransparentColors[key] ?? []) { images[key]  = img }
+                if images[key]  == nil, let img = loadMagentaFree(url: fileURL, extraTransparent: extraTransparentColors[key] ?? []) {
+                    images[key] = imageOverrides[key]?.apply(to: img) ?? img
+                }
                 if mapData[key] == nil, let md  = loadMapData(url: fileURL)     { mapData[key] = md  }
             }
         }
