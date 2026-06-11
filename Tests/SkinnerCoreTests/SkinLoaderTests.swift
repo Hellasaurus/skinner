@@ -19,6 +19,22 @@ struct SkinLoaderTests {
         .deletingLastPathComponent()
         .appendingPathComponent("skins/windowsmediaplayerskinscollection/activate.wmz")
 
+    // A .wmz with a deliberately corrupted local file header on one entry
+    // (anti-extraction trick); `unzip` exits non-zero but extracts the rest.
+    private static let bruteforceWMZ = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("skins/windowsmediaplayerskinscollection/bruteforce.wmz")
+
+    // Same trick, but the corrupted entry is the .wms file itself — `unzip`
+    // can't extract it at all without the header repair.
+    private static let splinterCellWMZ = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("skins/windowsmediaplayerskinscollection/SplinterCellWMPSkin.wmz")
+
     // MARK: Directory input
 
     @Test func loadsFromDirectory() throws {
@@ -53,6 +69,20 @@ struct SkinLoaderTests {
         let bundle = try SkinLoader.load(from: Self.sampleWMZ)
         let inTemp = bundle.directory.path.hasPrefix(FileManager.default.temporaryDirectory.path)
         #expect(inTemp)
+        try? FileManager.default.removeItem(at: bundle.directory)
+    }
+
+    @Test func loadsWMZWithCorruptedLocalHeaderEntry() throws {
+        let bundle = try SkinLoader.load(from: Self.bruteforceWMZ)
+        #expect(bundle.wmsFile.pathExtension.lowercased() == "wms")
+        #expect(FileManager.default.fileExists(atPath: bundle.wmsFile.path))
+        try? FileManager.default.removeItem(at: bundle.directory)
+    }
+
+    @Test func loadsWMZWithCorruptedWMSLocalHeader() throws {
+        let bundle = try SkinLoader.load(from: Self.splinterCellWMZ)
+        #expect(bundle.wmsFile.lastPathComponent.lowercased() == "sc.wms")
+        #expect(FileManager.default.fileExists(atPath: bundle.wmsFile.path))
         try? FileManager.default.removeItem(at: bundle.directory)
     }
 
