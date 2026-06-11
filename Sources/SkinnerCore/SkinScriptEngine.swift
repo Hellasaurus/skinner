@@ -12,12 +12,17 @@ struct ElementScriptState {
     var alphaBlend: Int?
     var enabled: Bool?
     var image: String?       // button/element image override (element.image = "foo.png")
+    var hoverImage: String?  // buttongroup/button hoverImage override
+    var downImage: String?   // buttongroup/button downImage override
+    var disabledImage: String? // buttongroup disabledImage override
     var value: String?       // text element value set via JS (e.g. metadata.value = ...)
     var down: Bool?          // sticky button toggle state (element.down = true/false/"true"/"false")
+    var foregroundColor: String? // text element foregroundColor set via JS
 
     var isEmpty: Bool {
         visible == nil && backgroundImage == nil && alphaBlend == nil
-            && enabled == nil && image == nil && value == nil && down == nil
+            && enabled == nil && image == nil && hoverImage == nil && downImage == nil
+            && disabledImage == nil && value == nil && down == nil && foregroundColor == nil
     }
 }
 
@@ -334,8 +339,12 @@ final class SkinScriptEngine {
         s.alphaBlend      = intProp(proxy,    "alphaBlend")
         s.enabled         = boolProp(proxy,   "enabled")
         s.image           = stringProp(proxy, "image")
+        s.hoverImage      = stringProp(proxy, "hoverImage")
+        s.downImage       = stringProp(proxy, "downImage")
+        s.disabledImage   = stringProp(proxy, "disabledImage")
         s.value           = stringProp(proxy, "value")
         s.down            = downProp(proxy,   "down")
+        s.foregroundColor = stringProp(proxy, "foregroundColor")
         let result: ElementScriptState? = s.isEmpty ? nil : s
         stateCache[id] = .some(result)
         return result

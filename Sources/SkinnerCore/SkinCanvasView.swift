@@ -1051,7 +1051,8 @@ public final class SkinCanvasView: NSView {
         } else {
             font = NSFont.systemFont(ofSize: pointSize)
         }
-        let fgColor = (isHovered ? label.hoverForegroundColor : nil) ?? label.foregroundColor ?? "#ffffff"
+        let jsForegroundColor = label.base.id.flatMap { engine?.state(for: $0)?.foregroundColor }
+        let fgColor = (isHovered ? label.hoverForegroundColor : nil) ?? jsForegroundColor ?? label.foregroundColor ?? "#ffffff"
         let fgRGB = parseAnyColor(fgColor) ?? (0xff, 0xff, 0xff)
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineBreakMode = .byClipping
@@ -1089,7 +1090,11 @@ public final class SkinCanvasView: NSView {
     // MARK: - Per-element drawing
 
     private func drawGroup(_ group: RenderedGroup, frame: CGRect, ctx: CGContext) {
-        guard let imgName = group.model.image,
+        // JS color-switch scripts (e.g. objectColorToggle) reassign a buttongroup's
+        // image/hoverImage/downImage/disabledImage to swap in a different color set.
+        let jsState = group.model.base.id.flatMap { engine?.state(for: $0) }
+
+        guard let imgName = jsState?.image ?? group.model.image,
               let normal  = cache.images[imgName.lowercased()]
         else { return }
 
@@ -1106,7 +1111,7 @@ public final class SkinCanvasView: NSView {
         ctx.restoreGState()
 
         if let key  = group.hoveredColor,
-           let name = group.model.hoverImage,
+           let name = jsState?.hoverImage ?? group.model.hoverImage,
            let img  = cache.images[name.lowercased()],
            let mask = group.assets.masks[key] {
             ctx.saveGState()
@@ -1117,7 +1122,7 @@ public final class SkinCanvasView: NSView {
         }
 
         if let key  = group.pressedColor,
-           let name = group.model.downImage,
+           let name = jsState?.downImage ?? group.model.downImage,
            let img  = cache.images[name.lowercased()],
            let mask = group.assets.masks[key] {
             ctx.saveGState()
@@ -1127,7 +1132,7 @@ public final class SkinCanvasView: NSView {
             ctx.restoreGState()
         }
 
-        if let disName = group.model.disabledImage,
+        if let disName = jsState?.disabledImage ?? group.model.disabledImage,
            let disImg  = cache.images[disName.lowercased()] {
             for elem in group.model.elements where !buttonElementIsEnabled(elem) {
                 guard let mask = group.assets.masks[elem.mappingColor.lowercased()] else { continue }
@@ -1141,13 +1146,13 @@ public final class SkinCanvasView: NSView {
     }
 
     private func drawButton(_ button: RenderedButton, ctx: CGContext) {
-        let jsState = button.model.base.id.flatMap { engine?.state(for: $0) }
-        let jsImage = jsState?.image
-        let jsDown  = button.model.sticky && (jsState?.down == true)
+        let jsState   = button.model.base.id.flatMap { engine?.state(for: $0) }
+        let jsImage   = jsState?.image
+        let jsSticky  = button.model.sticky && (jsState?.down == true)
         let name: String?
-        if button.isPressed || jsDown { name = button.model.downImage  ?? jsImage ?? button.model.image }
-        else if button.isHovered      { name = button.model.hoverImage ?? jsImage ?? button.model.image }
-        else                          { name = jsImage ?? button.model.image }
+        if button.isPressed || jsSticky { name = jsState?.downImage  ?? button.model.downImage  ?? jsImage ?? button.model.image }
+        else if button.isHovered        { name = jsState?.hoverImage ?? button.model.hoverImage ?? jsImage ?? button.model.image }
+        else                             { name = jsImage ?? button.model.image }
         guard let n = name, let img = cache.images[n.lowercased()] else { return }
         // Draw at natural pixel size from the button origin.  The declared button
         // width/height defines the interaction area; the parent subview's clip rect
@@ -1188,13 +1193,20 @@ public final class SkinCanvasView: NSView {
             drawSpriteSlider(slider)
         } else if slider.model.thumbImage != nil {
             drawStandardSlider(slider)
-        } else if let name = slider.model.image, let img = cache.images[name.lowercased()] {
+        } else if let name = sliderImageName(slider), let img = cache.images[name.lowercased()] {
             img.draw(in: slider.frame)
         }
     }
 
+    /// JS color-switch scripts (e.g. toggleSliderColors) reassign a CustomSlider's
+    /// `image` to swap in a different color sprite sheet.
+    private func sliderImageName(_ slider: RenderedSlider) -> String? {
+        let jsImage = slider.model.base.id.flatMap { engine?.state(for: $0)?.image }
+        return jsImage ?? slider.model.image
+    }
+
     private func drawSpriteSlider(_ slider: RenderedSlider) {
-        guard let name = slider.model.image,
+        guard let name = sliderImageName(slider),
               let img  = cache.images[name.lowercased()]
         else { return }
 
@@ -1861,7 +1873,7 @@ public final class SkinCanvasView: NSView {
                 // See drawElements: don't upscale a background image beyond its native size
                 // unless tiling/stretch-alignment is requested.
                 let svBgW: CGFloat
-                if let explicitW = lc.resolve(sv.base.width),
+                if let explicitW = resolveCoord(sv.base.width, lc: lc),
                    explicitW <= (svBgImg?.size.width ?? explicitW) || sv.backgroundTiled {
                     svBgW = explicitW
                 } else if sv.base.horizontalAlignment == .stretch {
@@ -1875,7 +1887,7 @@ public final class SkinCanvasView: NSView {
                     svBgW = svBgImg?.size.width ?? 0
                 }
                 let svBgH: CGFloat
-                if let explicitH = lc.resolve(sv.base.height),
+                if let explicitH = resolveCoord(sv.base.height, lc: lc),
                    explicitH <= (svBgImg?.size.height ?? explicitH) || sv.backgroundTiled {
                     svBgH = explicitH
                 } else if sv.base.verticalAlignment == .stretch {
