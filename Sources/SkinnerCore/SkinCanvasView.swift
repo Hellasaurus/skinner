@@ -284,8 +284,13 @@ public final class SkinCanvasView: NSView {
 
         let sizeCtx = LayoutContext(viewWidth: 0, viewHeight: 0)
         let bgImg = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
-        let w = sizeCtx.resolve(skinView.width)  ?? bgImg?.size.width  ?? 320
-        let h = sizeCtx.resolve(skinView.height) ?? bgImg?.size.height ?? 240
+        var w = sizeCtx.resolve(skinView.width)  ?? bgImg?.size.width  ?? 320
+        var h = sizeCtx.resolve(skinView.height) ?? bgImg?.size.height ?? 240
+        // Some skins declare width/height smaller than minWidth/minHeight (e.g. WoW/Halo 2
+        // info views) — content positioned for the min size would overflow the border
+        // graphics if we honored the smaller declared size.
+        if let minW = sizeCtx.resolve(skinView.minWidth)  { w = max(w, minW) }
+        if let minH = sizeCtx.resolve(skinView.minHeight) { h = max(h, minH) }
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
 
         engine = bundle.flatMap { SkinScriptEngine(skinView: skinView, bundle: $0) }
