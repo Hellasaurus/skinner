@@ -44,6 +44,16 @@ public final class SkinCanvasView: NSView {
     private var animatedSubviewTransparency:   [String: [(UInt8, UInt8, UInt8)]] = [:]
     private var animatedSubviewWmsBackground:  [String: String]                  = [:]
     private var completedOnePassAnimations:    Set<String>                       = []
+    /// `<button>` elements whose `image` is an animated GIF (e.g. intro "shield" or corner
+    /// reveal animations), promoted to their own NSImageView. Keyed by element id.
+    private var animatedButtonViews:           [String: NSImageView]            = [:]
+    private var animatedButtonBases:           [String: ElementBase]            = [:]
+    private var animatedButtonAncestors:       [String: [ElementBase]]          = [:]
+    /// Buttongroup hover-flash overlays (e.g. animated `hoverImage` GIFs). Keyed by group index.
+    private var groupHoverViews:               [String: NSImageView]            = [:]
+    private var groupHoverTimers:              [String: Timer]                  = [:]
+    private var groupHoverFrameCache:          [String: [NSImage]]              = [:]
+    private var groupHoverFrameDurations:      [String: [Double]]               = [:]
     /// IDs promoted at runtime by JS (e.g. mainShutter). These are interactive toggle elements.
     private var interactiveAnimatedSubviews:  Set<String>                       = []
     /// Lowercased image names whose drawing is handled by an NSImageView (including id-less
@@ -192,6 +202,12 @@ public final class SkinCanvasView: NSView {
             } else {
                 iv.isHidden = elementIsHidden(base, live: true)
             }
+        }
+
+        for (id, iv) in animatedButtonViews {
+            guard let base = animatedButtonBases[id] else { continue }
+            let ancestors = animatedButtonAncestors[id] ?? []
+            iv.isHidden = elementIsHidden(base, live: true) || !ancestorsVisible(ancestors)
         }
     }
 
@@ -1152,7 +1168,8 @@ public final class SkinCanvasView: NSView {
         if button.isPressed || jsSticky { name = jsState?.downImage  ?? button.model.downImage  ?? jsImage ?? button.model.image }
         else if button.isHovered        { name = jsState?.hoverImage ?? button.model.hoverImage ?? jsImage ?? button.model.image }
         else                             { name = jsImage ?? button.model.image }
-        guard let n = name, let img = cache.images[n.lowercased()] else { return }
+        guard let n = name, !promotedGifNames.contains(n.lowercased()),
+              let img = cache.images[n.lowercased()] else { return }
         // Draw at natural pixel size from the button origin.  The declared button
         // width/height defines the interaction area; the parent subview's clip rect
         // (set in drawElements) acts as the viewport — this is how sprite-font digit
@@ -1355,6 +1372,7 @@ public final class SkinCanvasView: NSView {
                 let elem = groups[i].model.elements.first { $0.mappingColor.lowercased() == color }
                 guard buttonElementIsEnabled(elem) else { continue }
                 groups[i].pressedColor = color
+                groupHoverViews["\(i)"]?.isHidden = true
                 setNeedsDisplay(bounds)
                 return
             }
@@ -1462,6 +1480,7 @@ public final class SkinCanvasView: NSView {
             guard let pressed = groups[i].pressedColor else { continue }
             let group = groups[i]           // snapshot before firing; action may rebuild groups
             groups[i].pressedColor = nil
+            if groups[i].hoveredColor != nil { groupHoverViews["\(i)"]?.isHidden = false }
             setNeedsDisplay(bounds)
             if group.colorAt(pt) == pressed { fireGroupAction(group, colorKey: pressed) }
             return
@@ -1561,7 +1580,12 @@ public final class SkinCanvasView: NSView {
             let inactive = elementIsHidden(groups[i].model.base, live: true) || !ancestorsVisible(groups[i].ancestorBases) || ancestorsPassThrough(groups[i].ancestorBases) || !elementIsEnabled(groups[i].model.base)
             let h: String? = (!inactive && !groupHitHandled) ? groups[i].colorAt(pt) : nil
             if h != nil { groupHitHandled = true }
-            if h != groups[i].hoveredColor { groups[i].hoveredColor = h; changed = true }
+            if h != groups[i].hoveredColor {
+                groups[i].hoveredColor = h
+                changed = true
+                if let h { startGroupHoverAnimation(groupIndex: i, maskKey: h) }
+                else      { stopGroupHoverAnimation(groupIndex: i) }
+            }
         }
         var buttonHitHandled = false
         for i in buttons.indices.reversed() {
@@ -1624,6 +1648,7 @@ public final class SkinCanvasView: NSView {
         var changed = false
         for i in groups.indices where groups[i].hoveredColor != nil || groups[i].pressedColor != nil {
             groups[i].hoveredColor = nil; groups[i].pressedColor = nil; changed = true
+            stopGroupHoverAnimation(groupIndex: i)
         }
         for i in buttons.indices where buttons[i].isHovered || buttons[i].isPressed {
             buttons[i].isHovered = false; buttons[i].isPressed = false; changed = true
@@ -1704,6 +1729,8 @@ public final class SkinCanvasView: NSView {
             for (i, p) in savedGroupPressed {
                 groups[i].pressedColor = p
             }
+        } else {
+            clearAllGroupHoverAnimations()
         }
         for i in buttons.indices {
             if let id = buttons[i].model.base.id, savedButtonPressed.contains(id) {
@@ -2633,6 +2660,189 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// Promotes a `<button>` whose `image` is an animated GIF (e.g. an intro "shield" or
+    /// corner reveal animation) to its own NSImageView, since CGContext only ever draws a
+    /// static frame. Plays once: after the GIF's one-pass duration it freezes on its
+    /// current frame, matching how WMP plays these intro sequences.
+    private func promoteAnimatedButtonGif(_ b: Button, offset: CGPoint, lc: LayoutContext, ancestors: [ElementBase]) {
+        guard let bundle,
+              let id = b.base.id, animatedButtonViews[id] == nil,
+              let name = b.image, name.lowercased().hasSuffix(".gif"),
+              !cache.clipImageNames.contains(name.lowercased()),
+              let raw = NSImage(contentsOf: bundle.assetURL(named: name)),
+              gifIsAnimated(raw)
+        else { return }
+
+        let lower = name.lowercased()
+        let x = (resolveCoord(b.base.left, lc: lc) ?? 0) + offset.x
+        let y = (resolveCoord(b.base.top,  lc: lc) ?? 0) + offset.y
+        let md = cache.mapData[lower]
+        var w  = lc.resolve(b.base.width)  ?? CGFloat(md?.width  ?? 0)
+        var h  = lc.resolve(b.base.height) ?? CGFloat(md?.height ?? 0)
+        if w == 0 { w = raw.size.width  }
+        if h == 0 { h = raw.size.height }
+
+        let extra: [(UInt8, UInt8, UInt8)] = [b.clippingColor, b.base.transparencyColor]
+            .compactMap { $0.flatMap(parseAnyColor) }
+        let img = loadGifMagentaFree(url: bundle.assetURL(named: name), extraTransparent: extra) ?? raw
+
+        let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+        iv.image        = img
+        iv.animates     = true
+        iv.imageScaling = .scaleAxesIndependently
+        iv.isHidden     = elementIsHidden(b.base) || !ancestorsVisible(ancestors)
+        addSubview(iv)
+
+        if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak iv] in
+                iv?.animates = false
+            }
+        }
+
+        promotedGifNames.insert(lower)
+        animatedButtonViews[id]     = iv
+        animatedButtonBases[id]     = b.base
+        animatedButtonAncestors[id] = ancestors
+    }
+
+    /// Builds (and caches) composite hover-flash frames for buttongroup `i`'s `maskKey`
+    /// element: each frame is the group's normal image with one frame of the animated
+    /// `hoverImage` GIF painted on top, clipped to that element's mapping mask — i.e.
+    /// exactly what `drawGroup` renders statically, but per-frame.  Returns nil if the
+    /// group's hoverImage isn't a multi-frame GIF (nothing to animate).
+    private func hoverFlashFrames(forGroupIndex i: Int, maskKey: String) -> (frames: [NSImage], durations: [Double])? {
+        let cacheKey = "\(i)|\(maskKey)"
+        if let cached = groupHoverFrameCache[cacheKey] {
+            guard !cached.isEmpty else { return nil }
+            return (cached, groupHoverFrameDurations[cacheKey] ?? [])
+        }
+
+        func cacheMiss() -> (frames: [NSImage], durations: [Double])? {
+            groupHoverFrameCache[cacheKey] = []
+            groupHoverFrameDurations[cacheKey] = []
+            return nil
+        }
+
+        guard i < groups.count else { return cacheMiss() }
+        let group = groups[i]
+        let jsState = group.model.base.id.flatMap { engine?.state(for: $0) }
+        guard let bundle,
+              let normalName = jsState?.image ?? group.model.image,
+              let normalImg  = cache.images[normalName.lowercased()],
+              let hoverName  = jsState?.hoverImage ?? group.model.hoverImage,
+              let mask       = group.assets.masks[maskKey],
+              let raw  = NSImage(contentsOf: bundle.assetURL(named: hoverName)),
+              let rep  = raw.representations.first as? NSBitmapImageRep,
+              let n    = rep.value(forProperty: .frameCount) as? Int, n > 1
+        else { return cacheMiss() }
+
+        let extra: [(UInt8, UInt8, UInt8)] = [group.model.clippingColor, group.model.base.transparencyColor]
+            .compactMap { $0.flatMap(parseAnyColor) }
+        let size = group.frame.size
+        let rect = CGRect(origin: .zero, size: size)
+
+        var frames: [NSImage] = []
+        var durations: [Double] = []
+        for k in 0 ..< n {
+            guard let frameImg = extractCleanFrame(rep, index: k, extraTransparent: extra) else { continue }
+            let composite = NSImage(size: size)
+            composite.lockFocusFlipped(true)
+            if let ctx = NSGraphicsContext.current?.cgContext {
+                // Mirror drawGroup's normal-image clip (clipMask, else fullMask) so the
+                // composite's base layer matches the group's actual on-screen shape —
+                // otherwise the overlay's rectangular bounds bleed over neighboring UI.
+                ctx.saveGState()
+                if let clip = group.clipMask { ctx.clip(to: rect, mask: clip) }
+                else if let full = group.assets.fullMask { ctx.clip(to: rect, mask: full) }
+                normalImg.draw(in: NSRect(origin: .zero, size: size))
+                ctx.restoreGState()
+
+                ctx.saveGState()
+                if let clip = group.clipMask { ctx.clip(to: rect, mask: clip) }
+                ctx.clip(to: rect, mask: mask)
+                frameImg.draw(in: NSRect(origin: .zero, size: size))
+                ctx.restoreGState()
+            }
+            composite.unlockFocus()
+            frames.append(composite)
+            durations.append((rep.value(forProperty: .currentFrameDuration) as? Double) ?? 0.1)
+        }
+        guard frames.count > 1 else { return cacheMiss() }
+        groupHoverFrameCache[cacheKey] = frames
+        groupHoverFrameDurations[cacheKey] = durations
+        return (frames, durations)
+    }
+
+    /// Starts the hover-flash animation for buttongroup `i`'s `maskKey` element: plays the
+    /// composite frames from `hoverFlashFrames` once via a Timer-driven NSImageView overlay
+    /// positioned over the group, then freezes on the last (lit) frame. No-op if the
+    /// hoverImage isn't animated.
+    private func startGroupHoverAnimation(groupIndex i: Int, maskKey: String) {
+        stopGroupHoverAnimation(groupIndex: i)
+        guard let (frames, _) = hoverFlashFrames(forGroupIndex: i, maskKey: maskKey),
+              !frames.isEmpty, i < groups.count else { return }
+
+        let key = "\(i)"
+        let iv = NSImageView(frame: groups[i].frame)
+        iv.imageScaling = .scaleAxesIndependently
+        iv.image = frames[0]
+        addSubview(iv)
+        groupHoverViews[key] = iv
+        scheduleGroupHoverFrame(groupKey: key, cacheKey: "\(i)|\(maskKey)", index: 0)
+    }
+
+    /// Schedules the transition to `index + 1` of the cached hover-flash frames after the
+    /// current frame's delay elapses. Looks frames/durations up by `cacheKey` each time
+    /// (rather than capturing them) so the Timer closure only holds Sendable values.
+    private func scheduleGroupHoverFrame(groupKey: String, cacheKey: String, index: Int) {
+        guard let durations = groupHoverFrameDurations[cacheKey], index < durations.count else { return }
+        let timer = Timer(timeInterval: durations[index], repeats: false) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.advanceGroupHoverFrame(groupKey: groupKey, cacheKey: cacheKey, index: index)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        groupHoverTimers[groupKey] = timer
+    }
+
+    /// Advances the hover-flash overlay for `groupKey` to frame `index + 1`, or leaves it
+    /// frozen on the final frame once the one-pass animation completes.
+    private func advanceGroupHoverFrame(groupKey: String, cacheKey: String, index: Int) {
+        guard let frames = groupHoverFrameCache[cacheKey], let iv = groupHoverViews[groupKey] else {
+            groupHoverTimers[groupKey] = nil
+            return
+        }
+        let nextIndex = index + 1
+        if nextIndex < frames.count {
+            iv.image = frames[nextIndex]
+            scheduleGroupHoverFrame(groupKey: groupKey, cacheKey: cacheKey, index: nextIndex)
+        } else {
+            groupHoverTimers[groupKey] = nil
+        }
+    }
+
+    /// Stops and removes the hover-flash overlay for buttongroup `i`, if any.
+    private func stopGroupHoverAnimation(groupIndex i: Int) {
+        let key = "\(i)"
+        groupHoverTimers[key]?.invalidate()
+        groupHoverTimers[key] = nil
+        groupHoverViews[key]?.removeFromSuperview()
+        groupHoverViews[key] = nil
+    }
+
+    /// Tears down all hover-flash overlays/timers/caches. Called from `recollect()` when
+    /// `groups` is rebuilt with a different count, since the `"\(i)"` keys would otherwise
+    /// refer to the wrong group.
+    private func clearAllGroupHoverAnimations() {
+        for timer in groupHoverTimers.values { timer.invalidate() }
+        groupHoverTimers.removeAll()
+        for view in groupHoverViews.values { view.removeFromSuperview() }
+        groupHoverViews.removeAll()
+        groupHoverFrameCache.removeAll()
+        groupHoverFrameDurations.removeAll()
+    }
+
     /// Walks the element tree and creates an `NSImageView` (animates=true) for every
     /// subview whose effective background image is a GIF file.  Views are added in
     /// ascending z-order so higher-z elements appear on top.
@@ -2649,11 +2859,16 @@ public final class SkinCanvasView: NSView {
     @discardableResult
     private func buildAnimatedSubviews(in elements: [SkinElement],
                                         offset: CGPoint,
-                                        lc: LayoutContext) -> [String] {
+                                        lc: LayoutContext,
+                                        ancestors: [ElementBase] = []) -> [String] {
         guard let bundle else { return [] }
         var gifNSViewAddedToList = false
         var createdGifIds: [String] = []
         for element in sortedByZIndex(elements) {
+            if case .button(let b) = element {
+                promoteAnimatedButtonGif(b, offset: offset, lc: lc, ancestors: ancestors)
+                continue
+            }
             guard case .subview(let sv) = element else { continue }
             let hidden = elementIsHidden(sv.base)
             // Skip children of statically-hidden subviews (they can't be independently visible).
@@ -2679,7 +2894,7 @@ public final class SkinCanvasView: NSView {
             }
 
             if hasGifBelow {
-                buildAnimatedSubviews(in: below, offset: co, lc: lc)
+                buildAnimatedSubviews(in: below, offset: co, lc: lc, ancestors: ancestors + [sv.base])
                 // Add this element's background as an NSImageView so it sits above the GIF below-children.
                 if let name = bgName,
                    !cache.clipImageNames.contains(name.lowercased()) {
@@ -2729,7 +2944,7 @@ public final class SkinCanvasView: NSView {
                         }
                     }
                 }
-                buildAnimatedSubviews(in: above, offset: co, lc: lc)
+                buildAnimatedSubviews(in: above, offset: co, lc: lc, ancestors: ancestors + [sv.base])
             } else {
                 if let name = bgName, name.lowercased().hasSuffix(".gif"),
                    !cache.clipImageNames.contains(name.lowercased()),
@@ -2835,7 +3050,7 @@ public final class SkinCanvasView: NSView {
                 }
                 // Recurse into visible children; propagate one-pass GIF IDs upward.
                 if !hidden {
-                    let childGifIds = buildAnimatedSubviews(in: sv.children, offset: co, lc: lc)
+                    let childGifIds = buildAnimatedSubviews(in: sv.children, offset: co, lc: lc, ancestors: ancestors + [sv.base])
                     if !childGifIds.isEmpty {
                         // passthrough parent: its background must sit above child GIF NSImageViews.
                         if sv.base.passThrough,
@@ -3023,6 +3238,30 @@ private struct RenderedText {
 }
 
 // MARK: - File-local helpers
+
+/// Decodes a single frame of `rep` at `index`, strips magenta (and any extra transparent
+/// colours) via a CGContext pixel pass, and returns it as a standalone `NSImage`.
+/// Leaves `rep`'s `.currentFrame` set to `index` (caller may read frame-duration after).
+private func extractCleanFrame(_ rep: NSBitmapImageRep, index: Int,
+                                extraTransparent: [(UInt8, UInt8, UInt8)] = []) -> NSImage? {
+    rep.setProperty(.currentFrame, withValue: NSNumber(value: index))
+    guard let cg  = rep.cgImage(forProposedRect: nil, context: nil, hints: nil),
+          let ctx = makeBitmapContext(width: cg.width, height: cg.height)
+    else { return nil }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+    guard let ptr = ctx.data else { return nil }
+    let pixels = ptr.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
+    for j in 0 ..< cg.width * cg.height {
+        let o = j * 4
+        let r = pixels[o], g = pixels[o + 1], b = pixels[o + 2]
+        if isMagenta(r, g, b) ||
+           extraTransparent.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) {
+            pixels[o] = 0; pixels[o + 1] = 0; pixels[o + 2] = 0; pixels[o + 3] = 0
+        }
+    }
+    guard let clean = ctx.makeImage() else { return nil }
+    return NSImage(cgImage: clean, size: NSSize(width: cg.width, height: cg.height))
+}
 
 /// Decodes every frame of an animated GIF, strips magenta (and any extra transparent
 /// colours) from each frame via a CGContext pixel pass, then re-encodes as a new animated
