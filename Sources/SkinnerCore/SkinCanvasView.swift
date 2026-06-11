@@ -659,8 +659,9 @@ public final class SkinCanvasView: NSView {
     /// be drawn scaled (e.g. a view background drawn with `img.draw(in: bounds)`).
     /// Defaults to the MapData's own pixel dimensions (no scaling).
     ///
-    /// Row order: MapData stores rows in CGContext order (row 0 = visual bottom).
-    /// bgOpacity uses flipped view order (row 0 = visual top). The two are mirrored here.
+    /// Row order: MapData rows match flipped view order (row 0 = visual top),
+    /// same as every other MapData consumer (button/group/slider hit testing),
+    /// so row indices map straight across with no mirroring.
     private func paintMdIntoOpacity(md: MapData, ox: Int, oy: Int,
                                      dstW: Int = 0, dstH: Int = 0,
                                      imageKey: String,
@@ -672,24 +673,22 @@ public final class SkinCanvasView: NSView {
         for viewRow in 0 ..< destH {
             let vy = oy + viewRow
             guard vy >= 0, vy < bgHeight else { continue }
-            // viewRow 0 = visual top; CGContext row 0 = visual bottom → mirror
-            let srcVisRow = min(md.height - 1, viewRow * md.height / destH)
-            let cgRow     = md.height - 1 - srcVisRow
+            let srcRow = min(md.height - 1, viewRow * md.height / destH)
 
             for viewCol in 0 ..< destW {
                 let vx = ox + viewCol
                 guard vx >= 0, vx < bgWidth else { continue }
                 let srcCol = min(md.width - 1, viewCol * md.width / destW)
 
-                guard mask[cgRow * md.width + srcCol] else { continue }
+                guard mask[srcRow * md.width + srcCol] else { continue }
                 bgOpacity[vy * bgWidth + vx] = true
             }
         }
     }
 
     /// Recursively paints every subview's background image into the composite opacity
-    /// map. MapData rows are in CGContext order (row 0 = visual bottom); flipped view
-    /// coords use row 0 = visual top, so each row index is mirrored when stored.
+    /// map. MapData rows match flipped view order (row 0 = visual top), so row
+    /// indices map straight across — see `paintMdIntoOpacity`.
     private func paintBgOpacity(in elements: [SkinElement],
                                  lc: LayoutContext,
                                  offset: CGPoint) {
@@ -1811,10 +1810,15 @@ public final class SkinCanvasView: NSView {
             case .effects(let fx):
                 // No visibility check — always find the element so the provider can be
                 // created once and its show/hide state tracked dynamically in updateVisualizationView.
-                let x = (resolveCoord(fx.base.left,   lc: lc) ?? 0) + offset.x
-                let y = (resolveCoord(fx.base.top,    lc: lc) ?? 0) + offset.y
-                let w =  resolveCoord(fx.base.width,  lc: lc) ?? bounds.width
-                let h =  resolveCoord(fx.base.height, lc: lc) ?? bounds.height
+                // Some skins (e.g. Aquarium, da Vinci) reassign Visualizer.width/height
+                // directly in script (ShowVideo320 etc.), bypassing the WMS-declared
+                // jscript: expression. Prefer that live proxy value when present.
+                let x = liveCoord(fx.base.id, attr: fx.base.left,   propName: "left",   lc: lc) + offset.x
+                let y = liveCoord(fx.base.id, attr: fx.base.top,    propName: "top",    lc: lc) + offset.y
+                let w = (fx.base.id.flatMap { engine?.liveNumber(id: $0, property: "width") })
+                        ?? resolveCoord(fx.base.width,  lc: lc) ?? bounds.width
+                let h = (fx.base.id.flatMap { engine?.liveNumber(id: $0, property: "height") })
+                        ?? resolveCoord(fx.base.height, lc: lc) ?? bounds.height
                 let vizFrame = CGRect(x: x, y: y, width: w, height: h)
                 var topCovers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)] = []
                 var topSubviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = []
