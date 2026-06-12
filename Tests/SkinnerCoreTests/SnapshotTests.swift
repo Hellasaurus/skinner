@@ -16,7 +16,33 @@ struct SnapshotTests {
         .appendingPathComponent("Fixtures/SyntheticSkins")
 
     @Test @MainActor func transparencyFrameMatchesGolden() throws {
-        let fixtureDir = Self.fixturesRoot.appendingPathComponent("transparency")
+        try renderAndCompare(fixture: "transparency")
+    }
+
+    /// Regression test for the view-level `clippingColor` mask (`makeBgMask` +
+    /// `ctx.clip(to:mask:)` in `draw(_:)`). The fixture's background image is red on
+    /// top (the declared `clippingColor`, must be clipped to transparent) and green on
+    /// the bottom (must remain visible). `ctx.clip(to:mask:)` mirrors the mask
+    /// vertically relative to the destination in this `isFlipped` view, so if
+    /// `makeBgMask` ever drops its compensating row-flip again, the red half renders
+    /// instead of being clipped (and the green half vanishes).
+    @Test @MainActor func viewClippingColorFrameMatchesGolden() throws {
+        try renderAndCompare(fixture: "viewclip")
+    }
+
+    /// Regression test for buttongroup mapping masks (`makeGrayMask` /
+    /// `buildGroupAssets.fullMask`). The fixture's mapping image marks the top half as
+    /// a button region (`#00ff00`, matches the `<playelement>`'s `mappingColor`) and
+    /// the bottom half as magenta (excluded). The group's display image is blue on top
+    /// and yellow on bottom, so the fullMask must keep the blue top and clip the yellow
+    /// bottom. Same vertical-mirroring hazard as `viewClippingColorFrameMatchesGolden`.
+    @Test @MainActor func groupMaskFrameMatchesGolden() throws {
+        try renderAndCompare(fixture: "groupmask")
+    }
+
+    @MainActor
+    private func renderAndCompare(fixture: String) throws {
+        let fixtureDir = Self.fixturesRoot.appendingPathComponent(fixture)
         let bundle = try SkinLoader.load(from: fixtureDir)
         let theme = try WMSParser.parse(contentsOf: bundle.wmsFile)
         let view = try #require(theme.mainView)
@@ -36,6 +62,6 @@ struct SnapshotTests {
             .cgImage(forProposedRect: nil, context: nil, hints: nil))
 
         let diff = compareImages(rendered, golden, tolerance: 0)
-        #expect(diff.matches, "Rendered frame differs from golden_frame.png: \(diff)")
+        #expect(diff.matches, "Rendered frame for '\(fixture)' differs from golden_frame.png: \(diff)")
     }
 }

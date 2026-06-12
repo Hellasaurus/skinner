@@ -622,13 +622,17 @@ public final class SkinCanvasView: NSView {
 
     /// Converts the boolean `bgOpacity` map into a CGImage mask suitable for
     /// `CGContext.clip(to:mask:)`.  bgOpacity uses flipped coords (row 0 = visual
-    /// top); the mask is consumed in a flipped CGContext (isFlipped=true) where row 0
-    /// also lands at the visual top, so no row mirroring is needed.
+    /// top), but `ctx.clip(to:mask:)` mirrors the mask vertically relative to the
+    /// destination in this isFlipped view, so the mask bytes must be row-flipped here
+    /// to end up clipping the correct (visual-top-relative) rows on screen.
     private func makeBgMask() -> CGImage? {
         guard bgWidth > 0, bgHeight > 0 else { return nil }
         var bytes = [UInt8](repeating: 0, count: bgWidth * bgHeight)
-        for i in 0 ..< bgWidth * bgHeight {
-            bytes[i] = bgOpacity[i] ? 255 : 0
+        for row in 0 ..< bgHeight {
+            let srcRow = bgHeight - 1 - row
+            for x in 0 ..< bgWidth {
+                bytes[row * bgWidth + x] = bgOpacity[srcRow * bgWidth + x] ? 255 : 0
+            }
         }
         guard let space    = CGColorSpace(name: CGColorSpace.linearGray),
               let provider = CGDataProvider(data: Data(bytes) as CFData)
@@ -2050,8 +2054,15 @@ public final class SkinCanvasView: NSView {
                         if tcIsWhite, let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
                             found.maskImageName = bgName
                         } else if !tcIsWhite, sv.clippingColor != nil,
+                                  (directEffect.base?.zIndex ?? 0) >= 0,
                                   let tc = sv.base.transparencyColor, let holeRGB = parseAnyColor(tc),
                                   let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
+                            // Only valid when the <effects> frame is aligned with this subview's
+                            // background (e.g. AOM's visMask: effects left=0 top=0, same size as
+                            // vis_back.png) — the hole-mask samples the background image at the
+                            // viz frame's size, which is wrong if effects is offset/cropped within
+                            // a larger background (e.g. Cerulean's face.bmp, zIndex=-1 cover case
+                            // handled below).
                             found.maskImageName = bgName
                             found.maskHoleColor = holeRGB
                         } else if !tcIsWhite {
@@ -2625,6 +2636,10 @@ public final class SkinCanvasView: NSView {
         guard let engine else { stopMoveTimer(); return }
         let _ = engine.tickMoves()
         engine.fireOnEndMoveCallbacks()
+        // onEndMove handlers may queue new moveTo animations (e.g. chaining hop 2 of a
+        // two-hop screen toggle) — stamp their _t0 now so tickMoves() advances them on
+        // the next tick instead of leaving them stuck at _t0 == -1 forever.
+        engine.stampNewAnimationStartTimes()
         recollect()
         setNeedsDisplay(bounds)
         if !engine.hasActiveMoves {

@@ -1,0 +1,4 @@
+<theme id="synth_viewclip" title="View Clip Test" author="SkinnerTests">
+<view id="mainView" titleBar="false" backgroundColor="none" backgroundImage="background.png" clippingColor="#ff0000" width="32" height="32">
+</view>
+</theme>

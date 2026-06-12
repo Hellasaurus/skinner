@@ -267,16 +267,18 @@ private func buildGroupAssets(_ group: ButtonGroup,
         let base = i * 4
         let r = md.bytes[base], g = md.bytes[base + 1],
             b = md.bytes[base + 2], a = md.bytes[base + 3]
-        guard a > 128, !isMagenta(r, g, b),
-              !(r > 240 && g > 240 && b > 240)  // white = background in mapping images
-        else { continue }
-        fullRegion[i] = true
-        for color in parsedColors where colorMatches(r, g, b, color.r, color.g, color.b) {
-            if perButton[color.key] == nil {
-                perButton[color.key] = [Bool](repeating: false, count: md.width * md.height)
+        guard a > 128 else { continue }
+        // A pixel matching one of this group's mappingColors belongs to that button even
+        // if the colour happens to be magenta or white (e.g. a `#FF00FF` nextelement) —
+        // only fall back to the magenta/white "no button here" convention otherwise.
+        if let match = parsedColors.first(where: { colorMatches(r, g, b, $0.r, $0.g, $0.b) }) {
+            fullRegion[i] = true
+            if perButton[match.key] == nil {
+                perButton[match.key] = [Bool](repeating: false, count: md.width * md.height)
             }
-            perButton[color.key]![i] = true
-            break
+            perButton[match.key]![i] = true
+        } else if !isMagenta(r, g, b), !(r > 240 && g > 240 && b > 240) {
+            fullRegion[i] = true
         }
     }
 
@@ -331,11 +333,14 @@ private func loadMapData(url: URL) -> MapData? {
 // MARK: - Mask building
 
 private func makeGrayMask(region: [Bool], width: Int, height: Int) -> CGImage? {
+    // `region` is indexed in MapData row order (row 0 = visual top), but
+    // `ctx.clip(to:mask:)` mirrors the mask vertically relative to the destination
+    // in this isFlipped view, so the mask bytes must be row-flipped here.
     var bytes = [UInt8](repeating: 0, count: width * height)
-    for maskRow in 0 ..< height {
-        let srcRow = height - 1 - maskRow   // flip: CGContext draws bottom-up, view is flipped
+    for row in 0 ..< height {
+        let srcRow = height - 1 - row
         for x in 0 ..< width {
-            bytes[maskRow * width + x] = region[srcRow * width + x] ? 255 : 0
+            bytes[row * width + x] = region[srcRow * width + x] ? 255 : 0
         }
     }
     guard let space = CGColorSpace(name: CGColorSpace.linearGray) else { return nil }

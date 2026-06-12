@@ -1,0 +1,7 @@
+<theme id="synth_groupmask" title="Group Mask Test" author="SkinnerTests">
+<view id="mainView" titleBar="false" backgroundColor="none" width="32" height="16">
+<buttongroup id="grp" left="0" top="0" width="32" height="16" image="group_image.png" mappingImage="group_map.png">
+<playelement mappingColor="#00ff00" />
+</buttongroup>
+</view>
+</theme>
