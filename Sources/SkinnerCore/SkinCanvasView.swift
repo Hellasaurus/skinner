@@ -917,10 +917,27 @@ public final class SkinCanvasView: NSView {
                 let clipW = lc.resolve(sv.base.width)
                 let clipH = lc.resolve(sv.base.height)
                 let needsClip = clipW != nil && clipH != nil
-                let needsGState = needsClip || needsAlpha
+                // A backgroundImage + clippingColor pair defines a shaped region (e.g. an
+                // irregular window silhouette) — clip this subview's whole subtree to that
+                // shape so children don't paint into the "outside" pixels (e.g. Combat
+                // Flight Simulator 3's mainBody/mainJPG: main_bg.jpg's rectangular corners
+                // would otherwise cover the transparent area outside the cockpit silhouette).
+                let shapeMask: (mask: CGImage, size: CGSize)? = sv.clippingColor.flatMap { _ in
+                    sv.backgroundImage.flatMap { name in
+                        guard let mask = cache.subviewShapeMasks[name.lowercased()],
+                              let size = cache.images[name.lowercased()]?.size
+                        else { return nil }
+                        return (mask, size)
+                    }
+                }
+                let needsGState = needsClip || needsAlpha || shapeMask != nil
                 if needsGState { ctx.saveGState() }
                 if needsClip {
                     ctx.clip(to: CGRect(x: sx, y: sy, width: clipW!, height: clipH!))
+                }
+                if let shapeMask {
+                    ctx.clip(to: CGRect(x: sx, y: sy, width: shapeMask.size.width, height: shapeMask.size.height),
+                             mask: shapeMask.mask)
                 }
                 if needsAlpha {
                     ctx.setAlpha(CGFloat(alpha) / 255.0)

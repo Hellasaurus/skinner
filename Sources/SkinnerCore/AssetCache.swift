@@ -38,6 +38,13 @@ public final class AssetCache {
     /// CGImage alpha masks built from `clippingImage` files (non-transparent pixels → 255).
     /// Used to clip button and buttonGroup drawing to the skin's shaped regions.
     public let clipMasks: [String: CGImage]
+    /// CGImage alpha masks for subviews whose `backgroundImage` + `clippingColor` define an
+    /// irregular shape (e.g. a window silhouette). Keyed by lowercased backgroundImage
+    /// filename. Used to clip such a subview's entire subtree (its own background draw and
+    /// all children) to the shape, so content doesn't spill into the "clipped away" pixels
+    /// (e.g. Combat Flight Simulator 3's mainBody, whose mainJPG child otherwise paints its
+    /// rectangular main_bg.jpg over the silhouette's transparent corners).
+    public let subviewShapeMasks: [String: CGImage]
 
     /// Returns pre-built mask assets for the given mapping image filename, or `nil` if not found.
     public func buttonGroupAssets(forMappingImage name: String?) -> ButtonGroupAssets? {
@@ -49,12 +56,14 @@ public final class AssetCache {
                  mapData: [String: MapData],
                  buttonGroupsByMappingImage: [String: ButtonGroupAssets],
                  clipImageNames: Set<String>,
-                 clipMasks: [String: CGImage]) {
+                 clipMasks: [String: CGImage],
+                 subviewShapeMasks: [String: CGImage]) {
         self.images = images
         self.mapData = mapData
         self.buttonGroupsByMappingImage = buttonGroupsByMappingImage
         self.clipImageNames = clipImageNames
         self.clipMasks = clipMasks
+        self.subviewShapeMasks = subviewShapeMasks
     }
 
     // MARK: - Factory
@@ -125,10 +134,24 @@ public final class AssetCache {
             }
         }
 
+        // Subviews whose backgroundImage doubles as a shape mask (clippingColor set): build
+        // a clip mask so drawElements can confine the subview's whole subtree to that shape.
+        var shapeNames = Set<String>()
+        for view in theme.views {
+            collectSubviewShapeNames(from: view.elements, into: &shapeNames)
+        }
+        var subviewShapeMasks: [String: CGImage] = [:]
+        for name in shapeNames {
+            if let md = mapData[name], let mask = buildClipMask(from: md) {
+                subviewShapeMasks[name] = mask
+            }
+        }
+
         return AssetCache(images: images, mapData: mapData,
                           buttonGroupsByMappingImage: groupsByMappingImage,
                           clipImageNames: clipNames,
-                          clipMasks: clipMasks)
+                          clipMasks: clipMasks,
+                          subviewShapeMasks: subviewShapeMasks)
     }
 }
 
@@ -224,6 +247,21 @@ private func collectClipImageNames(from elements: [SkinElement], into set: inout
             collectClipImageNames(from: sv.children, into: &set)
         default: break
         }
+    }
+}
+
+// MARK: - Subview shape mask name collection
+
+/// A subview with both a `backgroundImage` and a `clippingColor` defines a shaped region
+/// (e.g. an irregular window silhouette, like Combat Flight Simulator 3's mainBody). Collects
+/// such backgroundImage filenames so a clip mask can be built for each.
+private func collectSubviewShapeNames(from elements: [SkinElement], into set: inout Set<String>) {
+    for element in elements {
+        guard case .subview(let sv) = element else { continue }
+        if sv.clippingColor != nil, let name = sv.backgroundImage {
+            set.insert(name.lowercased())
+        }
+        collectSubviewShapeNames(from: sv.children, into: &set)
     }
 }
 
