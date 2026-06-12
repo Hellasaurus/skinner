@@ -878,6 +878,29 @@ public final class SkinCanvasView: NSView {
                         ?? 0
                     if elemW > 0 { sx = offset.x + (lc.viewWidth - elemW) / 2 }
                 }
+                // A backgroundTiled strut positioned via left="wmpprop:XCenter.left"
+                // (T3-Skynet's f_top_s/f_bot_s) aliases the left edge of a centered sibling
+                // (XCenter, e.g. f_top_center/f_bot_center, the "T3" logo). "<id>.left" isn't
+                // an exposed live property, so liveCoord falls back to 0 — compute the
+                // referenced sibling's center position directly instead. Such a strut has no
+                // explicit width and isn't itself horizontalAlignment="stretch", but is meant
+                // to stretch from the sibling's left edge to the row's right bound: the
+                // sibling (higher zIndex) then covers its own footprint, leaving only the
+                // strip to its right visible — i.e. the strut tiles on the right side of the logo.
+                var aliasesCenterSibling = false
+                if sv.backgroundTiled, case .wmpProp(let expr)? = sv.base.left, expr.hasSuffix(".left") {
+                    let refID = String(expr.dropLast(".left".count))
+                    if case .subview(let siblingSV)? = elements.first(where: { e in
+                        if case .subview(let s) = e { return s.base.id == refID && s.base.horizontalAlignment == .center }
+                        return false
+                    }) {
+                        let siblingW = lc.resolve(siblingSV.base.width)
+                            ?? siblingSV.backgroundImage.flatMap { cache.images[$0.lowercased()]?.size.width }
+                            ?? 0
+                        sx = offset.x + (lc.viewWidth - siblingW) / 2
+                        aliasesCenterSibling = true
+                    }
+                }
                 let childOffset = CGPoint(x: sx, y: sy)
                 let alpha = effectiveAlpha(for: sv.base)
                 let needsAlpha = alpha < 255
@@ -934,16 +957,26 @@ public final class SkinCanvasView: NSView {
                         // size while Displaybg.gif/Displaybg2.gif are 105x105. Only honor an
                         // explicit size that's <= native (legitimate downscale/crop) or when
                         // tiling/stretch-alignment is explicitly requested.
+                        // Only consider right-aligned anchors starting at the same row (top
+                        // coordinate) as this piece — e.g. T3-Skynet's f_bot_right (left=
+                        // view.width-130) and a floating overlay button (left=view.width-108,
+                        // top=11) both sit further left than f_top_right/f_right_s (left=
+                        // view.width-55, top=0), so without this check a top-row stretch picks
+                        // one of their smaller bounds and falls short of the actual right border.
+                        func rowRightBound() -> CGFloat {
+                            elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.base.horizontalAlignment == .right,
+                                      liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y == sy
+                                else { return nil }
+                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                            }.min() ?? lc.viewWidth
+                        }
                         let w: CGFloat
                         if let explicitW = lc.resolve(sv.base.width),
                            explicitW <= img.size.width || sv.backgroundTiled {
                             w = explicitW
-                        } else if sv.base.horizontalAlignment == .stretch {
-                            let rightBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.horizontalAlignment == .right else { return nil }
-                                return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
-                            }.min() ?? lc.viewWidth
-                            w = max(0, rightBound - sx)
+                        } else if sv.base.horizontalAlignment == .stretch || aliasesCenterSibling {
+                            w = max(0, rowRightBound() - sx)
                         } else {
                             w = img.size.width
                         }
@@ -957,6 +990,24 @@ public final class SkinCanvasView: NSView {
                                 return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
                             }.min() ?? lc.viewHeight
                             h = max(0, botBound - sy)
+                        } else if sv.backgroundTiled {
+                            // A backgroundTiled strut with no explicit size normally matches its
+                            // image's native height (e.g. Half-Life 2's f_top_s == f_top_left's
+                            // height). Some skins (T3-Skynet) ship a strut image taller than the
+                            // border row it fills, with the extra height being unused filler —
+                            // clamp to the row height defined by non-tiled anchors (corner/center
+                            // pieces) starting at the same y, so the filler doesn't paint over
+                            // the next row's content.
+                            let anchorHeights = elements.compactMap { e -> CGFloat? in
+                                guard case .subview(let s) = e, s.backgroundTiled != true,
+                                      !elementIsHidden(s.base, live: true),
+                                      liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y == sy,
+                                      let sName = s.backgroundImage,
+                                      let sImg = cache.images[sName.lowercased()]
+                                else { return nil }
+                                return lc.resolve(s.base.height) ?? sImg.size.height
+                            }
+                            h = anchorHeights.filter { $0 < img.size.height }.min() ?? img.size.height
                         } else {
                             h = img.size.height
                         }
@@ -1605,6 +1656,19 @@ public final class SkinCanvasView: NSView {
             }
         }
         if changed { setNeedsDisplay(bounds) }
+
+        // Update slider tooltip (e.g. EQ band labels like "31hz").
+        var sliderTip: String? = nil
+        for i in sliders.indices.reversed() {
+            guard !elementIsHidden(sliders[i].model.base, live: true),
+                  ancestorsVisible(sliders[i].ancestorBases),
+                  !ancestorsPassThrough(sliders[i].ancestorBases),
+                  elementIsEnabled(sliders[i].model.base),
+                  sliders[i].frame.contains(pt) else { continue }
+            sliderTip = sliders[i].model.base.toolTip
+            break
+        }
+        if self.toolTip != sliderTip { self.toolTip = sliderTip }
     }
 
     // MARK: - Keyboard
@@ -1662,6 +1726,7 @@ public final class SkinCanvasView: NSView {
             texts[i].isHovered = false; changed = true
         }
         if changed { setNeedsDisplay(bounds) }
+        self.toolTip = nil
     }
 
     // MARK: - Actions
@@ -1751,12 +1816,13 @@ public final class SkinCanvasView: NSView {
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         let viewBgImg   = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
         let viewBgFrame = viewBgImg.map { CGRect(origin: .zero, size: $0.size) }
-        if let (fx, frame, covers, subviewCovers, ancestorAlpha, maskImageName) = findEffects(
+        if let (fx, frame, covers, subviewCovers, ancestorAlpha, maskImageName, maskHoleColor) = findEffects(
             in: skinView.elements, offset: .zero, lc: lc2,
             parentBgImage: viewBgImg, parentBgFrame: viewBgFrame
         ) {
             updateVisualizationView(for: fx, frame: frame, covers: covers, subviewCovers: subviewCovers,
-                                    ancestorAlpha: ancestorAlpha, maskImageName: maskImageName)
+                                    ancestorAlpha: ancestorAlpha, maskImageName: maskImageName,
+                                    maskHoleColor: maskHoleColor)
         }
     }
 
@@ -1836,7 +1902,7 @@ public final class SkinCanvasView: NSView {
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, maskImageName: String?)? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -1897,7 +1963,7 @@ public final class SkinCanvasView: NSView {
                     }
                 }
                 return (fx, vizFrame, covers: topCovers, subviewCovers: topSubviewCovers,
-                        ancestorAlpha: 255, maskImageName: fx.clippingImage?.lowercased())
+                        ancestorAlpha: 255, maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil)
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -1963,8 +2029,14 @@ public final class SkinCanvasView: NSView {
                     //    - White (#FFFFFF): colored pixels = screen area (show viz), white = background
                     //      (hide viz). Use a CALayer mask so the viz only renders inside the colored region.
                     //      e.g. viz_mask.gif in Elvis, viz_screen.gif in Heart_Butterfly.
-                    //    - Magenta/other: transparent holes = screen area (show viz), opaque = frame.
-                    //      Use a cover NSImageView above the viz.
+                    //    - Non-white + clippingColor set: the backgroundImage's transparencyColor pixels
+                    //      mark the screen area (show viz) and its clippingColor pixels mark frame art
+                    //      that must stay on top of the viz. Use a CALayer "hole" mask (transparencyColor
+                    //      pixels show the viz; everything else hides it, revealing the CGContext-drawn
+                    //      frame beneath). e.g. vis_back.png in Age of Mythology (transparencyColor=
+                    //      #ff00ff, clippingColor=#ffffff).
+                    //    - Non-white, no clippingColor: transparent holes = screen area (show viz),
+                    //      opaque = frame. Use a cover NSImageView above the viz.
                     //      e.g. vis_mask.png in Blinx, VisBG.gif in deepbluesomething.
                     if let img = svBgImg,
                        let directEffect = sv.children.first(where: { if case .effects = $0 { return true }; return false }),
@@ -1977,7 +2049,12 @@ public final class SkinCanvasView: NSView {
                         }
                         if tcIsWhite, let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
                             found.maskImageName = bgName
-                        } else if !tcIsWhite || found.maskImageName == nil {
+                        } else if !tcIsWhite, sv.clippingColor != nil,
+                                  let tc = sv.base.transparencyColor, let holeRGB = parseAnyColor(tc),
+                                  let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
+                            found.maskImageName = bgName
+                            found.maskHoleColor = holeRGB
+                        } else if !tcIsWhite {
                             found.covers.append((subview: sv, bgImage: img, frame: svBgFrame, drawRect: svBgFrame))
                         }
                     }
@@ -2040,7 +2117,8 @@ public final class SkinCanvasView: NSView {
         covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)],
         subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = [],
         ancestorAlpha: Int = 255,
-        maskImageName: String? = nil
+        maskImageName: String? = nil,
+        maskHoleColor: (UInt8, UInt8, UInt8)? = nil
     ) {
         if vizProvider == nil, let provider = prebuiltVisualizationProvider ?? makeVisualizationProvider?() {
             vizProvider  = provider
@@ -2067,9 +2145,13 @@ public final class SkinCanvasView: NSView {
             // works correctly in a layer-backed hierarchy when wantsBestResolutionOpenGLSurface=true
             // is set (which configure() does before creating the OpenGL context).
             let resolvedMaskName = maskImageName ?? (cache.mapData["vis_mask.gif"] != nil ? "vis_mask.gif" : nil)
-            if let name = resolvedMaskName,
-               let md = cache.mapData[name],
-               let maskImg = buildVisMaskLayerImage(from: md, targetSize: frame.size) {
+            let resolvedMaskImg: CGImage? = resolvedMaskName.flatMap { cache.mapData[$0] }.flatMap { md in
+                if let holeColor = maskHoleColor {
+                    return buildHoleMaskLayerImage(from: md, holeColor: holeColor, targetSize: frame.size)
+                }
+                return buildVisMaskLayerImage(from: md, targetSize: frame.size)
+            }
+            if let maskImg = resolvedMaskImg {
                 container.wantsLayer = true
                 if let layer = container.layer {
                     let maskLayer = CALayer()
@@ -2118,6 +2200,15 @@ public final class SkinCanvasView: NSView {
             vizCoverInfos[i].frame           = cover.frame
             vizCoverInfos[i].drawRect        = cover.drawRect
             vizCoverInfos[i].imageView.frame = cover.frame
+        }
+        // Image covers are matched by position, but the `covers` array can shrink between
+        // calls (e.g. aomLogo drops out once its `visible` becomes false via script).
+        // Collapse any now-unmatched trailing image-cover slots to a zero frame so their
+        // stale NSImageViews stop drawing.
+        for i in vizCoverInfos.indices where i >= covers.count && !vizCoverInfos[i].isFullSubviewCover {
+            vizCoverInfos[i].frame           = .zero
+            vizCoverInfos[i].drawRect        = .zero
+            vizCoverInfos[i].imageView.frame = .zero
         }
         // Whole-subtree covers are matched by subview id rather than position, since a
         // sibling can appear/disappear from `subviewCovers` as it moves in and out of the
@@ -2170,6 +2261,39 @@ public final class SkinCanvasView: NSView {
                 guard si + 3 < md.bytes.count else { continue }
                 let r = md.bytes[si], g = md.bytes[si+1], b = md.bytes[si+2], a = md.bytes[si+3]
                 let visible = a > 10 && !isMagenta(r, g, b) && !(r > 240 && g > 240 && b > 240)
+                let alpha: UInt8 = visible ? 255 : 0
+                let di = (dstRow * tw + dstCol) * 4
+                bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
+            }
+        }
+        guard let space    = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: tw, height: th,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: tw * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// Builds an RGBA CGImage suitable for use as a `CALayer.mask` contents, where pixels
+    /// matching `holeColor` (the "screen" hole, e.g. transparencyColor) become opaque (show
+    /// the viz) and all other pixels become alpha=0 (hide the viz, revealing the
+    /// CGContext-drawn frame art beneath). Inverse of `buildVisMaskLayerImage`. Rows are
+    /// flipped to match the top-down coordinate system of macOS NSView backing layers
+    /// (isGeometryFlipped=true).
+    private func buildHoleMaskLayerImage(from md: MapData, holeColor: (UInt8, UInt8, UInt8), targetSize: CGSize) -> CGImage? {
+        let tw = max(1, Int(targetSize.width))
+        let th = max(1, Int(targetSize.height))
+        var bytes = [UInt8](repeating: 0, count: tw * th * 4)
+        for dstRow in 0 ..< th {
+            let srcRow = (dstRow * md.height / th)
+            for dstCol in 0 ..< tw {
+                let srcCol = min(md.width - 1, dstCol * md.width / tw)
+                let si = (srcRow * md.width + srcCol) * 4
+                guard si + 3 < md.bytes.count else { continue }
+                let r = md.bytes[si], g = md.bytes[si+1], b = md.bytes[si+2], a = md.bytes[si+3]
+                let visible = a > 10 && colorMatches(r, g, b, holeColor.0, holeColor.1, holeColor.2)
                 let alpha: UInt8 = visible ? 255 : 0
                 let di = (dstRow * tw + dstCol) * 4
                 bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
