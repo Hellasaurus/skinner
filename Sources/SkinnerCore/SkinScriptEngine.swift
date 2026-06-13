@@ -4,9 +4,29 @@ import Foundation
 import UniformTypeIdentifiers
 @preconcurrency import Combine
 
+// MARK: - SkinPreferences
+
+/// Shared `theme.savePreference`/`loadPreference` store for one skin session.
+/// WMP skins use these to relay state (e.g. a color-scheme choice made in the main
+/// view) to other views' periodic `onTimer` polls — each view runs its own
+/// `SkinScriptEngine`/JSContext, so the store must be shared by reference across them.
+public final class SkinPreferences {
+    private var values: [String: String] = [:]
+
+    public init() {}
+
+    func load(_ key: String) -> String {
+        values[key.lowercased()] ?? "--"
+    }
+
+    func save(_ key: String, _ value: String) {
+        values[key.lowercased()] = value
+    }
+}
+
 // MARK: - ElementScriptState
 
-struct ElementScriptState {
+struct ElementScriptState: Equatable {
     var visible: Bool?
     var backgroundImage: String?
     var alphaBlend: Int?
@@ -18,12 +38,23 @@ struct ElementScriptState {
     var value: String?       // text element value set via JS (e.g. metadata.value = ...)
     var down: Bool?          // sticky button toggle state (element.down = true/false/"true"/"false")
     var foregroundColor: String? // text element foregroundColor set via JS
+    var foregroundImage: String? // slider foregroundImage override (e.g. toggleTexture color swaps)
 
     var isEmpty: Bool {
         visible == nil && backgroundImage == nil && alphaBlend == nil
             && enabled == nil && image == nil && hoverImage == nil && downImage == nil
             && disabledImage == nil && value == nil && down == nil && foregroundColor == nil
+            && foregroundImage == nil
     }
+}
+
+/// One frame of the skin's real-time startup sequence: the per-element state that
+/// was in effect just before an `onTimer` tick fired during the init pump, plus how
+/// long (in seconds) that state should be shown before advancing to the next step
+/// (or, for the last step, before the converged/final state takes over).
+struct StartupAnimationStep {
+    let states: [String: ElementScriptState]
+    let duration: TimeInterval
 }
 
 // MARK: - SkinScriptEngine
@@ -47,6 +78,15 @@ final class SkinScriptEngine {
     private var stateCache: [String: ElementScriptState?] = [:]
     private let bundleDirectory: URL
     private var soundCache: [String: NSSound] = [:]
+    private let preferences: SkinPreferences
+
+    // Captured during the init pump: each step is a (states, duration) snapshot of an
+    // onTimer tick's "before" state, used to replay the skin's real-time startup
+    // animation (e.g. CFS3's intro gif → shutter-open gif → ready) in the live app.
+    private(set) var startupSteps: [StartupAnimationStep] = []
+    // When set, state(for:) returns this snapshot instead of the converged live state —
+    // used by SkinCanvasView to render a startup-animation step. nil = converged state.
+    private var stateOverride: [String: ElementScriptState]?
 
     var onOpenView:    ((String) -> Void)?
     var onCloseView:   ((String) -> Void)?
@@ -70,18 +110,19 @@ final class SkinScriptEngine {
 
     // IDs used by host stubs — element proxies must not overwrite these.
     private static let hostIds: Set<String> = [
-        "view", "player", "theme", "mediacenter", "event", "_prefs", "_EP"
+        "view", "player", "theme", "mediacenter", "event", "_EP"
     ]
 
     // MARK: - Init
 
-    init?(skinView: SkinView, bundle: SkinBundle) {
+    init?(skinView: SkinView, bundle: SkinBundle, preferences: SkinPreferences = SkinPreferences()) {
         guard let scriptFile = skinView.scriptFile, !scriptFile.isEmpty else { return nil }
         guard let ctx = JSContext() else { return nil }
         self.context = ctx
         self.bundleDirectory = bundle.directory
         self.playerCallbacks = skinView.player
         self.onTimerHandler = skinView.onTimer
+        self.preferences = preferences
 
         ctx.exceptionHandler = { _, exc in
             // Skin scripts routinely access WMP internals we don't implement;
@@ -117,11 +158,28 @@ final class SkinScriptEngine {
         }
         if let interval = skinView.timerInterval, interval > 0,
            let handler  = skinView.onTimer, !handler.isEmpty {
+            var stepDuration = TimeInterval(interval) / 1000.0
             for _ in 0 ..< 1024 {
+                startupSteps.append(StartupAnimationStep(states: snapshotElementStates(), duration: stepDuration))
                 ctx.evaluateScript("try { \(handler) } catch(e) {}")
-                if let ti = ctx.evaluateScript("view.timerInterval"),
-                   ti.isNumber, ti.toInt32() == 0 { break }
+                guard let ti = ctx.evaluateScript("view.timerInterval"), ti.isNumber else { break }
+                let newInterval = ti.toInt32()
+                if newInterval == 0 { break }
+                stepDuration = TimeInterval(newInterval) / 1000.0
             }
+            // Trim a converged/no-op tail: some intros (e.g. Batman's onViewTimer) never
+            // set view.timerInterval = 0, they just keep re-running an idle else-branch
+            // once the intro flag flips, so the loop runs all 1024 iterations with the
+            // last N steps identical. Indefinite live pollers (e.g. plView's checkBluePL,
+            // which polls theme prefs every second) converge to a single repeated state
+            // after their first tick. Either way, trailing duplicates carry no animation
+            // and would otherwise bloat the replay (or, for pollers, make it run ~17min).
+            while startupSteps.count > 1,
+                  startupSteps[startupSteps.count - 1].states == startupSteps[startupSteps.count - 2].states {
+                startupSteps.removeLast()
+            }
+            // A single step means the state never changed — no real animation to replay.
+            if startupSteps.count <= 1 { startupSteps.removeAll() }
         }
         // Allow runtime moveTo calls to animate; init-time moves were already instant.
         ctx.evaluateScript("_skinnerInitializing = false")
@@ -328,6 +386,7 @@ final class SkinScriptEngine {
     }
 
     func state(for id: String) -> ElementScriptState? {
+        if let override = stateOverride { return override[id] }
         if let cached = stateCache[id] { return cached }
         guard let proxy = proxies[id] else {
             stateCache[id] = .some(nil)
@@ -345,6 +404,7 @@ final class SkinScriptEngine {
         s.value           = stringProp(proxy, "value")
         s.down            = downProp(proxy,   "down")
         s.foregroundColor = stringProp(proxy, "foregroundColor")
+        s.foregroundImage = stringProp(proxy, "foregroundImage")
         let result: ElementScriptState? = s.isEmpty ? nil : s
         stateCache[id] = .some(result)
         return result
@@ -352,6 +412,24 @@ final class SkinScriptEngine {
 
     private func invalidateStateCache() {
         stateCache.removeAll()
+    }
+
+    /// Snapshots state(for:) across every registered element, for capture into a
+    /// StartupAnimationStep. Must run with stateOverride == nil (only called from
+    /// the init pump, before any override is installed).
+    private func snapshotElementStates() -> [String: ElementScriptState] {
+        invalidateStateCache()
+        var result: [String: ElementScriptState] = [:]
+        for id in proxies.keys {
+            if let s = state(for: id) { result[id] = s }
+        }
+        return result
+    }
+
+    /// Overrides state(for:) to replay a captured startup-animation step (or, when
+    /// nil, restore the converged live state). See `startupSteps`.
+    func setStartupOverride(_ states: [String: ElementScriptState]?) {
+        stateOverride = states
     }
 
     // MARK: - WMP constants + element prototype
@@ -463,6 +541,16 @@ final class SkinScriptEngine {
             }
         }
         ctx.setObject(prefChangeBridge, forKeyedSubscript: "_skinnerOnPrefChange" as NSString)
+
+        let loadPrefBridge: @convention(block) (String) -> String = { [weak self] key in
+            MainActor.assumeIsolated { self?.preferences.load(key) ?? "--" }
+        }
+        ctx.setObject(loadPrefBridge, forKeyedSubscript: "_skinnerLoadPref" as NSString)
+
+        let savePrefBridge: @convention(block) (String, String) -> Void = { [weak self] key, value in
+            MainActor.assumeIsolated { self?.preferences.save(key, value) }
+        }
+        ctx.setObject(savePrefBridge, forKeyedSubscript: "_skinnerSavePref" as NSString)
 
         let openDialogBridge: @convention(block) (String, String) -> String = { _, _ in
             MainActor.assumeIsolated {
@@ -576,12 +664,11 @@ final class SkinScriptEngine {
 
         // theme — openView/closeView call back into Swift via the bridges above.
         ctx.evaluateScript("""
-        var _prefs = {};
         var theme = {
-            loadPreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
-            loadpreference:  function(k) { var v = _prefs[k.toLowerCase()]; return v !== undefined ? v : "--"; },
-            savePreference:  function(k, v) { var lk=k.toLowerCase(), sv=String(v); _prefs[lk]=sv; _skinnerOnPrefChange(lk,sv); },
-            savepreference:  function(k, v) { var lk=k.toLowerCase(), sv=String(v); _prefs[lk]=sv; _skinnerOnPrefChange(lk,sv); },
+            loadPreference:  function(k) { return _skinnerLoadPref(String(k)); },
+            loadpreference:  function(k) { return _skinnerLoadPref(String(k)); },
+            savePreference:  function(k, v) { var sv=String(v); _skinnerSavePref(String(k), sv); _skinnerOnPrefChange(String(k).toLowerCase(), sv); },
+            savepreference:  function(k, v) { var sv=String(v); _skinnerSavePref(String(k), sv); _skinnerOnPrefChange(String(k).toLowerCase(), sv); },
             loadString:      function(res) { return ""; },
             loadstring:      function(res) { return ""; },
             openView:        function(id) { _skinnerOpenView(id); },
@@ -694,7 +781,17 @@ final class SkinScriptEngine {
             if case .literal(let s) = b.top,    let v = Double(s) { proxy.setValue(v,   forProperty: "top") }
             if case .literal(let s) = b.width,  let v = Double(s) { proxy.setValue(v,   forProperty: "width") }
             if case .literal(let s) = b.height, let v = Double(s) { proxy.setValue(v,   forProperty: "height") }
-            if let vis = b.visible, let bv = vis.boolValue        { proxy.setValue(bv,  forProperty: "visible") }
+            // WMS elements with no `visible` attribute are visible by default. Seed the
+            // proxy's `visible` to `true` in that case so JS reads like `!mainIntro.visible`
+            // (CFS3's mainTimer) see `true`/`false` instead of `undefined` (where `!undefined`
+            // is `true`, sending the script down the wrong branch). Elements with a dynamic
+            // `visible` (wmpenabled:/jscript:) are left unset so elementIsHidden() falls
+            // through to evaluating the WMS binding live instead of this static seed.
+            if let vis = b.visible {
+                if let bv = vis.boolValue { proxy.setValue(bv, forProperty: "visible") }
+            } else {
+                proxy.setValue(true, forProperty: "visible")
+            }
             if let alpha = b.alphaBlend { proxy.setValue(alpha, forProperty: "alphaBlend") }
         }
         if let script = onEndMove, !script.isEmpty { proxy.setValue(script, forProperty: "_onEndMove") }

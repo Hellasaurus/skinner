@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var theme:  Theme?
     private var cache:  AssetCache?
     private var bundle: SkinBundle?
+    private var preferences: SkinPreferences?
     private var secondaryWindows: [String: SkinWindow] = [:]
     private var player: AVFoundationPlayer?
     private(set) var currentSkinURL: URL?
@@ -71,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             theme  = t
             cache  = c
             bundle = b
+            preferences = SkinPreferences()
             currentSkinURL = url
 
             if player == nil { player = AVFoundationPlayer() }
@@ -78,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             if sharedViz == nil { sharedViz = VisualizationView() }
 
-            let canvas = makeCanvas(skinView: view, cache: c, bundle: b)
+            let canvas = makeCanvas(skinView: view, cache: c, bundle: b, preferences: preferences)
             canvas.prebuiltVisualizationProvider = sharedViz
             let mainId = view.id
             canvas.onCloseView = { [weak self] id in
@@ -103,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let skinView = theme?.views.first(where: { $0.id == viewId }),
               let cache, let bundle else { return }
-        let canvas = makeCanvas(skinView: skinView, cache: cache, bundle: bundle)
+        let canvas = makeCanvas(skinView: skinView, cache: cache, bundle: bundle, preferences: preferences)
         canvas.makeVisualizationProvider = { VisualizationView() }
         canvas.onCloseView = { [weak self] id in self?.closeSecondaryView(id) }
         if let player { canvas.setPlayerBackend(player) }
@@ -123,10 +125,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func makeCanvas(skinView: SkinView, cache: AssetCache, bundle: SkinBundle) -> SkinCanvasView {
-        let canvas = SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
+    private func makeCanvas(skinView: SkinView, cache: AssetCache, bundle: SkinBundle, preferences: SkinPreferences? = nil) -> SkinCanvasView {
+        let canvas = preferences.map { SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle, preferences: $0) }
+            ?? SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
         canvas.onOpenView   = { [weak self] id in self?.openSecondaryView(id) }
         canvas.onDroppedURL = { [weak self] url in self?.openMedia(url) }
+        canvas.beginStartupAnimation()
         return canvas
     }
 

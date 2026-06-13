@@ -49,6 +49,10 @@ public final class SkinCanvasView: NSView {
     private var animatedButtonViews:           [String: NSImageView]            = [:]
     private var animatedButtonBases:           [String: ElementBase]            = [:]
     private var animatedButtonAncestors:       [String: [ElementBase]]          = [:]
+    private var animatedButtonCurrentImage:    [String: String]                 = [:]
+    // Set while replaying a startup-animation step; index into engine.startupSteps,
+    // or nil once the sequence has finished (engine is showing converged state).
+    private var startupAnimationStepIndex: Int?
     /// Buttongroup hover-flash overlays (e.g. animated `hoverImage` GIFs). Keyed by group index.
     private var groupHoverViews:               [String: NSImageView]            = [:]
     private var groupHoverTimers:              [String: Timer]                  = [:]
@@ -207,6 +211,24 @@ public final class SkinCanvasView: NSView {
         for (id, iv) in animatedButtonViews {
             guard let base = animatedButtonBases[id] else { continue }
             let ancestors = animatedButtonAncestors[id] ?? []
+            // Swap to a JS-assigned animated gif (e.g. mainShutter.image = "..._open.gif"
+            // during CFS3's startup-animation replay) and replay it once from frame 0.
+            if let newName = engine?.state(for: id)?.image?.lowercased(),
+               newName != animatedButtonCurrentImage[id],
+               newName.hasSuffix(".gif"),
+               let bundle,
+               let raw = NSImage(contentsOf: bundle.assetURL(named: newName)),
+               gifIsAnimated(raw) {
+                let img = loadGifMagentaFree(url: bundle.assetURL(named: newName)) ?? raw
+                iv.image    = img
+                iv.animates = true
+                animatedButtonCurrentImage[id] = newName
+                if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak iv] in
+                        iv?.animates = false
+                    }
+                }
+            }
             iv.isHidden = elementIsHidden(base, live: true) || !ancestorsVisible(ancestors)
         }
     }
@@ -277,7 +299,7 @@ public final class SkinCanvasView: NSView {
 
     // MARK: - Init
 
-    public init(skinView: SkinView, cache: AssetCache, bundle: SkinBundle? = nil) {
+    public init(skinView: SkinView, cache: AssetCache, bundle: SkinBundle? = nil, preferences: SkinPreferences = SkinPreferences()) {
         self.skinView = skinView
         self.cache    = cache
         self.bundle   = bundle                 // stored before super.init (let property)
@@ -293,7 +315,7 @@ public final class SkinCanvasView: NSView {
         if let minH = sizeCtx.resolve(skinView.minHeight) { h = max(h, minH) }
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
 
-        engine = bundle.flatMap { SkinScriptEngine(skinView: skinView, bundle: $0) }
+        engine = bundle.flatMap { SkinScriptEngine(skinView: skinView, bundle: $0, preferences: preferences) }
         engine?.onStartResize = { [weak self] mode in
             guard let self, let win = self.window else { return }
             self.resizeDragState = (startPt: NSEvent.mouseLocation, startFrame: win.frame)
@@ -1363,7 +1385,8 @@ public final class SkinCanvasView: NSView {
            let bg = cache.images[bgName.lowercased()] {
             drawSliderTrackImage(bg, in: frame, isVertical: isVertical, tiled: slider.model.tiled)
         }
-        if let trackName = slider.model.foregroundImage,
+        let jsForeground = slider.model.base.id.flatMap { engine?.state(for: $0)?.foregroundImage }
+        if let trackName = jsForeground ?? slider.model.foregroundImage,
            let track = cache.images[trackName.lowercased()] {
             track.draw(in: frame)
         }
@@ -1837,13 +1860,13 @@ public final class SkinCanvasView: NSView {
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         let viewBgImg   = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
         let viewBgFrame = viewBgImg.map { CGRect(origin: .zero, size: $0.size) }
-        if let (fx, frame, covers, subviewCovers, ancestorAlpha, maskImageName, maskHoleColor) = findEffects(
+        if let (fx, frame, covers, subviewCovers, ancestorAlpha, ancestorHidden, maskImageName, maskHoleColor) = findEffects(
             in: skinView.elements, offset: .zero, lc: lc2,
             parentBgImage: viewBgImg, parentBgFrame: viewBgFrame
         ) {
             updateVisualizationView(for: fx, frame: frame, covers: covers, subviewCovers: subviewCovers,
-                                    ancestorAlpha: ancestorAlpha, maskImageName: maskImageName,
-                                    maskHoleColor: maskHoleColor)
+                                    ancestorAlpha: ancestorAlpha, ancestorHidden: ancestorHidden,
+                                    maskImageName: maskImageName, maskHoleColor: maskHoleColor)
         }
     }
 
@@ -1923,7 +1946,7 @@ public final class SkinCanvasView: NSView {
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?)? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, ancestorHidden: Bool, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -1984,7 +2007,8 @@ public final class SkinCanvasView: NSView {
                     }
                 }
                 return (fx, vizFrame, covers: topCovers, subviewCovers: topSubviewCovers,
-                        ancestorAlpha: 255, maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil)
+                        ancestorAlpha: 255, ancestorHidden: false,
+                        maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil)
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -2060,15 +2084,25 @@ public final class SkinCanvasView: NSView {
                     //      opaque = frame. Use a cover NSImageView above the viz.
                     //      e.g. vis_mask.png in Blinx, VisBG.gif in deepbluesomething.
                     if let img = svBgImg,
-                       let directEffect = sv.children.first(where: { if case .effects = $0 { return true }; return false }),
-                       (directEffect.base?.zIndex ?? 0) < 0 || sv.base.transparencyColor != nil {
+                       let directEffect = sv.children.first(where: { if case .effects = $0 { return true }; return false }) {
                         let tcIsWhite: Bool
                         if let tc = sv.base.transparencyColor, let rgb = parseAnyColor(tc) {
                             tcIsWhite = rgb.0 > 240 && rgb.1 > 240 && rgb.2 > 240
                         } else {
                             tcIsWhite = false
                         }
-                        if tcIsWhite, let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
+                        // A white clippingColor on the subview itself (no transparencyColor)
+                        // defines the same kind of shape mask: clippingColor pixels of
+                        // backgroundImage are clipped from the subview's own render, so they
+                        // should also hide the viz behind them (e.g. main_vismask.png in
+                        // Combat Flight Simulator 3 — black circle = screen, white = frame).
+                        let ccIsWhite: Bool
+                        if sv.base.transparencyColor == nil, let cc = sv.clippingColor, let rgb = parseAnyColor(cc) {
+                            ccIsWhite = rgb.0 > 240 && rgb.1 > 240 && rgb.2 > 240
+                        } else {
+                            ccIsWhite = false
+                        }
+                        if (tcIsWhite || ccIsWhite), let bgName = sv.backgroundImage?.lowercased(), found.maskImageName == nil {
                             found.maskImageName = bgName
                         } else if !tcIsWhite, sv.clippingColor != nil,
                                   (directEffect.base?.zIndex ?? 0) >= 0,
@@ -2082,7 +2116,8 @@ public final class SkinCanvasView: NSView {
                             // handled below).
                             found.maskImageName = bgName
                             found.maskHoleColor = holeRGB
-                        } else if !tcIsWhite {
+                        } else if !tcIsWhite, !ccIsWhite,
+                                  (directEffect.base?.zIndex ?? 0) < 0 || sv.base.transparencyColor != nil {
                             found.covers.append((subview: sv, bgImage: img, frame: svBgFrame, drawRect: svBgFrame))
                         }
                     }
@@ -2132,6 +2167,11 @@ public final class SkinCanvasView: NSView {
                     }
                     // Propagate ancestor alpha: viz must be hidden when any ancestor's alpha is 0.
                     found.ancestorAlpha = min(found.ancestorAlpha, effectiveAlpha(for: sv.base))
+                    // Propagate ancestor visibility: viz must be hidden when any ancestor
+                    // subview is visible=false, even though we recurse past hidden subviews
+                    // to find the <effects> element (e.g. CFS3's "vis" subview starts hidden
+                    // and is toggled on by toggleVis()).
+                    found.ancestorHidden = found.ancestorHidden || elementIsHidden(sv.base, live: true)
                     return found
                 }
             default: break
@@ -2145,6 +2185,7 @@ public final class SkinCanvasView: NSView {
         covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)],
         subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = [],
         ancestorAlpha: Int = 255,
+        ancestorHidden: Bool = false,
         maskImageName: String? = nil,
         maskHoleColor: (UInt8, UInt8, UInt8)? = nil
     ) {
@@ -2260,7 +2301,7 @@ public final class SkinCanvasView: NSView {
             vizCoverInfos[i].imageView.frame = vizCoverInfos[i].frame
         }
         if let provider = vizProvider {
-            let hidden = elementIsHidden(fx.base, live: true) || ancestorAlpha == 0
+            let hidden = elementIsHidden(fx.base, live: true) || ancestorAlpha == 0 || ancestorHidden
             provider.view.isHidden   = hidden
             vizContainer?.isHidden   = hidden
             // Covers are only needed when the viz is live — when hidden, CGContext draws
@@ -2634,6 +2675,39 @@ public final class SkinCanvasView: NSView {
         startMoveTimerIfNeeded()
     }
 
+    /// Begins replaying the skin's real-time startup-animation sequence captured by
+    /// SkinScriptEngine's init pump (e.g. CFS3: intro gif visible for 5s, then a
+    /// shutter-open gif for 1.8s, then the converged ready state). No-op if the skin's
+    /// onLoad/onTimer converged in a single tick (nothing to replay). Intended for the
+    /// live app only — headless/test construction shows the converged state immediately.
+    public func beginStartupAnimation() {
+        guard startupAnimationStepIndex == nil, let engine else { return }
+        guard !engine.startupSteps.isEmpty else {
+            // No intro to replay, but the view may still have an indefinite onTimer
+            // poller (e.g. plView's checkBluePL) — start its repeating timer now.
+            rescheduleTimer()
+            return
+        }
+        playStartupAnimationStep(0)
+    }
+
+    private func playStartupAnimationStep(_ index: Int) {
+        guard let engine else { return }
+        let steps = engine.startupSteps
+        guard index < steps.count else {
+            startupAnimationStepIndex = nil
+            engine.setStartupOverride(nil)
+            applyScriptChanges()
+            return
+        }
+        startupAnimationStepIndex = index
+        engine.setStartupOverride(steps[index].states)
+        applyScriptChanges()
+        DispatchQueue.main.asyncAfter(deadline: .now() + steps[index].duration) { [weak self] in
+            self?.playStartupAnimationStep(index + 1)
+        }
+    }
+
     private func startMoveTimerIfNeeded() {
         guard moveTimer == nil, engine?.hasActiveMoves == true else { return }
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
@@ -2861,9 +2935,10 @@ public final class SkinCanvasView: NSView {
         }
 
         promotedGifNames.insert(lower)
-        animatedButtonViews[id]     = iv
-        animatedButtonBases[id]     = b.base
-        animatedButtonAncestors[id] = ancestors
+        animatedButtonViews[id]      = iv
+        animatedButtonBases[id]      = b.base
+        animatedButtonAncestors[id]  = ancestors
+        animatedButtonCurrentImage[id] = lower
     }
 
     /// Builds (and caches) composite hover-flash frames for buttongroup `i`'s `maskKey`

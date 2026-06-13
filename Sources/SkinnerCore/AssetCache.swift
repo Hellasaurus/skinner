@@ -93,23 +93,25 @@ public final class AssetCache {
             if let md  = loadMapData(url: url)     { mapData[key] = md }
         }
 
-        // Scripts reference image filenames not declared in the WMS (e.g. shutter_open2.gif
-        // set via element.backgroundImage at runtime).  Load everything in the bundle directory
-        // so those assets are available when the canvas draws them.
+        // Scripts reference image filenames not declared in the WMS (e.g. shutter_open2.gif,
+        // or "png24/intro_anim_f1.png" — frame sequences for startup animations, set via
+        // element.backgroundImage at runtime).  Recursively load everything in the bundle
+        // directory, keyed by its path relative to the bundle root, so those assets are
+        // available when the canvas draws them.
         let scriptImageExts: Set<String> = ["png", "gif", "bmp", "jpg", "jpeg"]
-        if let entries = try? FileManager.default.contentsOfDirectory(
-            at: bundle.directory,
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles
-        ) {
-            for fileURL in entries
-            where scriptImageExts.contains(fileURL.pathExtension.lowercased()) {
-                let key = fileURL.lastPathComponent.lowercased()
-                if images[key]  == nil, let img = loadMagentaFree(url: fileURL, extraTransparent: extraTransparentColors[key] ?? []) {
-                    images[key] = imageOverrides[key]?.apply(to: img) ?? img
-                }
-                if mapData[key] == nil, let md  = loadMapData(url: fileURL)     { mapData[key] = md  }
+        let relativePaths = (try? FileManager.default.subpathsOfDirectory(atPath: bundle.directory.path)) ?? []
+        for relativePath in relativePaths
+        where scriptImageExts.contains((relativePath as NSString).pathExtension.lowercased()) {
+            let fileURL = bundle.directory.appendingPathComponent(relativePath)
+            let key = relativePath.lowercased()
+            if images[key] == nil, let img = loadMagentaFree(url: fileURL, extraTransparent: extraTransparentColors[key] ?? []) {
+                images[key] = imageOverrides[key]?.apply(to: img) ?? img
             }
+            // mapData (raw RGBA, for hit-testing/masks) is only needed for top-level,
+            // WMS-declared assets — those are already loaded by the primary loop above.
+            // Skip it for nested frame-sequence directories to keep memory bounded.
+            if relativePath == fileURL.lastPathComponent, mapData[key] == nil,
+               let md = loadMapData(url: fileURL) { mapData[key] = md }
         }
 
         var groupsByMappingImage: [String: ButtonGroupAssets] = [:]
