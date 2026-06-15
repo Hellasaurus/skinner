@@ -39,12 +39,13 @@ struct ElementScriptState: Equatable {
     var down: Bool?          // sticky button toggle state (element.down = true/false/"true"/"false")
     var foregroundColor: String? // text element foregroundColor set via JS
     var foregroundImage: String? // slider foregroundImage override (e.g. toggleTexture color swaps)
+    var zIndex: Int?         // draw-order override (element.zindex = N), e.g. raising a subview above its parent's background
 
     var isEmpty: Bool {
         visible == nil && backgroundImage == nil && alphaBlend == nil
             && enabled == nil && image == nil && hoverImage == nil && downImage == nil
             && disabledImage == nil && value == nil && down == nil && foregroundColor == nil
-            && foregroundImage == nil
+            && foregroundImage == nil && zIndex == nil
     }
 }
 
@@ -116,7 +117,11 @@ final class SkinScriptEngine {
     // MARK: - Init
 
     init?(skinView: SkinView, bundle: SkinBundle, preferences: SkinPreferences = SkinPreferences()) {
-        guard let scriptFile = skinView.scriptFile, !scriptFile.isEmpty else { return nil }
+        // Some skins reference a script's functions via inline `JScript:` handlers
+        // without ever declaring scriptFile on <VIEW>. WMP falls back to a .js file
+        // matching the .wms file's base name in that case — do the same.
+        let declaredScriptFile = skinView.scriptFile.flatMap { $0.isEmpty ? nil : $0 }
+        guard let scriptFile = declaredScriptFile ?? Self.defaultScriptFile(bundle: bundle) else { return nil }
         guard let ctx = JSContext() else { return nil }
         self.context = ctx
         self.bundleDirectory = bundle.directory
@@ -159,24 +164,25 @@ final class SkinScriptEngine {
         if let interval = skinView.timerInterval, interval > 0,
            let handler  = skinView.onTimer, !handler.isEmpty {
             var stepDuration = TimeInterval(interval) / 1000.0
+            var seenStates: [[String: ElementScriptState]] = []
             for _ in 0 ..< 1024 {
-                startupSteps.append(StartupAnimationStep(states: snapshotElementStates(), duration: stepDuration))
+                let snapshot = snapshotElementStates()
+                // Cycle detection: once a tick's state matches one already replayed, every
+                // following tick will repeat the same cycle (e.g. Batman's onViewTimer never
+                // sets view.timerInterval = 0 — once its 154-frame intro ends it just loops
+                // mainRuntime through runtime/loop_f1..30 forever; plView's checkBluePL
+                // converges to one repeated state after its first tick). The live Timer
+                // (rescheduleTimer) continues that cycle in real time after the replay
+                // converges, so stop here rather than replaying it for up to 1024 steps
+                // (e.g. ~52s for Batman, ~17min for a 1s poller).
+                if seenStates.contains(snapshot) { break }
+                seenStates.append(snapshot)
+                startupSteps.append(StartupAnimationStep(states: snapshot, duration: stepDuration))
                 ctx.evaluateScript("try { \(handler) } catch(e) {}")
                 guard let ti = ctx.evaluateScript("view.timerInterval"), ti.isNumber else { break }
                 let newInterval = ti.toInt32()
                 if newInterval == 0 { break }
                 stepDuration = TimeInterval(newInterval) / 1000.0
-            }
-            // Trim a converged/no-op tail: some intros (e.g. Batman's onViewTimer) never
-            // set view.timerInterval = 0, they just keep re-running an idle else-branch
-            // once the intro flag flips, so the loop runs all 1024 iterations with the
-            // last N steps identical. Indefinite live pollers (e.g. plView's checkBluePL,
-            // which polls theme prefs every second) converge to a single repeated state
-            // after their first tick. Either way, trailing duplicates carry no animation
-            // and would otherwise bloat the replay (or, for pollers, make it run ~17min).
-            while startupSteps.count > 1,
-                  startupSteps[startupSteps.count - 1].states == startupSteps[startupSteps.count - 2].states {
-                startupSteps.removeLast()
             }
             // A single step means the state never changed — no real animation to replay.
             if startupSteps.count <= 1 { startupSteps.removeAll() }
@@ -402,9 +408,10 @@ final class SkinScriptEngine {
         s.downImage       = stringProp(proxy, "downImage")
         s.disabledImage   = stringProp(proxy, "disabledImage")
         s.value           = stringProp(proxy, "value")
-        s.down            = downProp(proxy,   "down")
+        s.down            = boolProp(proxy,   "down")
         s.foregroundColor = stringProp(proxy, "foregroundColor")
         s.foregroundImage = stringProp(proxy, "foregroundImage")
+        s.zIndex          = intProp(proxy,    "zindex")
         let result: ElementScriptState? = s.isEmpty ? nil : s
         stateCache[id] = .some(result)
         return result
@@ -739,7 +746,7 @@ final class SkinScriptEngine {
                 if let id = sv.base.id { registerProxy(id: id, base: sv.base, onEndMove: sv.onEndMove, in: ctx, reserved: reserved) }
                 registerElements(sv.children, in: ctx, reserved: reserved)
             case .button(let b):
-                if let id = b.base.id { registerProxy(id: id, base: b.base, in: ctx, reserved: reserved) }
+                if let id = b.base.id { registerProxy(id: id, base: b.base, onEndMove: b.onEndMove, in: ctx, reserved: reserved) }
             case .buttonGroup(let bg):
                 if let id = bg.base.id { registerProxy(id: id, base: bg.base, in: ctx, reserved: reserved) }
                 for elem in bg.elements {
@@ -1137,6 +1144,17 @@ final class SkinScriptEngine {
             ?? String(data: data, encoding: .isoLatin1)
     }
 
+    /// Looks for a `.js` file in the bundle directory whose base name matches the
+    /// `.wms` file's base name, case-insensitively (e.g. "Charlies Angels.wms" →
+    /// "charlies Angels.js"). Returns nil if no such file exists.
+    private static func defaultScriptFile(bundle: SkinBundle) -> String? {
+        let wantedBase = bundle.wmsFile.deletingPathExtension().lastPathComponent.lowercased()
+        let entries = try? FileManager.default.contentsOfDirectory(atPath: bundle.directory.path)
+        return entries?.first {
+            $0.lowercased() == "\(wantedBase).js"
+        }
+    }
+
     /// Splits `"foo.js;res://wmploc.dll/RT_TEXT/#132;"` → `["foo.js"]`.
     private func localScriptNames(from scriptFile: String) -> [String] {
         scriptFile
@@ -1155,9 +1173,20 @@ final class SkinScriptEngine {
 
     // MARK: - JSValue property readers
 
+    /// Reads a boolean property that scripts may set as either a real boolean or the
+    /// strings "true"/"false" (e.g. `cover.visible="false"`). `toBool()` is not used
+    /// directly because non-empty strings (including "false") are truthy in JS.
     private func boolProp(_ proxy: JSValue, _ key: String) -> Bool? {
         guard let v = proxy.forProperty(key), !v.isUndefined, !v.isNull else { return nil }
-        return v.toBool()
+        if v.isBoolean { return v.toBool() }
+        if v.isString {
+            switch v.toString()?.lowercased() {
+            case "true":  return true
+            case "false": return false
+            default:      return nil
+            }
+        }
+        return nil
     }
 
     private func stringProp(_ proxy: JSValue, _ key: String) -> String? {
@@ -1172,21 +1201,6 @@ final class SkinScriptEngine {
         guard let v = proxy.forProperty(key), !v.isUndefined, !v.isNull else { return nil }
         if v.isNumber { return Int(v.toInt32()) }
         if v.isString, let n = Int(v.toString() ?? "") { return n }
-        return nil
-    }
-
-    /// Reads a `down` property that may be a boolean or the strings "true"/"false".
-    /// `toBool()` is not used because non-empty strings (including "false") are truthy in JS.
-    private func downProp(_ proxy: JSValue, _ key: String) -> Bool? {
-        guard let v = proxy.forProperty(key), !v.isUndefined, !v.isNull else { return nil }
-        if v.isBoolean { return v.toBool() }
-        if v.isString {
-            switch v.toString()?.lowercased() {
-            case "true":  return true
-            case "false": return false
-            default:      return nil
-            }
-        }
         return nil
     }
 }

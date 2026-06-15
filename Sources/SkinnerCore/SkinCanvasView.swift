@@ -37,7 +37,7 @@ public final class SkinCanvasView: NSView {
     private var didFinishInit    = false
     private var pressedTextIdx:  Int?
     private var lastKnownMousePt: NSPoint?
-    private var engine: SkinScriptEngine?
+    var engine: SkinScriptEngine?
     private var animatedSubviews:              [String: NSImageView]            = [:]
     private var animatedSubviewBases:          [String: ElementBase]            = [:]
     private var animatedSubviewCurrentImage:   [String: String]                 = [:]
@@ -230,6 +230,22 @@ public final class SkinCanvasView: NSView {
                 }
             }
             iv.isHidden = elementIsHidden(base, live: true) || !ancestorsVisible(ancestors)
+        }
+    }
+
+    /// Animated-button NSImageViews (promoted by `promoteAnimatedButtonGif` because their
+    /// image is a multi-frame .gif, e.g. Charlies Angels' sliding doors) are created once at
+    /// their initial frame and never repositioned. A moveTo() on the underlying button only
+    /// updates the JS-side position (read via liveCoord in collectButtons) — without this,
+    /// the visible NSImageView stays frozen at its start position until visibility flips,
+    /// so the slide never appears.
+    private func updateAnimatedButtonFrames() {
+        guard !animatedButtonViews.isEmpty else { return }
+        for button in buttons {
+            guard let id = button.model.base.id, let iv = animatedButtonViews[id] else { continue }
+            if iv.frame != button.frame {
+                iv.frame = button.frame
+            }
         }
     }
 
@@ -481,8 +497,8 @@ public final class SkinCanvasView: NSView {
                 let clipH = lc.resolve(sv.base.height)
                 let clipSize: CGSize? = (clipW != nil || clipH != nil)
                     ? CGSize(width: clipW ?? 0, height: clipH ?? 0) : nil
-                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors, parentClipSize: clipSize)
-                result += collectButtons(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors, parentClipSize: clipSize)
+                result += collectButtons(in: sv.children.filter { liveZIndex($0) < 0 },  offset: co, lc: lc, ancestors: childAncestors, parentClipSize: clipSize)
+                result += collectButtons(in: sv.children.filter { liveZIndex($0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors, parentClipSize: clipSize)
             default: break
             }
         }
@@ -545,8 +561,8 @@ public final class SkinCanvasView: NSView {
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 let co  = CGPoint(x: sx, y: sy)
                 let childAncestors = ancestors + [sv.base]
-                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
-                result += collectSliders(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
+                result += collectSliders(in: sv.children.filter { liveZIndex($0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
+                result += collectSliders(in: sv.children.filter { liveZIndex($0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
             default: break
             }
         }
@@ -575,8 +591,8 @@ public final class SkinCanvasView: NSView {
                 let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
                 let co = CGPoint(x: sx, y: sy)
                 let childAncestors = ancestors + [sv.base]
-                result += collectTexts(in: sv.children.filter { ($0.base?.zIndex ?? 0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
-                result += collectTexts(in: sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
+                result += collectTexts(in: sv.children.filter { liveZIndex($0) < 0 },  offset: co, lc: lc, ancestors: childAncestors)
+                result += collectTexts(in: sv.children.filter { liveZIndex($0) >= 0 }, offset: co, lc: lc, ancestors: childAncestors)
             default: break
             }
         }
@@ -887,7 +903,9 @@ public final class SkinCanvasView: NSView {
                                buttonIdx: inout Int,
                                sliderIdx: inout Int,
                                buttonOverride: [RenderedButton]? = nil,
-                               sliderOverride: [RenderedSlider]? = nil) {
+                               sliderOverride: [RenderedSlider]? = nil,
+                               parentClipRect: CGRect? = nil,
+                               parentShapeMask: (mask: CGImage, size: CGSize)? = nil) {
         let btnArr = buttonOverride ?? buttons
         let slrArr = sliderOverride ?? sliders
         for element in sortedByZIndex(elements) {
@@ -952,8 +970,51 @@ public final class SkinCanvasView: NSView {
                         return (mask, size)
                     }
                 }
-                let needsGState = needsClip || needsAlpha || shapeMask != nil
+                // Bounds children can be confined to when JS has moved them away from
+                // their declared position (see the `.button` case below): the subview's
+                // declared size, or — if undeclared — its backgroundImage's natural size
+                // (e.g. Charlies Angels' "pos" subview is sized to mainBG.bmp). Lets a
+                // sliding door animation retract until it's cut off at the device's edge
+                // instead of drawing over the rest of the canvas.
+                let childClipRect: CGRect? = {
+                    let w = clipW ?? sv.backgroundImage.flatMap { cache.images[$0.lowercased()]?.size.width }
+                    let h = clipH ?? sv.backgroundImage.flatMap { cache.images[$0.lowercased()]?.size.height }
+                    guard let w, let h, w > 0, h > 0 else { return nil }
+                    return CGRect(x: sx, y: sy, width: w, height: h)
+                }()
+                // The pixel-accurate counterpart to childClipRect: a moved child confined to
+                // this subview's silhouette (not just its bounding box) when the background
+                // image's clippingColor/transparencyColor defines a non-rectangular shape —
+                // e.g. Charlies Angels' "pos"/mainBG.bmp cuts a device-shaped hole, so a
+                // retracting door is cut off at the device's edge, not mainBG's bounding box.
+                let childShapeMask: (mask: CGImage, size: CGSize)? = (sv.clippingColor ?? sv.base.transparencyColor).flatMap { _ in
+                    sv.backgroundImage.flatMap { name in
+                        guard let mask = cache.subviewShapeMasks[name.lowercased()],
+                              let size = cache.images[name.lowercased()]?.size
+                        else { return nil }
+                        return (mask, size)
+                    }
+                }
+                // This subview itself slid away from its declared position via JS .moveto
+                // (e.g. Charlies Angels' Peviewlogo/logo ascending/descending past mainBG's
+                // top edge) — confine it to the parent's footprint so it appears to pass
+                // behind the bezel rather than floating outside the device artwork. Only the
+                // bounding-box clip applies here (not the silhouette mask): the logo extends
+                // past mainBG's cut-out shape into the bezel area by design, unlike the doors.
+                let movedFromDeclared: Bool = {
+                    guard let id = sv.base.id,
+                          let liveLeft = engine?.liveNumber(id: id, property: "left"),
+                          let liveTop = engine?.liveNumber(id: id, property: "top")
+                    else { return false }
+                    return liveLeft != (resolveCoord(sv.base.left, lc: lc) ?? 0)
+                        || liveTop != (resolveCoord(sv.base.top, lc: lc) ?? 0)
+                }()
+                let needsParentClip = movedFromDeclared && parentClipRect != nil
+                let needsGState = needsClip || needsAlpha || shapeMask != nil || needsParentClip
                 if needsGState { ctx.saveGState() }
+                if needsParentClip {
+                    ctx.clip(to: parentClipRect!)
+                }
                 if needsClip {
                     ctx.clip(to: CGRect(x: sx, y: sy, width: clipW!, height: clipH!))
                 }
@@ -972,11 +1033,12 @@ public final class SkinCanvasView: NSView {
                 // parent's own zIndex (e.g. Professional's buttons zIndex=1,2 inside a
                 // parent with zIndex=15 still appear above s_main_no.png).
                 // This split must match collectButtons/collectSliders so index order stays in sync.
-                let below = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
-                let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
+                let below = sv.children.filter { liveZIndex($0) < 0 }
+                let above = sv.children.filter { liveZIndex($0) >= 0 }
                 drawElements(below, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx,
-                             buttonOverride: buttonOverride, sliderOverride: sliderOverride)
+                             buttonOverride: buttonOverride, sliderOverride: sliderOverride,
+                             parentClipRect: childClipRect, parentShapeMask: childShapeMask)
                 // Fill backgroundColor before drawing the background image so the image sits on top.
                 // Only fill when we have explicit clip dimensions; otherwise size is unknown.
                 if let colorStr = sv.backgroundColor,
@@ -1063,7 +1125,8 @@ public final class SkinCanvasView: NSView {
                 }
                 drawElements(above, offset: childOffset, lc: lc, ctx: ctx,
                              buttonIdx: &buttonIdx, sliderIdx: &sliderIdx,
-                             buttonOverride: buttonOverride, sliderOverride: sliderOverride)
+                             buttonOverride: buttonOverride, sliderOverride: sliderOverride,
+                             parentClipRect: childClipRect, parentShapeMask: childShapeMask)
                 if needsAlpha { ctx.endTransparencyLayer() }
                 if needsGState { ctx.restoreGState() }
 
@@ -1089,7 +1152,25 @@ public final class SkinCanvasView: NSView {
                 guard !elementIsHidden(b.base) else { continue }
                 defer { buttonIdx += 1 }
                 if !elementIsHidden(b.base, live: true), buttonIdx < btnArr.count {
-                    drawButton(btnArr[buttonIdx], ctx: ctx)
+                    // A button JS has slid away from its declared position (e.g. Charlies
+                    // Angels' ldoor/rdoor retracting via moveto) is clipped to its parent
+                    // subview's footprint so it doesn't keep drawing past the device's edge
+                    // once it slides outside the parent's background image bounds.
+                    if let parentClipRect, let id = b.base.id,
+                       let liveLeft = engine?.liveNumber(id: id, property: "left"),
+                       let liveTop = engine?.liveNumber(id: id, property: "top"),
+                       liveLeft != (resolveCoord(b.base.left, lc: lc) ?? 0)
+                        || liveTop != (resolveCoord(b.base.top, lc: lc) ?? 0) {
+                        ctx.saveGState()
+                        ctx.clip(to: parentClipRect)
+                        if let parentShapeMask {
+                            ctx.clip(to: parentClipRect, mask: parentShapeMask.mask)
+                        }
+                        drawButton(btnArr[buttonIdx], ctx: ctx)
+                        ctx.restoreGState()
+                    } else {
+                        drawButton(btnArr[buttonIdx], ctx: ctx)
+                    }
                 }
 
             case .slider(let s):
@@ -1860,13 +1941,13 @@ public final class SkinCanvasView: NSView {
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         let viewBgImg   = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
         let viewBgFrame = viewBgImg.map { CGRect(origin: .zero, size: $0.size) }
-        if let (fx, frame, covers, subviewCovers, ancestorAlpha, ancestorHidden, maskImageName, maskHoleColor) = findEffects(
+        if let (fx, frame, covers, subviewCovers, ancestorAlpha, ancestorHidden, maskImageName, maskHoleColor, maskInvert) = findEffects(
             in: skinView.elements, offset: .zero, lc: lc2,
             parentBgImage: viewBgImg, parentBgFrame: viewBgFrame
         ) {
             updateVisualizationView(for: fx, frame: frame, covers: covers, subviewCovers: subviewCovers,
                                     ancestorAlpha: ancestorAlpha, ancestorHidden: ancestorHidden,
-                                    maskImageName: maskImageName, maskHoleColor: maskHoleColor)
+                                    maskImageName: maskImageName, maskHoleColor: maskHoleColor, maskInvert: maskInvert)
         }
     }
 
@@ -1946,7 +2027,7 @@ public final class SkinCanvasView: NSView {
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, ancestorHidden: Bool, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?)? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, ancestorHidden: Bool, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?, maskInvert: Bool)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -2008,7 +2089,7 @@ public final class SkinCanvasView: NSView {
                 }
                 return (fx, vizFrame, covers: topCovers, subviewCovers: topSubviewCovers,
                         ancestorAlpha: 255, ancestorHidden: false,
-                        maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil)
+                        maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil, maskInvert: false)
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -2119,6 +2200,33 @@ public final class SkinCanvasView: NSView {
                         } else if !tcIsWhite, !ccIsWhite,
                                   (directEffect.base?.zIndex ?? 0) < 0 || sv.base.transparencyColor != nil {
                             found.covers.append((subview: sv, bgImage: img, frame: svBgFrame, drawRect: svBgFrame))
+                            // This subview's backgroundImage (the cover, e.g. visoutline.gif)
+                            // has a transparencyColor "hole" through which the viz should show.
+                            // If <effects clippingimage="..."> (e.g. vis.gif) was set at the .effects
+                            // case above, check whether buildVisMaskLayerImage's default convention
+                            // (grey/black = show, white/magenta = hide) agrees with that hole — some
+                            // skins ship clippingImages using the opposite convention (white = show),
+                            // e.g. Charlies Angels' vis.gif is white exactly where visoutline.gif's
+                            // #FF0000 hole is, while its black region is fully covered by visoutline's
+                            // opaque frame art. Sample the clip image at the hole's pixels and flip
+                            // polarity if the default convention would hide the viz there.
+                            if let maskName = found.maskImageName, found.maskHoleColor == nil,
+                               let bgName = sv.backgroundImage?.lowercased(),
+                               let tc = sv.base.transparencyColor, let holeRGB = parseAnyColor(tc),
+                               let coverMD = cache.mapData[bgName], let clipMD = cache.mapData[maskName],
+                               coverMD.width == clipMD.width, coverMD.height == clipMD.height {
+                                var shown = 0, hidden = 0
+                                for i in 0 ..< (coverMD.width * coverMD.height) {
+                                    let o = i * 4
+                                    guard coverMD.bytes[o + 3] > 10,
+                                          colorMatches(coverMD.bytes[o], coverMD.bytes[o + 1], coverMD.bytes[o + 2],
+                                                        holeRGB.0, holeRGB.1, holeRGB.2) else { continue }
+                                    let cr = clipMD.bytes[o], cg = clipMD.bytes[o + 1], cb = clipMD.bytes[o + 2], ca = clipMD.bytes[o + 3]
+                                    let visibleByDefault = ca > 10 && !isMagenta(cr, cg, cb) && !(cr > 240 && cg > 240 && cb > 240)
+                                    if visibleByDefault { shown += 1 } else { hidden += 1 }
+                                }
+                                if hidden > shown { found.maskInvert = true }
+                            }
                         }
                     }
                     // Collect passThrough sibling subviews with a higher zIndex as overlay covers.
@@ -2187,7 +2295,8 @@ public final class SkinCanvasView: NSView {
         ancestorAlpha: Int = 255,
         ancestorHidden: Bool = false,
         maskImageName: String? = nil,
-        maskHoleColor: (UInt8, UInt8, UInt8)? = nil
+        maskHoleColor: (UInt8, UInt8, UInt8)? = nil,
+        maskInvert: Bool = false
     ) {
         if vizProvider == nil, let provider = prebuiltVisualizationProvider ?? makeVisualizationProvider?() {
             vizProvider  = provider
@@ -2218,7 +2327,7 @@ public final class SkinCanvasView: NSView {
                 if let holeColor = maskHoleColor {
                     return buildHoleMaskLayerImage(from: md, holeColor: holeColor, targetSize: frame.size)
                 }
-                return buildVisMaskLayerImage(from: md, targetSize: frame.size)
+                return buildVisMaskLayerImage(from: md, targetSize: frame.size, invert: maskInvert)
             }
             if let maskImg = resolvedMaskImg {
                 container.wantsLayer = true
@@ -2314,9 +2423,12 @@ public final class SkinCanvasView: NSView {
 
     /// Builds an RGBA CGImage suitable for use as a `CALayer.mask` contents, where
     /// grey pixels in `md` become opaque (show the viz) and white/transparent/magenta
-    /// pixels become alpha=0 (hide the viz). Rows are flipped to match the top-down
-    /// coordinate system of macOS NSView backing layers (isGeometryFlipped=true).
-    private func buildVisMaskLayerImage(from md: MapData, targetSize: CGSize) -> CGImage? {
+    /// pixels become alpha=0 (hide the viz). `invert` flips that: white pixels show the
+    /// viz and grey/transparent/magenta pixels hide it — some skins' clippingImages use
+    /// this opposite convention (e.g. Charlies Angels' vis.gif is white exactly where its
+    /// frame art's transparencyColor cutout reveals the viz). Rows are flipped to match
+    /// the top-down coordinate system of macOS NSView backing layers (isGeometryFlipped=true).
+    private func buildVisMaskLayerImage(from md: MapData, targetSize: CGSize, invert: Bool = false) -> CGImage? {
         let tw = max(1, Int(targetSize.width))
         let th = max(1, Int(targetSize.height))
         var bytes = [UInt8](repeating: 0, count: tw * th * 4)
@@ -2329,7 +2441,8 @@ public final class SkinCanvasView: NSView {
                 let si = (srcRow * md.width + srcCol) * 4
                 guard si + 3 < md.bytes.count else { continue }
                 let r = md.bytes[si], g = md.bytes[si+1], b = md.bytes[si+2], a = md.bytes[si+3]
-                let visible = a > 10 && !isMagenta(r, g, b) && !(r > 240 && g > 240 && b > 240)
+                var visible = a > 10 && !isMagenta(r, g, b) && !(r > 240 && g > 240 && b > 240)
+                if invert { visible.toggle() }
                 let alpha: UInt8 = visible ? 255 : 0
                 let di = (dstRow * tw + dstCol) * 4
                 bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
@@ -2654,6 +2767,7 @@ public final class SkinCanvasView: NSView {
     private func applyScriptChanges() {
         engine?.fireOnEndMoveCallbacks()
         recollect()
+        updateAnimatedButtonFrames()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
         // Rebuild the click-through mask synchronously so the upcoming draw (below)
@@ -2686,6 +2800,13 @@ public final class SkinCanvasView: NSView {
             // No intro to replay, but the view may still have an indefinite onTimer
             // poller (e.g. plView's checkBluePL) — start its repeating timer now.
             rescheduleTimer()
+            // onEndMove handlers fired during init's fireOnEndMoveCallbacks() drain may
+            // have queued real-time moveTo animations (e.g. door/cover intro sequences)
+            // whose _t0 was never stamped and whose moveTimer was never started, since
+            // init() itself doesn't call applyScriptChanges(). Kick them off now.
+            if engine.hasActiveMoves {
+                applyScriptChanges()
+            }
             return
         }
         playStartupAnimationStep(0)
@@ -2732,6 +2853,7 @@ public final class SkinCanvasView: NSView {
         // the next tick instead of leaving them stuck at _t0 == -1 forever.
         engine.stampNewAnimationStartTimes()
         recollect()
+        updateAnimatedButtonFrames()
         setNeedsDisplay(bounds)
         if !engine.hasActiveMoves {
             stopMoveTimer()
@@ -2921,7 +3043,8 @@ public final class SkinCanvasView: NSView {
             .compactMap { $0.flatMap(parseAnyColor) }
         let img = loadGifMagentaFree(url: bundle.assetURL(named: name), extraTransparent: extra) ?? raw
 
-        let iv = NSImageView(frame: NSRect(x: x, y: y, width: w, height: h))
+        let frame = NSRect(x: x, y: y, width: w, height: h)
+        let iv = NSImageView(frame: frame)
         iv.image        = img
         iv.animates     = true
         iv.imageScaling = .scaleAxesIndependently
@@ -3116,8 +3239,8 @@ public final class SkinCanvasView: NSView {
 
             let bgName = sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                          ?? sv.backgroundImage
-            let below = sv.children.filter { ($0.base?.zIndex ?? 0) < 0 }
-            let above = sv.children.filter { ($0.base?.zIndex ?? 0) >= 0 }
+            let below = sv.children.filter { liveZIndex($0) < 0 }
+            let above = sv.children.filter { liveZIndex($0) >= 0 }
 
             // Check if any below-children are GIF subviews (will become NSImageViews).
             // If so, this element's background must also be an NSImageView added after
@@ -3363,6 +3486,24 @@ public final class SkinCanvasView: NSView {
         return base.alphaBlend ?? 255
     }
 
+    /// Returns the effective zIndex, checking script state first. A script may
+    /// reassign `<id>.zindex` at runtime (e.g. Charlies Angels' movedoors() raises
+    /// `logo` from -2 to 1 so it draws above its parent's background once it slides
+    /// into view) — without this, the below/above-background split would stay frozen
+    /// at the WMS-declared value and the element would remain hidden under the background.
+    private func liveZIndex(_ element: SkinElement) -> Int {
+        guard let base = element.base else { return 0 }
+        if let id = base.id, let z = engine?.state(for: id)?.zIndex { return z }
+        return base.zIndex ?? 0
+    }
+
+    /// Stable sort by effective z-index ascending (no z-index → 0, document order
+    /// preserved for ties). Uses `liveZIndex` so script-driven `.zindex` reassignments
+    /// affect draw order.
+    private func sortedByZIndex(_ elements: [SkinElement]) -> [SkinElement] {
+        elements.sorted { liveZIndex($0) < liveZIndex($1) }
+    }
+
 }
 
 // MARK: - VizCoverInfo
@@ -3569,11 +3710,6 @@ private func gifIsAnimated(_ img: NSImage) -> Bool {
           let count = rep.value(forProperty: .frameCount) as? Int
     else { return false }
     return count > 1
-}
-
-/// Stable sort by z-index ascending (no z-index → 0, document order preserved for ties).
-private func sortedByZIndex(_ elements: [SkinElement]) -> [SkinElement] {
-    elements.sorted { ($0.base?.zIndex ?? 0) < ($1.base?.zIndex ?? 0) }
 }
 
 private extension NSColor {

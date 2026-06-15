@@ -144,7 +144,8 @@ public final class AssetCache {
         }
         var subviewShapeMasks: [String: CGImage] = [:]
         for name in shapeNames {
-            if let md = mapData[name], let mask = buildClipMask(from: md) {
+            if let md = mapData[name],
+               let mask = buildClipMask(from: md, extraTransparent: extraTransparentColors[name] ?? []) {
                 subviewShapeMasks[name] = mask
             }
         }
@@ -230,6 +231,12 @@ private func collectImageTransparentColors(from elements: [SkinElement],
                 add(name, tc)
             }
 
+        case .slider(let s):
+            let tc = s.base.transparencyColor
+            for name in [s.thumbImage, s.thumbDownImage, s.backgroundImage, s.foregroundImage, s.image, s.positionImage] {
+                add(name, tc)
+            }
+
         default: break
         }
     }
@@ -254,13 +261,14 @@ private func collectClipImageNames(from elements: [SkinElement], into set: inout
 
 // MARK: - Subview shape mask name collection
 
-/// A subview with both a `backgroundImage` and a `clippingColor` defines a shaped region
-/// (e.g. an irregular window silhouette, like Combat Flight Simulator 3's mainBody). Collects
-/// such backgroundImage filenames so a clip mask can be built for each.
+/// A subview with both a `backgroundImage` and a `clippingColor`/`transparencyColor` defines
+/// a shaped region (e.g. an irregular window silhouette, like Combat Flight Simulator 3's
+/// mainBody, or Charlies Angels' "pos"/mainBG.bmp). Collects such backgroundImage filenames
+/// so a clip mask can be built for each.
 private func collectSubviewShapeNames(from elements: [SkinElement], into set: inout Set<String>) {
     for element in elements {
         guard case .subview(let sv) = element else { continue }
-        if sv.clippingColor != nil, let name = sv.backgroundImage {
+        if (sv.clippingColor != nil || sv.base.transparencyColor != nil), let name = sv.backgroundImage {
             set.insert(name.lowercased())
         }
         collectSubviewShapeNames(from: sv.children, into: &set)
@@ -273,13 +281,17 @@ private func collectSubviewShapeNames(from elements: [SkinElement], into set: in
 /// clipping image map to 255 (show) and "transparent" pixels map to 0 (clip away).
 /// WMP skins use white (r>240, g>240, b>240) as the clip-transparent colour in
 /// clippingImage files; magenta and zero-alpha are also treated as transparent.
-private func buildClipMask(from md: MapData) -> CGImage? {
+/// `extraTransparent` additionally treats a subview's own clippingColor/transparencyColor
+/// (e.g. mainBG.bmp's #7D5A43) as transparent, so the mask reflects that image's actual
+/// silhouette rather than just its magenta/white/alpha cutouts.
+private func buildClipMask(from md: MapData, extraTransparent: [(UInt8, UInt8, UInt8)] = []) -> CGImage? {
     let region = (0 ..< md.width * md.height).map { i -> Bool in
         let o = i * 4
         let r = md.bytes[o], g = md.bytes[o + 1], b = md.bytes[o + 2], a = md.bytes[o + 3]
         guard a > 10 else { return false }
         if isMagenta(r, g, b)                  { return false }
         if r > 240 && g > 240 && b > 240       { return false } // white = transparent
+        if extraTransparent.contains(where: { colorMatches(r, g, b, $0.0, $0.1, $0.2) }) { return false }
         return true
     }
     return makeGrayMask(region: region, width: md.width, height: md.height)

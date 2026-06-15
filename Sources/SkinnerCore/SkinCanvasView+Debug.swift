@@ -7,6 +7,9 @@ import AppKit
 /// masks, clip masks).
 extension SkinCanvasView {
 
+    /// The skin's JS engine, for inspecting captured startup-animation steps etc.
+    var debugEngine: SkinScriptEngine? { engine }
+
     /// Synthesizes a left click (down + up) at `point` in this view's coordinate space
     /// (top-left origin, matches `isFlipped` / WMS layout coords).
     public func debugClick(atViewPoint point: CGPoint) {

@@ -125,6 +125,7 @@ public struct Button: Sendable {
     public var sticky: Bool
     public var clippingImage: String?
     public var clippingColor: String?
+    public var onEndMove: String?
 }
 
 // MARK: - ButtonElement

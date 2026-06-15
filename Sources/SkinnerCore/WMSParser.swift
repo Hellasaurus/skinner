@@ -416,7 +416,8 @@ private extension WMSParser {
             downToolTip: a.str("downtooltip"),
             sticky: a.bool("sticky"),
             clippingImage: a.str("clippingimage"),
-            clippingColor: a.str("clippingcolor")
+            clippingColor: a.str("clippingcolor"),
+            onEndMove: a.str("onendmove")
         )
     }
 
