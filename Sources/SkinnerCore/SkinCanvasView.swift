@@ -1941,13 +1941,14 @@ public final class SkinCanvasView: NSView {
         let lc2 = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
         let viewBgImg   = skinView.backgroundImage.flatMap { cache.images[$0.lowercased()] }
         let viewBgFrame = viewBgImg.map { CGRect(origin: .zero, size: $0.size) }
-        if let (fx, frame, covers, subviewCovers, ancestorAlpha, ancestorHidden, maskImageName, maskHoleColor, maskInvert) = findEffects(
+        if let (fx, frame, covers, subviewCovers, ancestorAlpha, ancestorHidden, maskImageName, maskHoleColor, maskInvert, customVizMask) = findEffects(
             in: skinView.elements, offset: .zero, lc: lc2,
             parentBgImage: viewBgImg, parentBgFrame: viewBgFrame
         ) {
             updateVisualizationView(for: fx, frame: frame, covers: covers, subviewCovers: subviewCovers,
                                     ancestorAlpha: ancestorAlpha, ancestorHidden: ancestorHidden,
-                                    maskImageName: maskImageName, maskHoleColor: maskHoleColor, maskInvert: maskInvert)
+                                    maskImageName: maskImageName, maskHoleColor: maskHoleColor, maskInvert: maskInvert,
+                                    customVizMask: customVizMask)
         }
     }
 
@@ -2027,7 +2028,7 @@ public final class SkinCanvasView: NSView {
                               parentBgImage: NSImage? = nil,
                               parentBgFrame: CGRect? = nil,
                               parentSubview: Subview? = nil
-    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, ancestorHidden: Bool, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?, maskInvert: Bool)? {
+    ) -> (Effects, CGRect, covers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)], subviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)], ancestorAlpha: Int, ancestorHidden: Bool, maskImageName: String?, maskHoleColor: (UInt8, UInt8, UInt8)?, maskInvert: Bool, customVizMask: CGImage?)? {
         for element in elements {
             switch element {
             case .effects(let fx):
@@ -2045,6 +2046,9 @@ public final class SkinCanvasView: NSView {
                 let vizFrame = CGRect(x: x, y: y, width: w, height: h)
                 var topCovers: [(subview: Subview?, bgImage: NSImage, frame: CGRect, drawRect: CGRect)] = []
                 var topSubviewCovers: [(subview: Subview, frame: CGRect, containerOffset: CGPoint)] = []
+                var topMaskImageName: String? = nil
+                var topMaskHoleColor: (UInt8, UInt8, UInt8)? = nil
+                var topCustomVizMask: CGImage? = nil
                 // When effects is a direct child of the view (parentSubview == nil), the
                 // regular cover-collection in case .subview never runs. Collect covers here:
                 // sibling subviews with higher zIndex + the view's own backgroundImage.
@@ -2077,6 +2081,31 @@ public final class SkinCanvasView: NSView {
                         if let img = validImg {
                             topCovers.append((subview: sib, bgImage: img,
                                               frame: sibFrame.intersection(vizFrame), drawRect: sibFrame))
+                            // A sibling whose backgroundImage carries both a clippingColor and a
+                            // non-white transparencyColor uses the "hole mask" convention: the
+                            // transparencyColor pixels mark the viz-visible screen area (e.g.
+                            // circle07's visfield.bmp — a magenta ring over a black frame). Build
+                            // a CALayer mask from those pixels so the viz only renders there,
+                            // instead of filling the whole vizFrame behind the (mostly opaque)
+                            // cover. Also fold in any descendant subviews using the same
+                            // transparencyColor/clippingColor convention (e.g. circle07's
+                            // sHundreds/sTens/sOnes digit subviews showing num<n>.bmp) so the viz
+                            // shows through the lit segments of those images too.
+                            if topMaskImageName == nil,
+                               let cc = sib.clippingColor, parseAnyColor(cc) != nil,
+                               let tc = sib.base.transparencyColor, let holeRGB = parseAnyColor(tc),
+                               !(holeRGB.0 > 240 && holeRGB.1 > 240 && holeRGB.2 > 240),
+                               let bgName = liveBgName, let md = cache.mapData[bgName] {
+                                topMaskImageName = bgName
+                                topMaskHoleColor = holeRGB
+                                var regions: [(md: MapData, frame: CGRect)] = [(md: md, frame: sibFrame)]
+                                regions += collectHoleMaskRegions(in: sib.children, holeColor: holeRGB,
+                                                                   offset: sibFrame.origin, lc: lc)
+                                if regions.count > 1 {
+                                    topCustomVizMask = buildCombinedHoleMaskLayerImage(
+                                        regions: regions, holeColor: holeRGB, targetSize: vizFrame.size)
+                                }
+                            }
                         } else if !sib.children.isEmpty {
                             // No usable backgroundImage of its own, but it has content (e.g. a
                             // sliding drawer like Headspace's sEqEar) that draws above the viz
@@ -2089,7 +2118,9 @@ public final class SkinCanvasView: NSView {
                 }
                 return (fx, vizFrame, covers: topCovers, subviewCovers: topSubviewCovers,
                         ancestorAlpha: 255, ancestorHidden: false,
-                        maskImageName: fx.clippingImage?.lowercased(), maskHoleColor: nil, maskInvert: false)
+                        maskImageName: fx.clippingImage?.lowercased() ?? topMaskImageName,
+                        maskHoleColor: fx.clippingImage != nil ? nil : topMaskHoleColor, maskInvert: false,
+                        customVizMask: topCustomVizMask)
             case .subview(let sv):
                 // Recurse regardless of visibility so nested effects elements are found
                 // even when their parent starts hidden (e.g. visMask in Pulsar).
@@ -2225,7 +2256,43 @@ public final class SkinCanvasView: NSView {
                                     let visibleByDefault = ca > 10 && !isMagenta(cr, cg, cb) && !(cr > 240 && cg > 240 && cb > 240)
                                     if visibleByDefault { shown += 1 } else { hidden += 1 }
                                 }
-                                if hidden > shown { found.maskInvert = true }
+                                if hidden > shown {
+                                    found.maskInvert = true
+                                    // The clip image marks the viz-visible area as the pixels NOT
+                                    // covered by transparencyColor hole — e.g. Charlies Angels' vis.gif
+                                    // is black exactly over the silhouette shape of visoutline.gif
+                                    // (and white over the hole + grey gradient panel). The viz should
+                                    // render filling that silhouette shape, so punch the cover
+                                    // transparent there too (revealing the viz through what was an
+                                    // opaque silhouette) and build a viz mask restricted to just that
+                                    // silhouette region. The hole pixels stay excluded (white in
+                                    // vis.gif) so they reveal the main skin background behind "vis"
+                                    // rather than the viz.
+                                    var extraRegion = [Bool](repeating: false, count: coverMD.width * coverMD.height)
+                                    var hasExtra = false
+                                    for i in 0 ..< (coverMD.width * coverMD.height) {
+                                        let o = i * 4
+                                        let isHole = coverMD.bytes[o + 3] > 10
+                                            && colorMatches(coverMD.bytes[o], coverMD.bytes[o + 1], coverMD.bytes[o + 2],
+                                                            holeRGB.0, holeRGB.1, holeRGB.2)
+                                        guard !isHole else { continue }
+                                        let cr = clipMD.bytes[o], cg = clipMD.bytes[o + 1], cb = clipMD.bytes[o + 2], ca = clipMD.bytes[o + 3]
+                                        let clipVisibleByDefault = ca > 10 && !isMagenta(cr, cg, cb) && !(cr > 240 && cg > 240 && cb > 240)
+                                        if clipVisibleByDefault {
+                                            extraRegion[i] = true
+                                            hasExtra = true
+                                        }
+                                    }
+                                    if hasExtra {
+                                        if let punched = punchTransparent(img, region: extraRegion) {
+                                            found.covers[found.covers.count - 1] =
+                                                (subview: sv, bgImage: punched, frame: svBgFrame, drawRect: svBgFrame)
+                                        }
+                                        found.customVizMask = buildRegionMaskLayerImage(
+                                            region: extraRegion, width: coverMD.width, height: coverMD.height,
+                                            targetSize: found.1.size)
+                                    }
+                                }
                             }
                         }
                     }
@@ -2296,7 +2363,8 @@ public final class SkinCanvasView: NSView {
         ancestorHidden: Bool = false,
         maskImageName: String? = nil,
         maskHoleColor: (UInt8, UInt8, UInt8)? = nil,
-        maskInvert: Bool = false
+        maskInvert: Bool = false,
+        customVizMask: CGImage? = nil
     ) {
         if vizProvider == nil, let provider = prebuiltVisualizationProvider ?? makeVisualizationProvider?() {
             vizProvider  = provider
@@ -2323,7 +2391,7 @@ public final class SkinCanvasView: NSView {
             // works correctly in a layer-backed hierarchy when wantsBestResolutionOpenGLSurface=true
             // is set (which configure() does before creating the OpenGL context).
             let resolvedMaskName = maskImageName ?? (cache.mapData["vis_mask.gif"] != nil ? "vis_mask.gif" : nil)
-            let resolvedMaskImg: CGImage? = resolvedMaskName.flatMap { cache.mapData[$0] }.flatMap { md in
+            let resolvedMaskImg: CGImage? = customVizMask ?? resolvedMaskName.flatMap { cache.mapData[$0] }.flatMap { md in
                 if let holeColor = maskHoleColor {
                     return buildHoleMaskLayerImage(from: md, holeColor: holeColor, targetSize: frame.size)
                 }
@@ -2458,6 +2526,54 @@ public final class SkinCanvasView: NSView {
                        intent: .defaultIntent)
     }
 
+    /// Builds an RGBA CGImage suitable for use as a `CALayer.mask` contents from a
+    /// precomputed boolean `region` (indexed in `MapData` row order, `true` = show the
+    /// viz). Used when the viz-visible area can't be expressed as a simple color/invert
+    /// rule on a single image — e.g. Charlies Angels' viz-visible area is vis.gif's black
+    /// silhouette region (matching visoutline.gif's silhouette shape).
+    private func buildRegionMaskLayerImage(region: [Bool], width: Int, height: Int, targetSize: CGSize) -> CGImage? {
+        let tw = max(1, Int(targetSize.width))
+        let th = max(1, Int(targetSize.height))
+        var bytes = [UInt8](repeating: 0, count: tw * th * 4)
+        for dstRow in 0 ..< th {
+            let srcRow = (dstRow * height / th)
+            for dstCol in 0 ..< tw {
+                let srcCol = min(width - 1, dstCol * width / tw)
+                let si = srcRow * width + srcCol
+                guard si < region.count else { continue }
+                let alpha: UInt8 = region[si] ? 255 : 0
+                let di = (dstRow * tw + dstCol) * 4
+                bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
+            }
+        }
+        guard let space    = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: tw, height: th,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: tw * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// Returns a copy of `image` with alpha zeroed at every pixel where `region` (indexed
+    /// in `MapData` row order) is true. Used to extend a cover image's transparency beyond
+    /// its own transparencyColor hole into an area the viz mask now also covers.
+    private func punchTransparent(_ image: NSImage, region: [Bool]) -> NSImage? {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let ctx = makeBitmapContext(width: cg.width, height: cg.height)
+        else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        guard let data = ctx.data else { return nil }
+        let pixels = data.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
+        for i in 0 ..< min(cg.width * cg.height, region.count) where region[i] {
+            let o = i * 4
+            pixels[o] = 0; pixels[o + 1] = 0; pixels[o + 2] = 0; pixels[o + 3] = 0
+        }
+        guard let result = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: result, size: image.size)
+    }
+
     /// Builds an RGBA CGImage suitable for use as a `CALayer.mask` contents, where pixels
     /// matching `holeColor` (the "screen" hole, e.g. transparencyColor) become opaque (show
     /// the viz) and all other pixels become alpha=0 (hide the viz, revealing the
@@ -2479,6 +2595,73 @@ public final class SkinCanvasView: NSView {
                 let alpha: UInt8 = visible ? 255 : 0
                 let di = (dstRow * tw + dstCol) * 4
                 bytes[di] = alpha; bytes[di+1] = alpha; bytes[di+2] = alpha; bytes[di+3] = alpha
+            }
+        }
+        guard let space    = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: tw, height: th,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: tw * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// Recursively collects `(MapData, frame)` pairs for `elements` and their descendants
+    /// whose `backgroundImage` uses the same hole-mask convention as the cover that
+    /// triggered this search: a `clippingColor` plus a `transparencyColor` matching
+    /// `holeColor`. `offset` accumulates each subview's left/top so frames are expressed
+    /// in the same view-coordinate space as `vizFrame`. Used by circle07's digit
+    /// subviews (sHundreds/sTens/sOnes, backgroundImage num<n>.bmp) so the viz shows
+    /// through the magenta "lit segment" pixels of whichever digit is displayed.
+    private func collectHoleMaskRegions(in elements: [SkinElement], holeColor: (UInt8, UInt8, UInt8),
+                                         offset: CGPoint, lc: LayoutContext) -> [(md: MapData, frame: CGRect)] {
+        var result: [(md: MapData, frame: CGRect)] = []
+        for element in elements {
+            guard case .subview(let sv) = element else { continue }
+            let sx = liveCoord(sv.base.id, attr: sv.base.left, propName: "left", lc: lc) + offset.x
+            let sy = liveCoord(sv.base.id, attr: sv.base.top,  propName: "top",  lc: lc) + offset.y
+            if let cc = sv.clippingColor, parseAnyColor(cc) != nil,
+               let tc = sv.base.transparencyColor, let tcRGB = parseAnyColor(tc),
+               colorMatches(tcRGB.0, tcRGB.1, tcRGB.2, holeColor.0, holeColor.1, holeColor.2),
+               let bgName = (sv.base.id.flatMap { engine?.state(for: $0)?.backgroundImage } ?? sv.backgroundImage)?.lowercased(),
+               let md = cache.mapData[bgName] {
+                let w = resolveCoord(sv.base.width,  lc: lc) ?? CGFloat(md.width)
+                let h = resolveCoord(sv.base.height, lc: lc) ?? CGFloat(md.height)
+                result.append((md: md, frame: CGRect(x: sx, y: sy, width: w, height: h)))
+            }
+            result += collectHoleMaskRegions(in: sv.children, holeColor: holeColor,
+                                              offset: CGPoint(x: sx, y: sy), lc: lc)
+        }
+        return result
+    }
+
+    /// Builds a CALayer mask image (see `buildHoleMaskLayerImage`) that is the union of
+    /// several `(MapData, frame)` regions: for every region, pixels matching `holeColor`
+    /// become opaque (show the viz) at the corresponding position within `targetSize`,
+    /// scaled from the region's own pixel dimensions to its `frame` size. All other
+    /// pixels stay alpha=0 (hide the viz).
+    private func buildCombinedHoleMaskLayerImage(regions: [(md: MapData, frame: CGRect)],
+                                                   holeColor: (UInt8, UInt8, UInt8),
+                                                   targetSize: CGSize) -> CGImage? {
+        let tw = max(1, Int(targetSize.width))
+        let th = max(1, Int(targetSize.height))
+        var bytes = [UInt8](repeating: 0, count: tw * th * 4)
+        for (md, frame) in regions {
+            guard md.width > 0, md.height > 0 else { continue }
+            let fx0 = Int(frame.minX), fy0 = Int(frame.minY)
+            let fw = max(1, Int(frame.width)), fh = max(1, Int(frame.height))
+            for dstRow in max(0, fy0) ..< min(th, fy0 + fh) {
+                let srcRow = min(md.height - 1, (dstRow - fy0) * md.height / fh)
+                for dstCol in max(0, fx0) ..< min(tw, fx0 + fw) {
+                    let srcCol = min(md.width - 1, (dstCol - fx0) * md.width / fw)
+                    let si = (srcRow * md.width + srcCol) * 4
+                    guard si + 3 < md.bytes.count else { continue }
+                    let r = md.bytes[si], g = md.bytes[si+1], b = md.bytes[si+2], a = md.bytes[si+3]
+                    guard a > 10, colorMatches(r, g, b, holeColor.0, holeColor.1, holeColor.2) else { continue }
+                    let di = (dstRow * tw + dstCol) * 4
+                    bytes[di] = 255; bytes[di+1] = 255; bytes[di+2] = 255; bytes[di+3] = 255
+                }
             }
         }
         guard let space    = CGColorSpace(name: CGColorSpace.sRGB),
@@ -3021,7 +3204,7 @@ public final class SkinCanvasView: NSView {
     /// corner reveal animation) to its own NSImageView, since CGContext only ever draws a
     /// static frame. Plays once: after the GIF's one-pass duration it freezes on its
     /// current frame, matching how WMP plays these intro sequences.
-    private func promoteAnimatedButtonGif(_ b: Button, offset: CGPoint, lc: LayoutContext, ancestors: [ElementBase]) {
+    private func promoteAnimatedButtonGif(_ b: Button, offset: CGPoint, lc: LayoutContext, ancestors: [ElementBase], siblingSliders: [Slider] = []) {
         guard let bundle,
               let id = b.base.id, animatedButtonViews[id] == nil,
               let name = b.image, name.lowercased().hasSuffix(".gif"),
@@ -3044,6 +3227,13 @@ public final class SkinCanvasView: NSView {
         let img = loadGifMagentaFree(url: bundle.assetURL(named: name), extraTransparent: extra) ?? raw
 
         let frame = NSRect(x: x, y: y, width: w, height: h)
+        if siblingSliders.contains(where: { sliderFrame($0, offset: offset, lc: lc).intersects(frame) }) {
+            // Leave this to the normal CGContext button draw, which respects z-order
+            // (the slider drawn after it will cover it as intended) — at the cost of
+            // losing the multi-frame pulse animation, since CG draws only one frame.
+            return
+        }
+
         let iv = NSImageView(frame: frame)
         iv.image        = img
         iv.animates     = true
@@ -3062,6 +3252,32 @@ public final class SkinCanvasView: NSView {
         animatedButtonBases[id]      = b.base
         animatedButtonAncestors[id]  = ancestors
         animatedButtonCurrentImage[id] = lower
+    }
+
+    /// Computes a slider's on-screen frame using the same width/height fallback
+    /// logic as `collectSliders`, without its live-coord side effects — used only
+    /// to check whether an animated-GIF button sits under a slider that should
+    /// draw on top of it.
+    private func sliderFrame(_ s: Slider, offset: CGPoint, lc: LayoutContext) -> CGRect {
+        let x = (resolveCoord(s.base.left, lc: lc) ?? 0) + offset.x
+        let y = (resolveCoord(s.base.top,  lc: lc) ?? 0) + offset.y
+        let posMD = s.positionImage.flatMap { cache.mapData[$0.lowercased()] }
+        var w = resolveCoord(s.base.width,  lc: lc) ?? CGFloat(posMD?.width  ?? 0)
+        var h = resolveCoord(s.base.height, lc: lc) ?? CGFloat(posMD?.height ?? 0)
+        if let pd = posMD, pd.width > 0 {
+            if w == 0 { w = CGFloat(pd.width)  }
+            if h == 0 { h = CGFloat(pd.height) }
+        }
+        if w == 0 || h == 0 {
+            let trackImg = (s.backgroundImage ?? s.foregroundImage).flatMap { cache.images[$0.lowercased()] }
+            if w == 0 { w = trackImg?.size.width  ?? 0 }
+            if h == 0 { h = trackImg?.size.height ?? 0 }
+        }
+        if w == 0 || h == 0, let n = s.thumbImage, let img = cache.images[n.lowercased()] {
+            if w == 0 { w = img.size.width  }
+            if h == 0 { h = img.size.height }
+        }
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// Builds (and caches) composite hover-flash frames for buttongroup `i`'s `maskKey`
@@ -3223,9 +3439,18 @@ public final class SkinCanvasView: NSView {
         guard let bundle else { return [] }
         var gifNSViewAddedToList = false
         var createdGifIds: [String] = []
-        for element in sortedByZIndex(elements) {
+        let sorted = sortedByZIndex(elements)
+        for (idx, element) in sorted.enumerated() {
             if case .button(let b) = element {
-                promoteAnimatedButtonGif(b, offset: offset, lc: lc, ancestors: ancestors)
+                // Sliders drawn after this button (same/higher z) that overlap it are
+                // meant to render on top of it (e.g. Halo2's lblVol/lblSeek hover-glow
+                // labels sit under the volume/seek sliders). Promoting such a button's
+                // animated GIF would put it on an NSImageView above all CGContext
+                // content, inverting that z-order and covering the slider's fill.
+                let siblingSliders: [Slider] = sorted[(idx + 1)...].compactMap {
+                    if case .slider(let s) = $0 { return s } else { return nil }
+                }
+                promoteAnimatedButtonGif(b, offset: offset, lc: lc, ancestors: ancestors, siblingSliders: siblingSliders)
                 continue
             }
             guard case .subview(let sv) = element else { continue }
@@ -3334,14 +3559,16 @@ public final class SkinCanvasView: NSView {
                     if let dur = gifOnePassDuration(raw, excludingLastFrame: true) {
                         let animId = sv.base.id
                         let animIsClose = name.lowercased().contains("close")
-                        let animIsOpen  = name.lowercased().contains("open")
                         DispatchQueue.main.asyncAfter(deadline: .now() + dur) { [weak self, weak iv] in
                             iv?.animates = false
+                            // Show the WMS static fallback only for close animations (e.g. a
+                            // close GIF that ends at the static-closed state). Open and intro
+                            // animations (e.g. m_intro_anim.gif) leave the element in the open
+                            // state — hide the NSImageView so the open content shows through.
                             if let self, let id = animId,
-                               !animIsClose,
+                               animIsClose,
                                let wms = self.animatedSubviewWmsBackground[id],
                                !wms.hasSuffix(".gif"),
-                               !animIsOpen,
                                let img = self.cache.images[wms]
                                          ?? self.bundle.flatMap({ NSImage(contentsOf: $0.assetURL(named: wms)) }) {
                                 iv?.image    = img
