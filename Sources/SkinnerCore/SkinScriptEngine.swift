@@ -543,7 +543,7 @@ final class SkinScriptEngine {
                     // directly from the pref-change bridge (no timer), force controlStatus
                     // false so the function enters the remote-call processing branch instead
                     // of the player-state-sync branch it takes on the very first invocation.
-                    self?.evaluate("controlStatus = false; (typeof checkRemoteViewStatus==='function')&&checkRemoteViewStatus()")
+                    self?.evaluate("controlStatus = false; (typeof checkRemoteViewStatus==='function')&&checkRemoteViewStatus(); (typeof checkViewStatus==='function')&&checkViewStatus()")
                 }
             }
         }

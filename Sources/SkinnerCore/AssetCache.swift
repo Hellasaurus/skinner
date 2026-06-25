@@ -329,7 +329,9 @@ private func buildGroupAssets(_ group: ButtonGroup,
                 perButton[match.key] = [Bool](repeating: false, count: md.width * md.height)
             }
             perButton[match.key]![i] = true
-        } else if !isMagenta(r, g, b), !(r > 240 && g > 240 && b > 240) {
+        } else if !isMagenta(r, g, b), !(r > 240 && g > 240 && b > 240), !(r < 16 && g < 16 && b < 16) {
+            // Exclude black: some skins use black (not magenta) as the mapping background.
+            // Black pixels = transparent zone, same convention as magenta/white.
             fullRegion[i] = true
         }
     }
