@@ -2310,6 +2310,7 @@ public final class SkinCanvasView: NSView {
                         guard case .subview(let sib) = sibling,
                               sib.base.id != sv.base.id,
                               (sib.base.zIndex ?? 0) > effectsParentZIndex,
+                              (sib.base.zIndex ?? 0) >= 0,
                               !elementIsHidden(sib.base, live: true) else { continue }
                         let liveBgName = (sib.base.id.flatMap { engine?.state(for: $0)?.backgroundImage }
                                           ?? sib.backgroundImage)?.lowercased()
@@ -2743,9 +2744,22 @@ public final class SkinCanvasView: NSView {
 
             // Draw positive-zIndex children of the cover subview (nil for view-level covers).
             let aboveChildren = sv?.children.filter { ($0.base?.zIndex ?? 0) >= 0 } ?? []
+            // Negative-zIndex children render BETWEEN the viz and parent background in CGContext
+            // z-order; composite them here so they appear above the viz NSView but below bgImage.
+            // Exclude subviews that contain <effects> — those define the viz viewport and must
+            // not be drawn into the composite (doing so would paint over the viz NSView area).
+            let belowChildren = (sv?.children ?? []).filter { el in
+                guard (el.base?.zIndex ?? 0) < 0 else { return false }
+                if case .subview(let s) = el {
+                    return !s.children.contains { if case .effects = $0 { return true }; return false }
+                }
+                return true
+            }
             let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
             let coverButtons  = collectButtons(in: aboveChildren, offset: coverOffset, lc: lc)
             let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
+            let belowButtons  = collectButtons(in: belowChildren, offset: coverOffset, lc: lc)
+            let belowSliders  = collectSliders(in: belowChildren, offset: coverOffset, lc: lc)
 
             // Global groups/buttons/sliders that intersect the viz cover frame but live
             // outside the cover subview's child tree (already drawn via aboveChildren).
@@ -2766,7 +2780,11 @@ public final class SkinCanvasView: NSView {
             // viz NSView even though they're meant to stay behind the whole head unit.
             let coverRootZ = sv?.base.zIndex ?? 0
             func isInFrontOfCover(_ ancestors: [ElementBase], ownZIndex: Int?) -> Bool {
-                (ancestors.first?.zIndex ?? ownZIndex ?? 0) >= coverRootZ
+                // If any ancestor sits in a negative-zIndex "below" group it draws before its
+                // grandparent's background — not in front of the cover (e.g. visDrop buttons
+                // inside head.bmp: visDrop.zIndex=-1 → draws before head.bmp background).
+                if ancestors.contains(where: { ($0.zIndex ?? 0) < 0 }) { return false }
+                return (ancestors.first?.zIndex ?? ownZIndex ?? 0) >= coverRootZ
             }
             let extraGroups = groups.filter {
                 !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
@@ -2794,12 +2812,12 @@ public final class SkinCanvasView: NSView {
                                  w: Int(frame.width), h: Int(frame.height),
                                  extra: "\(ObjectIdentifier(info.bgImage))")
             ]
-            for b in coverButtons + extraButtons {
+            for b in belowButtons + coverButtons + extraButtons {
                 let js = b.model.base.id.flatMap { engine?.state(for: $0) }
                 sig.append(vizCoverSigEntry(id: b.model.base.id, frame: b.frame,
                     extra: "\(b.isPressed)|\(b.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"))
             }
-            for s in coverSliders + extraSliders {
+            for s in belowSliders + coverSliders + extraSliders {
                 sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: "\(s.frameIndex)"))
             }
             for g in extraGroups {
@@ -2822,6 +2840,15 @@ public final class SkinCanvasView: NSView {
                 // Draw the background at its canvas rect. For parent covers frame==drawRect;
                 // for sibling covers drawRect is the full sibling rect while frame is the
                 // intersection with the viz — only the overlapping portion is painted.
+                // Draw negative-zIndex children before parent background (they sit between
+                // viz content and parent bg in CGContext z-order).
+                if !belowChildren.isEmpty {
+                    var bi2 = 0
+                    var si2 = 0
+                    drawElements(belowChildren, offset: coverOffset, lc: lc, ctx: imgCtx,
+                                 buttonIdx: &bi2, sliderIdx: &si2,
+                                 buttonOverride: belowButtons, sliderOverride: belowSliders)
+                }
                 if info.subview?.backgroundTiled == true {
                     drawTiledImage(info.bgImage, in: info.drawRect, ctx: imgCtx)
                 } else {
@@ -2863,6 +2890,10 @@ public final class SkinCanvasView: NSView {
                 \(id).next = function() { _vizNext(); };
                 \(id).previous = function() { _vizPrev(); };
                 Object.defineProperty(\(id), 'effectTitle', {
+                    get: function() { return _vizPresetName(); },
+                    configurable: true
+                });
+                Object.defineProperty(\(id), 'currentPresetTitle', {
                     get: function() { return _vizPresetName(); },
                     configurable: true
                 });
