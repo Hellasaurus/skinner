@@ -2757,17 +2757,31 @@ public final class SkinCanvasView: NSView {
                 guard let id = svId else { return false }
                 return ancestors.contains { $0.id == id }
             }
+            // An element living in a sibling subtree only belongs in front of this cover if
+            // its own root-level subview actually draws after (>=) the cover subview in
+            // document z-order. Without this, an unrelated subview that's behind the cover
+            // (e.g. Headspace's sEqEar drawer, zIndex=-1, vs. the head subview's zIndex=0)
+            // can have its children swept in as "extra" just because their on-screen frame
+            // transiently overlaps the cover's frame while sliding — drawing them above the
+            // viz NSView even though they're meant to stay behind the whole head unit.
+            let coverRootZ = sv?.base.zIndex ?? 0
+            func isInFrontOfCover(_ ancestors: [ElementBase], ownZIndex: Int?) -> Bool {
+                (ancestors.first?.zIndex ?? ownZIndex ?? 0) >= coverRootZ
+            }
             let extraGroups = groups.filter {
                 !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
                     && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+                    && isInFrontOfCover($0.ancestorBases, ownZIndex: $0.model.base.zIndex)
             }
             let extraButtons = buttons.filter {
                 !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
                     && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+                    && isInFrontOfCover($0.ancestorBases, ownZIndex: $0.model.base.zIndex)
             }
             let extraSliders = sliders.filter {
                 !elementIsHidden($0.model.base, live: true) && ancestorsVisible($0.ancestorBases)
                     && $0.frame.intersects(frame) && !isOwnedByCover($0.ancestorBases)
+                    && isInFrontOfCover($0.ancestorBases, ownZIndex: $0.model.base.zIndex)
             }
 
             // Cheap signature of everything the composite below depends on. Skips the

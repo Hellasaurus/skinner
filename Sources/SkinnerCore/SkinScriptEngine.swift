@@ -583,6 +583,10 @@ final class SkinScriptEngine {
 
         let playSoundBridge: @convention(block) (String) -> Void = { [weak self] filename in
             guard let self else { return }
+            // Don't play real audio when running under `swift test` — skins click
+            // buttons that trigger onClick sounds, which would otherwise play over
+            // the system audio output during a headless test run.
+            guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
             let lower = filename.lowercased()
             let master: NSSound
             if let cached = self.soundCache[lower] {
