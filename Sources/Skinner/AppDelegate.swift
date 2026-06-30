@@ -129,7 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let canvas = preferences.map { SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle, preferences: $0) }
             ?? SkinCanvasView(skinView: skinView, cache: cache, bundle: bundle)
         canvas.onOpenView   = { [weak self] id in self?.openSecondaryView(id) }
-        canvas.onDroppedURL = { [weak self] url in self?.openMedia(url) }
+        canvas.onDroppedURLs = { [weak self] urls in self?.openMediaMultiple(urls) }
         canvas.beginStartupAnimation()
         return canvas
     }
@@ -138,6 +138,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openMedia(_ url: URL) {
         player?.open(url: url)
+    }
+
+    private func openMediaMultiple(_ urls: [URL]) {
+        let expanded = urls.flatMap { expandMedia($0) }
+        guard !expanded.isEmpty else { return }
+        player?.open(url: expanded[0])
+        for url in expanded.dropFirst() {
+            player?.playlistAdd(url: url)
+        }
+    }
+
+    private func expandMedia(_ url: URL) -> [URL] {
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        if isDir.boolValue {
+            let fm = FileManager.default
+            guard let enumerator = fm.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { return [] }
+            return enumerator.compactMap { $0 as? URL }
+                .filter { isAudioOrVideo($0) }
+                .sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
+        } else {
+            return isAudioOrVideo(url) ? [url] : []
+        }
+    }
+
+    private func isAudioOrVideo(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["mp3","m4a","aac","wav","aiff","aif","flac","ogg","wma",
+                "mp4","m4v","mov","mkv","avi"].contains(ext)
     }
 
     @objc private func pickMediaFromMenu() {

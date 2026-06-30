@@ -81,7 +81,7 @@ public final class SkinCanvasView: NSView {
 
     public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
     public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
-    public var onDroppedURL: ((URL) -> Void)?
+    public var onDroppedURLs: (([URL]) -> Void)?
 
     private var playerBackend: (any PlayerBackend)?
     private var timerWorkItem: DispatchWorkItem?
@@ -1833,8 +1833,8 @@ public final class SkinCanvasView: NSView {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         guard let urls = sender.draggingPasteboard
                 .readObjects(forClasses: [NSURL.self], options: opts) as? [URL],
-              let url = urls.first else { return false }
-        onDroppedURL?(url)
+              !urls.isEmpty else { return false }
+        onDroppedURLs?(urls)
         return true
     }
 
