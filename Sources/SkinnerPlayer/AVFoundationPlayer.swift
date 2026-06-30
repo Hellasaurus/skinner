@@ -59,18 +59,28 @@ public final class AVFoundationPlayer: PlayerBackend {
 
     // MARK: - Playlist state
 
-    private var playlist:     [URL] = []
-    private var currentIndex: Int   = -1
+    private struct PlaylistItem {
+        var url: URL
+        var title: String
+        var duration: Double  // seconds; 0 if unresolvable
+    }
+
+    private var playlistItems: [PlaylistItem] = []
+    private var currentIndex:  Int = -1
+
+    private var playlist: [URL] { playlistItems.map(\.url) }
 
     // MARK: - Publishers
 
-    private let playStateSubject = CurrentValueSubject<PlayState, Never>(.stopped)
-    private let positionSubject  = CurrentValueSubject<Double,    Never>(0)
-    private let openStateSubject = CurrentValueSubject<OpenState, Never>(.undefined)
+    private let playStateSubject  = CurrentValueSubject<PlayState, Never>(.stopped)
+    private let positionSubject   = CurrentValueSubject<Double,    Never>(0)
+    private let openStateSubject  = CurrentValueSubject<OpenState, Never>(.undefined)
+    private let playlistSubject   = PassthroughSubject<Void, Never>()
 
-    public var playStatePublisher: AnyPublisher<PlayState, Never> { playStateSubject.eraseToAnyPublisher() }
-    public var positionPublisher:  AnyPublisher<Double,    Never> { positionSubject.eraseToAnyPublisher() }
-    public var openStatePublisher: AnyPublisher<OpenState, Never> { openStateSubject.eraseToAnyPublisher() }
+    public var playStatePublisher:  AnyPublisher<PlayState, Never> { playStateSubject.eraseToAnyPublisher() }
+    public var positionPublisher:   AnyPublisher<Double,    Never> { positionSubject.eraseToAnyPublisher() }
+    public var openStatePublisher:  AnyPublisher<OpenState, Never> { openStateSubject.eraseToAnyPublisher() }
+    public var playlistPublisher:   AnyPublisher<Void,      Never> { playlistSubject.eraseToAnyPublisher() }
 
     // MARK: - Audio engine
 
@@ -178,15 +188,22 @@ public final class AVFoundationPlayer: PlayerBackend {
 
     private func loadMetadata(from url: URL) {
         currentItemURL = url.absoluteString
+        let idx = currentIndex
         Task { @MainActor in
             let asset    = AVURLAsset(url: url)
             let metadata = (try? await asset.load(.commonMetadata)) ?? []
             let titleItems = AVMetadataItem.metadataItems(
                 from: metadata, filteredByIdentifier: .commonIdentifierTitle)
-            if let title = try? await titleItems.first?.load(.stringValue), !title.isEmpty {
-                self.currentItemTitle = title
+            let title: String
+            if let t = try? await titleItems.first?.load(.stringValue), !t.isEmpty {
+                title = t
             } else {
-                self.currentItemTitle = url.deletingPathExtension().lastPathComponent
+                title = url.deletingPathExtension().lastPathComponent
+            }
+            self.currentItemTitle = title
+            if self.playlistItems.indices.contains(idx) {
+                self.playlistItems[idx].title = title
+                self.playlistSubject.send()
             }
             self.openStateSubject.send(.mediaOpen)
         }
@@ -209,17 +226,76 @@ public final class AVFoundationPlayer: PlayerBackend {
     // MARK: - PlayerBackend
 
     public func open(url: URL) {
-        playlist     = [url]
-        currentIndex = 0
+        playlistItems = [makeItem(url)]
+        currentIndex  = 0
+        playlistSubject.send()
         loadItem(at: 0, autoPlay: false)
     }
 
     public func enqueue(_ url: URL) {
-        playlist.append(url)
+        playlistItems.append(makeItem(url))
+        playlistSubject.send()
         if currentIndex < 0 {
             currentIndex = 0
             loadItem(at: 0, autoPlay: false)
         }
+    }
+
+    // MARK: - Playlist protocol
+
+    public var playlistCount: Int { playlistItems.count }
+    public var currentPlaylistIndex: Int { currentIndex }
+
+    public func playlistItemTitle(at index: Int) -> String {
+        guard playlistItems.indices.contains(index) else { return "" }
+        return playlistItems[index].title
+    }
+
+    public func playlistItemURL(at index: Int) -> String {
+        guard playlistItems.indices.contains(index) else { return "" }
+        return playlistItems[index].url.absoluteString
+    }
+
+    public func playlistItemDuration(at index: Int) -> Double {
+        guard playlistItems.indices.contains(index) else { return 0 }
+        return playlistItems[index].duration
+    }
+
+    public func playlistPlay(at index: Int) {
+        guard playlistItems.indices.contains(index) else { return }
+        currentIndex = index
+        loadItem(at: index, autoPlay: true)
+    }
+
+    public func playlistAdd(url: URL) {
+        enqueue(url)
+    }
+
+    public func playlistClear() {
+        playerNode.stop()
+        stopPositionTimer()
+        loadGeneration += 1
+        playlistItems    = []
+        currentIndex     = -1
+        currentAudioFile = nil
+        currentItemTitle = ""
+        currentItemURL   = ""
+        _seekPosition    = 0
+        _pausePosition   = 0
+        set(openState: .undefined)
+        set(playState: .stopped)
+        playlistSubject.send()
+    }
+
+    private func makeItem(_ url: URL) -> PlaylistItem {
+        let title    = url.deletingPathExtension().lastPathComponent
+        let duration: Double
+        if let f = try? AVAudioFile(forReading: url) {
+            duration = Double(f.length) / f.processingFormat.sampleRate
+        } else {
+            duration = 0
+        }
+        return PlaylistItem(url: url, title: title, duration: duration)
     }
 
     public func play() {

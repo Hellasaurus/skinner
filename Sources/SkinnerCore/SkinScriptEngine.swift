@@ -975,6 +975,26 @@ final class SkinScriptEngine {
             MainActor.assumeIsolated { self?.playerBackend?.currentEQPresetTitle ?? "" }
         }
 
+        // Playlist
+        let getPlaylistCount: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.playlistCount ?? 0 }
+        }
+        let getPlaylistIndex: @convention(block) () -> Int = { [weak self] in
+            MainActor.assumeIsolated { self?.playerBackend?.currentPlaylistIndex ?? -1 }
+        }
+        let getPlaylistItemTitle: @convention(block) (Int) -> String = { [weak self] i in
+            MainActor.assumeIsolated { self?.playerBackend?.playlistItemTitle(at: i) ?? "" }
+        }
+        let getPlaylistItemURL: @convention(block) (Int) -> String = { [weak self] i in
+            MainActor.assumeIsolated { self?.playerBackend?.playlistItemURL(at: i) ?? "" }
+        }
+        let getPlaylistItemDuration: @convention(block) (Int) -> Double = { [weak self] i in
+            MainActor.assumeIsolated { self?.playerBackend?.playlistItemDuration(at: i) ?? 0 }
+        }
+        let playlistPlayAt: @convention(block) (Int) -> Void = { [weak self] i in
+            MainActor.assumeIsolated { self?.playerBackend?.playlistPlay(at: i) }
+        }
+
         for (name, val): (NSString, Any) in [
             ("_skinnerGetPlayState",      getPlayState),    ("_skinnerGetOpenState",  getOpenState),
             ("_skinnerGetURL",            getURL),          ("_skinnerGetPosition",   getPosition),
@@ -995,6 +1015,12 @@ final class SkinScriptEngine {
             ("_skinnerGetEQPresetTitleAt", getEQPresetTitleAt),
             ("_skinnerEQNextPreset",       eqNextPreset),   ("_skinnerEQPrevPreset",    eqPrevPreset),
             ("_skinnerEQReset",            eqReset),        ("_skinnerGetEQPresetTitle",getEQPresetTitle),
+            ("_skinnerGetPlaylistCount",       getPlaylistCount),
+            ("_skinnerGetPlaylistIndex",       getPlaylistIndex),
+            ("_skinnerGetPlaylistItemTitle",   getPlaylistItemTitle),
+            ("_skinnerGetPlaylistItemURL",     getPlaylistItemURL),
+            ("_skinnerGetPlaylistItemDuration",getPlaylistItemDuration),
+            ("_skinnerPlaylistPlayAt",         playlistPlayAt),
         ] { context.setObject(val, forKeyedSubscript: name) }
 
         context.evaluateScript("""
@@ -1002,9 +1028,31 @@ final class SkinScriptEngine {
         Object.defineProperty(player, 'openState', { get: function() { return _skinnerGetOpenState(); }, configurable: true });
         Object.defineProperty(player, 'URL', { get: function() { return _skinnerGetURL(); }, set: function(v) { _skinnerOpenURL(v); }, configurable: true });
         Object.defineProperty(player.currentPlaylist, 'count', {
-            get: function() { return _skinnerGetOpenState() == osMediaOpen ? 1 : 0; },
+            get: function() { return _skinnerGetPlaylistCount(); },
             configurable: true
         });
+        Object.defineProperty(player.currentPlaylist, 'Count', {
+            get: function() { return _skinnerGetPlaylistCount(); },
+            configurable: true
+        });
+        player.currentPlaylist.item = function(i) {
+            var idx = i;
+            return {
+                getItemInfo: function(k) {
+                    var key = k.toLowerCase();
+                    if (key === 'title' || key === 'name') return _skinnerGetPlaylistItemTitle(idx);
+                    if (key === 'sourceurl' || key === 'url') return _skinnerGetPlaylistItemURL(idx);
+                    if (key === 'duration') return String(_skinnerGetPlaylistItemDuration(idx));
+                    return '';
+                },
+                getiteminfo: function(k) { return this.getItemInfo(k); },
+                sourceURL:   _skinnerGetPlaylistItemURL(idx),
+                name:        _skinnerGetPlaylistItemTitle(idx),
+                duration:    _skinnerGetPlaylistItemDuration(idx)
+            };
+        };
+        player.currentPlaylist.getItemInfo = function(k) { return ''; };
+        player.currentPlaylist.getiteminfo = function(k) { return ''; };
 
         player.controls.play        = function()     { _skinnerPlay();             };
         player.controls.pause       = function()     { _skinnerPause();            };
@@ -1126,6 +1174,15 @@ final class SkinScriptEngine {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.onStateChanged?()
+            }
+            .store(in: &backendCancellables)
+
+        backend.playlistPublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if let script = self.playerCallbacks?.currentPlaylistOnChange { self.evaluate(script) }
+                self.onStateChanged?()
             }
             .store(in: &backendCancellables)
     }

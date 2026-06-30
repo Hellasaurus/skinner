@@ -73,6 +73,17 @@ public protocol PlayerBackend: AnyObject {
     @discardableResult
     func installPCMTap(handler: @escaping @Sendable ([Float]) -> Void) -> PCMTapToken
     func removePCMTap(_ token: PCMTapToken)
+
+    // Playlist
+    var playlistCount: Int { get }
+    var currentPlaylistIndex: Int { get }
+    func playlistItemTitle(at index: Int) -> String
+    func playlistItemURL(at index: Int) -> String
+    func playlistItemDuration(at index: Int) -> Double  // seconds
+    func playlistPlay(at index: Int)
+    func playlistAdd(url: URL)
+    func playlistClear()
+    var playlistPublisher: AnyPublisher<Void, Never> { get }
 }
 
 public typealias PCMTapToken = AnyObject

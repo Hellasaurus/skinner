@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ImageIO
 
 // MARK: - SkinCanvasView
@@ -98,6 +99,8 @@ public final class SkinCanvasView: NSView {
     private var vizCoverInfos: [VizCoverInfo] = []
     private var lastVizCoverSignatures: [[VizCoverSigEntry]]?
 
+    private var playlistNSViews: [String: PlaylistViewInfo] = [:]
+
     public func setPlayerBackend(_ backend: any PlayerBackend) {
         playerBackend = backend
         engine?.onStateChanged = { [weak self] in
@@ -112,7 +115,13 @@ public final class SkinCanvasView: NSView {
             vizProvider.configure(backend: backend, presetPath: presetSearchPath())
             vizConfigured = true
         }
+        backend.playlistPublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.reloadPlaylistViews() }
+            .store(in: &playlistCancellables)
     }
+
+    private var playlistCancellables: Set<AnyCancellable> = []
 
     private func updateAnimatedSubviewVisibility() {
         let isPlaying = playerBackend?.playState == .playing
@@ -1181,12 +1190,8 @@ public final class SkinCanvasView: NSView {
                 }
 
             case .playlist(let p):
-                guard !elementIsHidden(p.base, live: true) else { continue }
                 let x = (lc.resolve(p.base.left) ?? 0) + offset.x
                 let y = (lc.resolve(p.base.top)  ?? 0) + offset.y
-                // Only fall back to full view dimensions when there is no attribute at all.
-                // If the attribute exists but can't be resolved (e.g. jscript:someProxy.width),
-                // skip drawing rather than covering the entire view.
                 let w: CGFloat
                 let h: CGFloat
                 if let rw = lc.resolve(p.base.width)        { w = rw }
@@ -1195,12 +1200,8 @@ public final class SkinCanvasView: NSView {
                 if let rh = lc.resolve(p.base.height)       { h = rh }
                 else if p.base.height == nil                 { h = lc.viewHeight }
                 else                                         { continue }
-                let rect = NSRect(x: x, y: y, width: w, height: h)
-                let bg = parseAnyColor(p.backgroundColor ?? "#1a1a2e") ?? (0x1a, 0x1a, 0x2e)
-                NSColor(skinRGB: bg).setFill()
-                NSBezierPath.fill(rect)
-                let fg = parseAnyColor(p.foregroundColor ?? "#cccccc") ?? (0xcc, 0xcc, 0xcc)
-                drawCenteredText("Playlist", in: rect, color: NSColor(skinRGB: fg))
+                let plRect = NSRect(x: x, y: y, width: w, height: h)
+                applyPlaylistNSView(p, rect: plRect)
 
             case .text(let t):
                 guard !elementIsHidden(t.base, live: true) else { continue }
@@ -2998,6 +2999,7 @@ public final class SkinCanvasView: NSView {
         updateAnimatedButtonFrames()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
+        reloadPlaylistViews()
         // Rebuild the click-through mask synchronously so the upcoming draw (below)
         // reflects elements' new positions/images. Deferring this to a later runloop
         // turn caused one stale-mask frame to be drawn first, flashing the background
@@ -3178,6 +3180,105 @@ public final class SkinCanvasView: NSView {
             completedOnePassAnimations.insert(id)
         }
         startupFallbacksShowing.removeAll()
+    }
+
+    // MARK: - Playlist views
+
+    private func applyPlaylistNSView(_ p: Playlist, rect: CGRect) {
+        let key     = p.base.id ?? "_pl"
+        let hidden  = elementIsHidden(p.base, live: true)
+        let bgRGB   = parseAnyColor(p.backgroundColor            ?? "#1a1a2e") ?? (0x1a, 0x1a, 0x2e)
+        let fgRGB   = parseAnyColor(p.foregroundColor            ?? "#cccccc") ?? (0xcc, 0xcc, 0xcc)
+        let plRGB   = parseAnyColor(p.itemPlayingColor           ?? "#ffffff") ?? (0xff, 0xff, 0xff)
+        let plBgRGB = parseAnyColor(p.itemPlayingBackgroundColor ?? "#004bb2") ?? (0x00, 0x4b, 0xb2)
+        let bgColor   = NSColor(skinRGB: bgRGB)
+        let fgColor   = NSColor(skinRGB: fgRGB)
+        let plColor   = NSColor(skinRGB: plRGB)
+        let plBgColor = NSColor(skinRGB: plBgRGB)
+        let columns   = parsePlaylistColumns(p.columns)
+
+        if playlistNSViews[key] == nil {
+            let tv = NSTableView(frame: .zero)
+            tv.style = .plain
+            tv.backgroundColor      = bgColor
+            tv.intercellSpacing     = NSSize(width: 3, height: 0)
+            tv.usesAlternatingRowBackgroundColors = false
+            tv.selectionHighlightStyle = .none
+            tv.rowHeight = 16
+
+            for col in columns {
+                let tc = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(col.key))
+                tc.title = col.title
+                tv.addTableColumn(tc)
+            }
+            if !p.columnsVisible { tv.headerView = nil }
+
+            let ds = PlaylistDataSource()
+            ds.backend    = playerBackend
+            ds.fgColor    = fgColor
+            ds.bgColor    = bgColor
+            ds.playingColor   = plColor
+            ds.playingBgColor = plBgColor
+            ds.columnKeys = columns.map(\.key)
+            tv.dataSource = ds
+            tv.delegate   = ds
+            tv.doubleAction = #selector(playlistRowDoubleClicked(_:))
+            tv.target = self
+
+            let sv = NSScrollView(frame: rect)
+            sv.documentView  = tv
+            sv.hasVerticalScroller   = true
+            sv.hasHorizontalScroller = false
+            sv.autohidesScrollers = true
+            sv.borderType     = .noBorder
+            sv.backgroundColor = bgColor
+            addSubview(sv, positioned: .above, relativeTo: nil)
+
+            let viewInfo = PlaylistViewInfo(scrollView: sv, tableView: tv, dataSource: ds)
+            playlistNSViews[key] = viewInfo
+            tv.reloadData()
+            tv.sizeToFit()
+        }
+
+        let info = playlistNSViews[key]!
+        info.scrollView.frame     = rect
+        info.scrollView.isHidden  = hidden
+        info.tableView.backgroundColor = bgColor
+        info.scrollView.backgroundColor = bgColor
+
+        let nameWidth = rect.width * 0.65
+        let durWidth  = rect.width * 0.35
+        for tc in info.tableView.tableColumns {
+            tc.width = tc.identifier.rawValue == "duration" ? durWidth : nameWidth
+        }
+
+        info.dataSource.backend       = playerBackend
+        info.dataSource.fgColor       = fgColor
+        info.dataSource.bgColor       = bgColor
+        info.dataSource.playingColor   = plColor
+        info.dataSource.playingBgColor = plBgColor
+    }
+
+    private func parsePlaylistColumns(_ spec: String?) -> [(key: String, title: String)] {
+        guard let spec, !spec.isEmpty else { return [("name", "Name")] }
+        return spec.split(separator: ";").compactMap { part in
+            let kv = part.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { return nil }
+            return (String(kv[0]).lowercased(), String(kv[1]))
+        }
+    }
+
+    private func reloadPlaylistViews() {
+        for info in playlistNSViews.values {
+            info.tableView.reloadData()
+            info.tableView.sizeToFit()
+        }
+    }
+
+    @objc private func playlistRowDoubleClicked(_ sender: NSTableView) {
+        let row = sender.clickedRow
+        guard row >= 0 else { return }
+        playerBackend?.playlistPlay(at: row)
     }
 
     // MARK: - Animated GIF subviews
@@ -3776,6 +3877,75 @@ public final class SkinCanvasView: NSView {
         elements.sorted { liveZIndex($0) < liveZIndex($1) }
     }
 
+}
+
+// MARK: - PlaylistViewInfo
+
+private struct PlaylistViewInfo {
+    let scrollView:  NSScrollView
+    let tableView:   NSTableView
+    let dataSource:  PlaylistDataSource
+}
+
+// MARK: - PlaylistDataSource
+
+@MainActor
+private final class PlaylistDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    weak var backend: (any PlayerBackend)?
+    var columnKeys:    [String]  = ["name"]
+    var fgColor:       NSColor   = .lightGray
+    var bgColor:       NSColor   = .black
+    var playingColor:  NSColor   = .white
+    var playingBgColor: NSColor  = NSColor(red: 0, green: 0.29, blue: 0.7, alpha: 1)
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        backend?.playlistCount ?? 0
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let backend else { return nil }
+        let key       = tableColumn?.identifier.rawValue ?? "name"
+        let text      = itemText(for: key, row: row, backend: backend)
+        let isPlaying = row == backend.currentPlaylistIndex
+        let field = NSTextField(labelWithString: text)
+        field.font            = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        field.textColor       = isPlaying ? playingColor : fgColor
+        field.backgroundColor = isPlaying ? playingBgColor : bgColor
+        field.drawsBackground = true
+        field.cell?.truncatesLastVisibleLine = true
+        field.cell?.lineBreakMode = .byTruncatingTail
+        return field
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let v = PlaylistRowView()
+        v.bg = (backend?.currentPlaylistIndex == row) ? playingBgColor : bgColor
+        return v
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 16 }
+
+    private func itemText(for key: String, row: Int, backend: any PlayerBackend) -> String {
+        switch key {
+        case "name", "title":
+            return backend.playlistItemTitle(at: row)
+        case "duration", "time":
+            let d = backend.playlistItemDuration(at: row)
+            guard d > 0 else { return "" }
+            let s = Int(d)
+            return "\(s / 60):\(String(format: "%02d", s % 60))"
+        default:
+            return ""
+        }
+    }
+}
+
+private final class PlaylistRowView: NSTableRowView {
+    var bg: NSColor = .black
+    override func drawBackground(in dirtyRect: NSRect) {
+        bg.setFill(); NSBezierPath.fill(dirtyRect)
+    }
+    override var isSelected: Bool { get { false } set {} }
 }
 
 // MARK: - VizCoverInfo
