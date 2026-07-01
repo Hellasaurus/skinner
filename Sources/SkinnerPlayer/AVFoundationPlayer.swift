@@ -312,12 +312,14 @@ public final class AVFoundationPlayer: PlayerBackend {
     public func pause() {
         guard playState == .playing else { return }
         _pausePosition = currentPosition
+        loadGeneration += 1
         playerNode.stop()
         stopPositionTimer()
         set(playState: .paused)
     }
 
     public func stop() {
+        loadGeneration += 1
         playerNode.stop()
         _seekPosition  = 0
         _pausePosition = 0

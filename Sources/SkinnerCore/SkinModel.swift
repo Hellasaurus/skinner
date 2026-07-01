@@ -110,6 +110,7 @@ public struct Subview: Sendable {
 public enum ButtonKind: Sendable {
     case generic
     case mute
+    case play, pause, stop, next, prev
 }
 
 public struct Button: Sendable {
@@ -141,6 +142,7 @@ public struct ButtonElement: Sendable {
     public var upToolTip: String?
     public var downToolTip: String?
     public var enabled: AttributeValue?
+    public var tabStop: AttributeValue?
     public var onClick: String?
     public var onMouseOver: String?
     public var onMouseDown: String?

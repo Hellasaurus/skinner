@@ -31,7 +31,7 @@ public final class SkinCanvasView: NSView {
     private var lastBgSignatureSize: (w: Int, h: Int) = (0, 0)
     private var opacityMaskCache: [OpacityMaskKey: [Bool]] = [:]
     private let bundle:          SkinBundle?
-    private var dragOrigin:      NSPoint?
+    private var windowDragStart: (screenPt: NSPoint, windowOrigin: NSPoint)?
     private var resizeDragState: (startPt: NSPoint, startFrame: NSRect)?
     private var isResizingFromJS = false
     private var activeSliderIdx: Int?
@@ -1503,8 +1503,8 @@ public final class SkinCanvasView: NSView {
     private func resolvedSliderValue(_ s: Slider) -> Double {
         let minV = s.min?.doubleValue ?? 0
         let maxV = s.max?.doubleValue ?? 1
-        let rawV = s.value?.doubleValue   // nil for wmpprop: bindings → default center
-        let v    = rawV ?? ((minV + maxV) / 2)
+        let rawV = s.value?.doubleValue   // nil for wmpprop/jsExpr bindings
+        let v    = rawV ?? 0
         guard maxV > minV else { return 0 }
         return min(1, max(0, (v - minV) / (maxV - minV)))
     }
@@ -1572,9 +1572,15 @@ public final class SkinCanvasView: NSView {
                 // view.size() fired: switch to resize tracking instead of button press
                 if resizeDragState != nil { return }
             }
-            buttons[i].isPressed = true
-            setNeedsDisplay(bounds)
-            return
+            // Only claim the press if this button has an action; otherwise fall through to window drag.
+            let hasAction = buttons[i].model.base.onClick != nil
+                         || buttons[i].model.base.onMouseDown != nil
+                         || buttons[i].model.kind != .generic
+            if hasAction {
+                buttons[i].isPressed = true
+                setNeedsDisplay(bounds)
+                return
+            }
         }
         for i in sliders.indices.reversed() {
             guard !elementIsHidden(sliders[i].model.base, live: true),
@@ -1596,8 +1602,10 @@ public final class SkinCanvasView: NSView {
             pressedTextIdx = i
             return
         }
-        print("[Skinner] mouseDown: no interactive element hit, setting dragOrigin")
-        dragOrigin = NSEvent.mouseLocation
+        print("[Skinner] mouseDown: no interactive element hit, starting window drag")
+        if let win = window {
+            windowDragStart = (NSEvent.mouseLocation, win.frame.origin)
+        }
     }
 
     public override func mouseDragged(with event: NSEvent) {
@@ -1628,13 +1636,12 @@ public final class SkinCanvasView: NSView {
             ), display: true)
             return
         }
-        guard let origin = dragOrigin, let win = window else { return }
+        guard let (startPt, startOrigin) = windowDragStart, let win = window else { return }
         let current = NSEvent.mouseLocation
         win.setFrameOrigin(NSPoint(
-            x: win.frame.origin.x + current.x - origin.x,
-            y: win.frame.origin.y + current.y - origin.y
+            x: startOrigin.x + current.x - startPt.x,
+            y: startOrigin.y + current.y - startPt.y
         ))
-        dragOrigin = current
     }
 
     public override func mouseUp(with event: NSEvent) {
@@ -1656,7 +1663,7 @@ public final class SkinCanvasView: NSView {
             activeSliderIdx = nil
             return
         }
-        defer { dragOrigin = nil }
+        defer { windowDragStart = nil }
         let pt = convert(event.locationInWindow, from: nil)
         for i in groups.indices {
             guard let pressed = groups[i].pressedColor else { continue }
@@ -1889,6 +1896,11 @@ public final class SkinCanvasView: NSView {
         }
         switch button.model.kind {
         case .mute:    playerBackend?.isMuted.toggle()
+        case .play:    playerBackend?.play()
+        case .pause:   playerBackend?.pause()
+        case .stop:    playerBackend?.stop()
+        case .next:    playerBackend?.next()
+        case .prev:    playerBackend?.previous()
         case .generic: print("[ACTION] button / \(button.model.base.id ?? button.model.image ?? "?")")
         }
     }
@@ -1907,7 +1919,8 @@ public final class SkinCanvasView: NSView {
             return (i, p)
         }
         let savedButtonPressed = Set(buttons.compactMap { b -> String? in
-            b.isPressed ? b.model.base.id : nil
+            guard b.isPressed else { return nil }
+            return b.model.base.id ?? "\(b.frame.minX),\(b.frame.minY)"
         })
 
         groups  = collectGroups(in: skinView.elements,  offset: .zero, lc: lc)
@@ -1929,7 +1942,8 @@ public final class SkinCanvasView: NSView {
             clearAllGroupHoverAnimations()
         }
         for i in buttons.indices {
-            if let id = buttons[i].model.base.id, savedButtonPressed.contains(id) {
+            let key = buttons[i].model.base.id ?? "\(buttons[i].frame.minX),\(buttons[i].frame.minY)"
+            if savedButtonPressed.contains(key) {
                 buttons[i].isPressed = true
             }
         }
@@ -3827,11 +3841,16 @@ public final class SkinCanvasView: NSView {
         return true
     }
 
-    /// Returns false if a ButtonElement within a group is disabled (JS state or WMS attribute).
+    /// Returns false if a ButtonElement within a group is disabled (JS state, enabled attr, or tabStop).
     private func buttonElementIsEnabled(_ elem: ButtonElement?) -> Bool {
         guard let elem else { return true }
         if let id = elem.id, let s = engine?.state(for: id), let en = s.enabled { return en }
         if let en = elem.enabled?.boolValue { return en }
+        // tabStop="wmpenabled:..." gates interactivity: false means the element is disabled.
+        if case .wmpEnabled(let expr) = elem.tabStop {
+            return engine?.evaluateWmpEnabled(expr) ?? false
+        }
+        if let ts = elem.tabStop?.boolValue { return ts }
         return true
     }
 

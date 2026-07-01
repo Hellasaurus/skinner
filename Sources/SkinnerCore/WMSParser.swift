@@ -313,8 +313,12 @@ private extension WMSParser {
         switch node.tag {
         case "subview":
             return .subview(buildSubview(node))
-        case "button", "playbutton", "pausebutton", "stopbutton", "prevbutton", "nextbutton":
-            return .button(buildButton(node, kind: .generic))
+        case "button":                   return .button(buildButton(node, kind: .generic))
+        case "playbutton":               return .button(buildButton(node, kind: .play))
+        case "pausebutton":              return .button(buildButton(node, kind: .pause))
+        case "stopbutton":               return .button(buildButton(node, kind: .stop))
+        case "prevbutton":               return .button(buildButton(node, kind: .prev))
+        case "nextbutton":               return .button(buildButton(node, kind: .next))
         case "mutebutton":
             return .button(buildButton(node, kind: .mute))
         case "buttongroup":
@@ -458,6 +462,7 @@ private extension WMSParser {
             upToolTip: a.str("uptooltip"),
             downToolTip: a.str("downtooltip"),
             enabled: a.av("enabled"),
+            tabStop: a.av("tabstop"),
             onClick: a.str("onclick"),
             onMouseOver: a.str("onmouseover"),
             onMouseDown: a.str("onmousedown"),

@@ -1065,7 +1065,16 @@ final class SkinScriptEngine {
             set: function(v) { _skinnerSeekTo(v);            },
             configurable: true
         });
+        Object.defineProperty(player.controls, 'currentposition', {
+            get: function()  { return _skinnerGetPosition(); },
+            set: function(v) { _skinnerSeekTo(v);            },
+            configurable: true
+        });
         Object.defineProperty(player.controls, 'currentPositionString', {
+            get: function()  { return _skinnerGetPositionString(); },
+            configurable: true
+        });
+        Object.defineProperty(player.controls, 'currentpositionstring', {
             get: function()  { return _skinnerGetPositionString(); },
             configurable: true
         });
