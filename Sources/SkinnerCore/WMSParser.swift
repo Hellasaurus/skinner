@@ -327,7 +327,7 @@ private extension WMSParser {
             return .slider(buildSlider(node, kind: .generic))
         case "customslider":
             return .slider(buildSlider(node, kind: .custom))
-        case "seekslider":
+        case "seekslider", "progressbar":
             return .slider(buildSlider(node, kind: .seek))
         case "volumeslider":
             return .slider(buildSlider(node, kind: .volume))
@@ -490,7 +490,8 @@ private extension WMSParser {
             positionImage: a.str("positionimage"),
             borderSize: a.int("bordersize"),
             slide: a.boolOpt("slide"),
-            tiled: a.bool("tiled")
+            tiled: a.bool("tiled"),
+            useForegroundProgress: a.bool("useforegroundprogress", default: true)
         )
     }
 

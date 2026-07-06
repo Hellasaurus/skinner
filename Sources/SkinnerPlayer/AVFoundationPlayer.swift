@@ -343,6 +343,11 @@ public final class AVFoundationPlayer: PlayerBackend {
         _seekPosition  = position
         _pausePosition = position
         let wasPlaying = playState == .playing
+        // Bump the generation before stopping: stop() invokes the completion handler of
+        // whatever segment was scheduled from the previous position (as "played back", not
+        // an error), and without this it's indistinguishable from real end-of-track — every
+        // seek would spuriously fire handleItemEnded() and skip to the next song.
+        loadGeneration += 1
         playerNode.stop()
         scheduleFrom(position)
         if wasPlaying {
