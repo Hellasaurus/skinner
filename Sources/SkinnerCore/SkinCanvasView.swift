@@ -582,9 +582,21 @@ public final class SkinCanvasView: NSView {
                 var w    = resolveCoord(s.base.width,  lc: lc) ?? CGFloat(posMD?.width  ?? 0)
                 var h    = resolveCoord(s.base.height, lc: lc) ?? CGFloat(posMD?.height ?? 0)
                 var fc   = 1
+                var framesVertical = false
                 if let n = s.image, let img = cache.images[n.lowercased()],
-                   let pd = posMD, pd.width > 0 {
-                    fc = max(1, Int(img.size.width) / pd.width)
+                   let pd = posMD, pd.width > 0, pd.height > 0 {
+                    // CustomSlider sprite strips stack frames along whichever axis the
+                    // positionImage doesn't span: e.g. Ginger Man/bruteforce's vol.png
+                    // matches positionImage width and stacks frames vertically, while
+                    // Plus! Pulsar's matches positionImage height and stacks horizontally.
+                    let imgW = Int(img.size.width), imgH = Int(img.size.height)
+                    if imgH == pd.height, imgW >= pd.width {
+                        fc = max(1, imgW / pd.width)
+                        framesVertical = false
+                    } else {
+                        fc = max(1, imgH / pd.height)
+                        framesVertical = true
+                    }
                     if w == 0 { w = CGFloat(pd.width)  }
                     if h == 0 { h = CGFloat(pd.height) }
                 }
@@ -602,6 +614,7 @@ public final class SkinCanvasView: NSView {
                 var rs = RenderedSlider(model: s,
                                         frame: CGRect(x: x, y: y, width: w, height: h),
                                         frameCount: fc,
+                                        framesStackedVertically: framesVertical,
                                         positionMapData: posMD,
                                         ancestorBases: ancestors)
                 rs.value = resolvedSliderValue(s)
@@ -1452,6 +1465,16 @@ public final class SkinCanvasView: NSView {
 
         if slider.frameCount <= 1 {
             img.draw(in: slider.frame)
+        } else if slider.framesStackedVertically {
+            let fw  = Int(img.size.width)
+            let fh  = Int(img.size.height) / slider.frameCount
+            // NSImage y=0 is the visual bottom; frame 0 is the strip's topmost slice.
+            let srcY = Int(img.size.height) - fh * (slider.frameIndex + 1)
+            let src  = NSRect(x: 0, y: CGFloat(srcY), width: CGFloat(fw), height: CGFloat(fh))
+            let dest = NSRect(origin: slider.frame.origin,
+                              size:   CGSize(width: fw, height: fh))
+            img.draw(in: dest, from: src, operation: .sourceOver, fraction: 1.0,
+                     respectFlipped: true, hints: nil)
         } else {
             let fw   = Int(img.size.width) / slider.frameCount
             let fh   = Int(img.size.height)
@@ -3125,6 +3148,7 @@ public final class SkinCanvasView: NSView {
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
         reloadPlaylistViews()
+        updatePlaylistViewVisibility()
         // Rebuild the click-through mask synchronously so the upcoming draw (below)
         // reflects elements' new positions/images. Deferring this to a later runloop
         // turn caused one stale-mask frame to be drawn first, flashing the background
@@ -3383,6 +3407,35 @@ public final class SkinCanvasView: NSView {
         info.dataSource.bgColor       = bgColor
         info.dataSource.playingColor   = plColor
         info.dataSource.playingBgColor = plBgColor
+    }
+
+    /// Finds every `<playlist>` element paired with its ancestor subview chain, descending
+    /// into hidden subviews too (unlike collectTexts/collectButtons) — a playlist inside a
+    /// collapsed pl drawer still needs to be found so its NSTableView can be hidden.
+    private func collectPlaylistRefs(in elements: [SkinElement], ancestors: [ElementBase] = []) -> [(Playlist, [ElementBase])] {
+        var result: [(Playlist, [ElementBase])] = []
+        for element in elements {
+            switch element {
+            case .playlist(let p):
+                result.append((p, ancestors))
+            case .subview(let sv):
+                result += collectPlaylistRefs(in: sv.children, ancestors: ancestors + [sv.base])
+            default: break
+            }
+        }
+        return result
+    }
+
+    /// drawElements only reaches a <playlist> element (and hides its NSTableView there) when
+    /// every ancestor subview is currently visible — it stops recursing at a hidden subview.
+    /// So closing a pl drawer (hiding its subview) would leave the already-created scrollView
+    /// stuck visible forever. Run this independently of the draw walk to keep it in sync.
+    private func updatePlaylistViewVisibility() {
+        for (p, ancestors) in collectPlaylistRefs(in: skinView.elements) {
+            let key = p.base.id ?? "_pl"
+            guard let info = playlistNSViews[key] else { continue }
+            info.scrollView.isHidden = elementIsHidden(p.base, live: true) || !ancestorsVisible(ancestors)
+        }
     }
 
     private func parsePlaylistColumns(_ spec: String?) -> [(key: String, title: String)] {
@@ -4192,6 +4245,7 @@ private struct RenderedSlider {
     let model:           Slider
     let frame:           CGRect
     let frameCount:      Int
+    let framesStackedVertically: Bool
     let positionMapData: MapData?
     let ancestorBases:   [ElementBase]
     var value:           Double = 0
