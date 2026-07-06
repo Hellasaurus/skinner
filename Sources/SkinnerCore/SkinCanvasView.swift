@@ -959,6 +959,39 @@ public final class SkinCanvasView: NSView {
             composite.unlockFocus()
             iv.image = composite
         }
+
+        // Same treatment for sliders (e.g. Halloween's seek slider thumb, which sits
+        // under the always-blinking eyes_anim.gif) whose frame overlaps a looping-GIF
+        // NSImageView.
+        for (idx, slider) in sliders.enumerated() {
+            let sliderZ = slider.model.base.zIndex ?? slider.ancestorBases.last?.zIndex ?? 0
+            guard gifOverlayFrames.contains(where: { $0.frame.intersects(slider.frame) && sliderZ > $0.zIndex }) else { continue }
+            let key = "s:\(slider.model.base.id ?? String(idx))"
+            let hidden = elementIsHidden(slider.model.base, live: true) || !ancestorsVisible(slider.ancestorBases)
+            let iv = buttonOverlayCoverViews[key] ?? {
+                let new = NSImageView(frame: slider.frame)
+                new.imageScaling = .scaleAxesIndependently
+                addSubview(new)
+                buttonOverlayCoverViews[key] = new
+                return new
+            }()
+            iv.isHidden = hidden
+            guard !hidden else { continue }
+            if iv.frame != slider.frame { iv.frame = slider.frame }
+
+            let sig = "\(slider.value)"
+            if buttonOverlayCoverSigs[key] == sig, iv.image != nil { continue }
+            buttonOverlayCoverSigs[key] = sig
+
+            let composite = NSImage(size: slider.frame.size)
+            composite.lockFocusFlipped(true)
+            if let imgCtx = NSGraphicsContext.current?.cgContext {
+                imgCtx.translateBy(x: -slider.frame.origin.x, y: -slider.frame.origin.y)
+                drawSlider(slider)
+            }
+            composite.unlockFocus()
+            iv.image = composite
+        }
     }
 
     private func drawElements(_ elements: [SkinElement],
@@ -1891,7 +1924,12 @@ public final class SkinCanvasView: NSView {
             }
         }
 
-        applyScriptChanges()
+        // Skip the full element-tree rebuild on intermediate drag ticks — only the
+        // slider's own (already-updated) value changed. Sliders with a live
+        // `value_onchange` script keep the full pipeline every tick since that script
+        // may drive other elements' structure (visibility/image), not just backend state.
+        let hasLiveScript = !(slider.model.valueOnChange?.isEmpty ?? true)
+        applyScriptChanges(fullRebuild: isMouseUp || hasLiveScript)
     }
 
     public override func mouseMoved(with event: NSEvent) {
@@ -3141,21 +3179,34 @@ public final class SkinCanvasView: NSView {
         DispatchQueue.main.asyncAfter(deadline: timerDeadline, execute: item)
     }
 
-    private func applyScriptChanges() {
+    /// - Parameter fullRebuild: When `false`, skips the parts of the pipeline that only
+    ///   matter for *structural* changes (element position/visibility/image swaps) —
+    ///   `recollect()`, `reloadPlaylistViews()`, `promoteNewGifSubviews()`. Used for
+    ///   intermediate slider-drag ticks, where the only thing that changed is the one
+    ///   slider's own value (already updated in-place by `applySlider`), so redoing a
+    ///   full element-tree walk + JS coordinate resolution on every `mouseDragged` is
+    ///   pure overhead that eats into the frame budget and makes fast drags look like
+    ///   they're skipping/stalling. The full pipeline still runs on drag-end (mouseUp)
+    ///   so any onDragEnd-driven structural change is picked up immediately after.
+    private func applyScriptChanges(fullRebuild: Bool = true) {
         engine?.fireOnEndMoveCallbacks()
-        recollect()
+        if fullRebuild {
+            recollect()
+        }
         updateAnimatedButtonFrames()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
-        reloadPlaylistViews()
-        updatePlaylistViewVisibility()
+        if fullRebuild {
+            reloadPlaylistViews()
+            updatePlaylistViewVisibility()
+        }
         // Rebuild the click-through mask synchronously so the upcoming draw (below)
         // reflects elements' new positions/images. Deferring this to a later runloop
         // turn caused one stale-mask frame to be drawn first, flashing the background
         // through areas a moved/covering element no longer leaves transparent.
         // Cheap in the common (no-op) case via the signature check in buildBgOpacity().
         buildBgOpacity()
-        if let bundle {
+        if fullRebuild, let bundle {
             let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
             promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
         }

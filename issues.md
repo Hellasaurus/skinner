@@ -8,7 +8,7 @@ This list is not exhaustive
 - (no remaining issues)
 
 ## Halloween
-- tracking slider is functional but does not appear visually
+- (no remaining issues)
 
 ## Half Life 2
 - eq/pl view: left side of window has a gap
