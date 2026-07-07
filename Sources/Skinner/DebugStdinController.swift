@@ -10,6 +10,7 @@ import SkinnerCore
 /// `ERR <message>` to stdout:
 ///   click X Y [VIEWID]      — synthetic left click at (X, Y) in view coords
 ///   move X Y [VIEWID]       — synthetic mouse-moved at (X, Y), updates hover state
+///   drag X1 Y1 X2 Y2 [STEPS] [VIEWID] — synthetic mouseDown+N mouseDragged+mouseUp from (X1,Y1) to (X2,Y2)
 ///   dump [DIR]               — write frame/mask/mapData/mask PNGs to DIR (default /tmp/skinner-debug)
 ///   screenshot PATH [VIEWID] — write the current frame to PATH
 /// `@unchecked Sendable`: the background read loop only ever touches `self` via
@@ -56,6 +57,17 @@ final class DebugStdinController: @unchecked Sendable {
             let pt = CGPoint(x: x, y: y)
             if verb == "click" { canvas.debugClick(atViewPoint: pt) }
             else                { canvas.debugMove(atViewPoint: pt) }
+            ack(.success)
+
+        case "drag":
+            guard args.count >= 4,
+                  let x1 = Double(args[0]), let y1 = Double(args[1]),
+                  let x2 = Double(args[2]), let y2 = Double(args[3])
+            else { return ack(.failure("usage: drag X1 Y1 X2 Y2 [STEPS] [VIEWID]")) }
+            let steps = args.count > 4 ? (Int(args[4]) ?? 20) : 20
+            let viewId = args.count > 5 ? args[5] : nil
+            guard let canvas = canvas(forViewId: viewId) else { return ack(.failure("no such view")) }
+            canvas.debugDrag(from: CGPoint(x: x1, y: y1), to: CGPoint(x: x2, y: y2), steps: steps)
             ack(.success)
 
         case "dump":

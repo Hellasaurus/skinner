@@ -293,20 +293,45 @@ public final class SkinCanvasView: NSView {
             case .generic:
                 // Generic <slider> elements may carry wmpprop/jsExpr value bindings (e.g. EQ band sliders).
                 // Only update when such a binding is present; otherwise preserve the drag position.
-                guard let eng = engine else { break }
                 var raw: Double? = nil
-                switch sliders[i].model.value {
-                case .wmpProp(let expr): raw = eng.evaluateNumber(expr).map(Double.init)
-                case .jsExpr(let expr):  raw = eng.evaluateNumber(expr).map(Double.init)
-                default: break
+                if let eng = engine {
+                    switch sliders[i].model.value {
+                    case .wmpProp(let expr): raw = eng.evaluateNumber(expr).map(Double.init)
+                    case .jsExpr(let expr):  raw = eng.evaluateNumber(expr).map(Double.init)
+                    default: break
+                    }
                 }
                 if let rv = raw {
                     let minV = resolveSliderBound(sliders[i].model.min) ?? 0
                     let maxV = resolveSliderBound(sliders[i].model.max) ?? 100
                     guard maxV > minV else { break }
                     sliders[i].value = min(1, max(0, (rv - minV) / (maxV - minV)))
+                } else if sliders[i].model.valueOnChange == nil || sliders[i].model.valueOnChange?.isEmpty == true,
+                          let reserved = reservedSliderRole(sliders[i].model.base.id) {
+                    // Legacy WMP skins wire plain <slider id="Progress"/"Volume"/"Balance">
+                    // to built-in controls purely by reserved id, with no min/max/value/
+                    // onchange authored at all (e.g. Grinch's "Progress" seek slider).
+                    switch reserved {
+                    case .seek:    sliders[i].value = dur > 0 ? min(1, max(0, backend.currentPosition / dur)) : 0
+                    case .volume:  sliders[i].value = Double(backend.volume) / 100.0
+                    case .balance: sliders[i].value = (Double(backend.balance) + 100.0) / 200.0
+                    }
                 }
             }
+        }
+    }
+
+    private enum ReservedSliderRole { case seek, volume, balance }
+
+    /// Legacy WMP skins bind a plain `<slider>` to a built-in control purely by id, with
+    /// no min/max/value/onchange authored (e.g. Grinch's `<slider id="Progress">`). Only
+    /// consulted as a fallback when the slider has no real script binding.
+    private func reservedSliderRole(_ id: String?) -> ReservedSliderRole? {
+        switch id?.lowercased() {
+        case "progress", "position", "seek": return .seek
+        case "volume": return .volume
+        case "balance": return .balance
+        default: return nil
         }
     }
 
@@ -421,6 +446,23 @@ public final class SkinCanvasView: NSView {
                 engine?.evaluate("\(id).height = \(img.size.height)")
             }
             seedImplicitSubviewSizes(in: sv.children)
+        }
+    }
+
+    /// Resolves JS-computed subview widths/heights (e.g. `jscript:plOutline.width`) and seeds
+    /// them into the JS proxy so that child jscript: references (e.g. `jscript:plFrame.width`
+    /// used by a nested <playlist> element) can resolve correctly. Walks in document order so
+    /// that referenced siblings are seeded before the elements that reference them.
+    private func seedComputedSubviewSizes(in elements: [SkinElement], lc: LayoutContext) {
+        for element in elements {
+            guard case .subview(let sv) = element, let id = sv.base.id else { continue }
+            if let w = resolveCoord(sv.base.width, lc: lc), w > 0 {
+                engine?.setLiveNumber(id: id, property: "width", value: w)
+            }
+            if let h = resolveCoord(sv.base.height, lc: lc), h > 0 {
+                engine?.setLiveNumber(id: id, property: "height", value: h)
+            }
+            seedComputedSubviewSizes(in: sv.children, lc: lc)
         }
     }
 
@@ -540,9 +582,21 @@ public final class SkinCanvasView: NSView {
                 var w    = resolveCoord(s.base.width,  lc: lc) ?? CGFloat(posMD?.width  ?? 0)
                 var h    = resolveCoord(s.base.height, lc: lc) ?? CGFloat(posMD?.height ?? 0)
                 var fc   = 1
+                var framesVertical = false
                 if let n = s.image, let img = cache.images[n.lowercased()],
-                   let pd = posMD, pd.width > 0 {
-                    fc = max(1, Int(img.size.width) / pd.width)
+                   let pd = posMD, pd.width > 0, pd.height > 0 {
+                    // CustomSlider sprite strips stack frames along whichever axis the
+                    // positionImage doesn't span: e.g. Ginger Man/bruteforce's vol.png
+                    // matches positionImage width and stacks frames vertically, while
+                    // Plus! Pulsar's matches positionImage height and stacks horizontally.
+                    let imgW = Int(img.size.width), imgH = Int(img.size.height)
+                    if imgH == pd.height, imgW >= pd.width {
+                        fc = max(1, imgW / pd.width)
+                        framesVertical = false
+                    } else {
+                        fc = max(1, imgH / pd.height)
+                        framesVertical = true
+                    }
                     if w == 0 { w = CGFloat(pd.width)  }
                     if h == 0 { h = CGFloat(pd.height) }
                 }
@@ -560,6 +614,7 @@ public final class SkinCanvasView: NSView {
                 var rs = RenderedSlider(model: s,
                                         frame: CGRect(x: x, y: y, width: w, height: h),
                                         frameCount: fc,
+                                        framesStackedVertically: framesVertical,
                                         positionMapData: posMD,
                                         ancestorBases: ancestors)
                 rs.value = resolvedSliderValue(s)
@@ -825,6 +880,7 @@ public final class SkinCanvasView: NSView {
                 img.draw(in: imgRect)
             }
         }
+        seedComputedSubviewSizes(in: skinView.elements, lc: lc)
         var bi = 0
         var si = 0
         drawElements(skinView.elements, offset: .zero, lc: lc, ctx: ctx,
@@ -899,6 +955,39 @@ public final class SkinCanvasView: NSView {
             if let imgCtx = NSGraphicsContext.current?.cgContext {
                 imgCtx.translateBy(x: -group.frame.origin.x, y: -group.frame.origin.y)
                 drawGroup(group, frame: group.frame, ctx: imgCtx)
+            }
+            composite.unlockFocus()
+            iv.image = composite
+        }
+
+        // Same treatment for sliders (e.g. Halloween's seek slider thumb, which sits
+        // under the always-blinking eyes_anim.gif) whose frame overlaps a looping-GIF
+        // NSImageView.
+        for (idx, slider) in sliders.enumerated() {
+            let sliderZ = slider.model.base.zIndex ?? slider.ancestorBases.last?.zIndex ?? 0
+            guard gifOverlayFrames.contains(where: { $0.frame.intersects(slider.frame) && sliderZ > $0.zIndex }) else { continue }
+            let key = "s:\(slider.model.base.id ?? String(idx))"
+            let hidden = elementIsHidden(slider.model.base, live: true) || !ancestorsVisible(slider.ancestorBases)
+            let iv = buttonOverlayCoverViews[key] ?? {
+                let new = NSImageView(frame: slider.frame)
+                new.imageScaling = .scaleAxesIndependently
+                addSubview(new)
+                buttonOverlayCoverViews[key] = new
+                return new
+            }()
+            iv.isHidden = hidden
+            guard !hidden else { continue }
+            if iv.frame != slider.frame { iv.frame = slider.frame }
+
+            let sig = "\(slider.value)"
+            if buttonOverlayCoverSigs[key] == sig, iv.image != nil { continue }
+            buttonOverlayCoverSigs[key] = sig
+
+            let composite = NSImage(size: slider.frame.size)
+            composite.lockFocusFlipped(true)
+            if let imgCtx = NSGraphicsContext.current?.cgContext {
+                imgCtx.translateBy(x: -slider.frame.origin.x, y: -slider.frame.origin.y)
+                drawSlider(slider)
             }
             composite.unlockFocus()
             iv.image = composite
@@ -1190,16 +1279,16 @@ public final class SkinCanvasView: NSView {
                 }
 
             case .playlist(let p):
-                let x = (lc.resolve(p.base.left) ?? 0) + offset.x
-                let y = (lc.resolve(p.base.top)  ?? 0) + offset.y
+                let x = (resolveCoord(p.base.left, lc: lc) ?? 0) + offset.x
+                let y = (resolveCoord(p.base.top,  lc: lc) ?? 0) + offset.y
                 let w: CGFloat
                 let h: CGFloat
-                if let rw = lc.resolve(p.base.width)        { w = rw }
-                else if p.base.width == nil                  { w = lc.viewWidth }
-                else                                         { continue }
-                if let rh = lc.resolve(p.base.height)       { h = rh }
-                else if p.base.height == nil                 { h = lc.viewHeight }
-                else                                         { continue }
+                if let rw = resolveCoord(p.base.width, lc: lc) { w = rw }
+                else if p.base.width == nil                     { w = lc.viewWidth }
+                else                                            { continue }
+                if let rh = resolveCoord(p.base.height, lc: lc) { h = rh }
+                else if p.base.height == nil                     { h = lc.viewHeight }
+                else                                             { continue }
                 let plRect = NSRect(x: x, y: y, width: w, height: h)
                 applyPlaylistNSView(p, rect: plRect)
 
@@ -1409,6 +1498,16 @@ public final class SkinCanvasView: NSView {
 
         if slider.frameCount <= 1 {
             img.draw(in: slider.frame)
+        } else if slider.framesStackedVertically {
+            let fw  = Int(img.size.width)
+            let fh  = Int(img.size.height) / slider.frameCount
+            // NSImage y=0 is the visual bottom; frame 0 is the strip's topmost slice.
+            let srcY = Int(img.size.height) - fh * (slider.frameIndex + 1)
+            let src  = NSRect(x: 0, y: CGFloat(srcY), width: CGFloat(fw), height: CGFloat(fh))
+            let dest = NSRect(origin: slider.frame.origin,
+                              size:   CGSize(width: fw, height: fh))
+            img.draw(in: dest, from: src, operation: .sourceOver, fraction: 1.0,
+                     respectFlipped: true, hints: nil)
         } else {
             let fw   = Int(img.size.width) / slider.frameCount
             let fh   = Int(img.size.height)
@@ -1459,6 +1558,30 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// borderSize is the distance from each edge to the thumb's CENTER at the extremes.
+    /// The thumb image can slightly clip at the edges; clamp to stay within the frame.
+    private func thumbRect(for slider: RenderedSlider, imageSize: CGSize, isVertical: Bool) -> NSRect {
+        let frame   = slider.frame
+        let thumbW  = imageSize.width
+        let thumbH  = imageSize.height
+        let border  = CGFloat(slider.model.borderSize ?? 0)
+        let v       = slider.value
+
+        if isVertical {
+            let travel = max(0, frame.height - border * 2)
+            let rawY   = frame.minY + border + (1 - v) * travel - thumbH / 2
+            let thumbY = max(frame.minY, min(frame.maxY - thumbH, rawY))
+            let thumbX = frame.minX + (frame.width - thumbW) / 2
+            return NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
+        } else {
+            let travel = max(0, frame.width  - border * 2)
+            let rawX   = frame.minX + border + v * travel - thumbW / 2
+            let thumbX = max(frame.minX, min(frame.maxX - thumbW, rawX))
+            let thumbY = frame.minY + (frame.height - thumbH) / 2
+            return NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
+        }
+    }
+
     private func drawStandardSlider(_ slider: RenderedSlider) {
         let frame = slider.frame
         let isVertical = slider.model.direction?.lowercased() == "vertical"
@@ -1470,34 +1593,33 @@ public final class SkinCanvasView: NSView {
         let jsForeground = slider.model.base.id.flatMap { engine?.state(for: $0)?.foregroundImage }
         if let trackName = jsForeground ?? slider.model.foregroundImage,
            let track = cache.images[trackName.lowercased()] {
-            track.draw(in: frame)
+            if slider.model.useForegroundProgress {
+                // foregroundImage is a fill indicator: clip to the current value so it
+                // grows/shrinks with playback position rather than always drawing full-size.
+                let v = slider.value
+                if isVertical {
+                    let visibleH = frame.height * CGFloat(v)
+                    let dest = NSRect(x: frame.minX, y: frame.maxY - visibleH, width: frame.width, height: visibleH)
+                    let src  = NSRect(x: 0, y: 0, width: track.size.width, height: track.size.height * CGFloat(v))
+                    if visibleH > 0 { track.draw(in: dest, from: src, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil) }
+                } else {
+                    let visibleW = frame.width * CGFloat(v)
+                    let dest = NSRect(x: frame.minX, y: frame.minY, width: visibleW, height: frame.height)
+                    let src  = NSRect(x: 0, y: 0, width: track.size.width * CGFloat(v), height: track.size.height)
+                    if visibleW > 0 { track.draw(in: dest, from: src, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil) }
+                }
+            } else {
+                // useForegroundProgress=false: the foreground image is not a stretched
+                // overlay but a movable indicator drawn at its native size at the current
+                // thumb position (e.g. Gadget's seek_fill.bmp, paired with an invisible
+                // 1px thumbImage that exists only to satisfy the parser).
+                track.draw(in: thumbRect(for: slider, imageSize: track.size, isVertical: isVertical))
+            }
         }
 
         guard let thumbName = slider.model.thumbImage,
               let thumb = cache.images[thumbName.lowercased()] else { return }
-
-        let thumbW  = thumb.size.width
-        let thumbH  = thumb.size.height
-        let border  = CGFloat(slider.model.borderSize ?? 0)
-        let v       = slider.value
-
-        // borderSize is the distance from each edge to the thumb's CENTER at the extremes.
-        // The thumb image can slightly clip at the edges; clamp to stay within the frame.
-        let thumbRect: NSRect
-        if isVertical {
-            let travel = max(0, frame.height - border * 2)
-            let rawY   = frame.minY + border + (1 - v) * travel - thumbH / 2
-            let thumbY = max(frame.minY, min(frame.maxY - thumbH, rawY))
-            let thumbX = frame.minX + (frame.width - thumbW) / 2
-            thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
-        } else {
-            let travel = max(0, frame.width  - border * 2)
-            let rawX   = frame.minX + border + v * travel - thumbW / 2
-            let thumbX = max(frame.minX, min(frame.maxX - thumbW, rawX))
-            let thumbY = frame.minY + (frame.height - thumbH) / 2
-            thumbRect = NSRect(x: thumbX, y: thumbY, width: thumbW, height: thumbH)
-        }
-        thumb.draw(in: thumbRect)
+        thumb.draw(in: thumbRect(for: slider, imageSize: thumb.size, isVertical: isVertical))
     }
 
     private func resolvedSliderValue(_ s: Slider) -> Double {
@@ -1537,70 +1659,97 @@ public final class SkinCanvasView: NSView {
 
     // MARK: - Mouse events
 
+    private enum HitCandidateKind {
+        case group(Int), button(Int), slider(Int), text(Int)
+    }
+
     public override func mouseDown(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
         print("[Skinner] mouseDown view=\(skinView.id ?? "?") pt=\(pt) buttons=\(buttons.count)")
 
-        // Button groups use pixel-precise mapping-image hit tests and should take
-        // priority over sliders when their frames overlap (e.g. STALKER's EQ/PL
-        // button group sits on top of the volume slider).  If a click misses all
-        // mapped button pixels the group returns nil and the slider below catches it.
-        for i in groups.indices.reversed() {
+        // Collect all eligible interactive elements (groups, buttons, sliders, texts)
+        // and resolve the click by *actual* z-order, topmost first — not by category.
+        // Category-first ordering (all groups, then all buttons, then all sliders) used
+        // to let a lower-zIndex buttongroup steal clicks from a higher-zIndex slider
+        // whenever their frames overlapped, e.g. seek sliders whose positionImage hit-box
+        // extends behind a transport buttongroup. Ties (the common case — most WMS
+        // elements omit zIndex) still break groups > buttons > sliders > texts, then by
+        // reversed document order within a category, matching the old behavior exactly.
+        var candidates: [(z: Int, catPriority: Int, tieIndex: Int, kind: HitCandidateKind)] = []
+        for i in groups.indices {
             guard !elementIsHidden(groups[i].model.base, live: true),
                   ancestorsVisible(groups[i].ancestorBases),
                   !ancestorsPassThrough(groups[i].ancestorBases),
                   elementIsEnabled(groups[i].model.base) else { continue }
-            if let color = groups[i].colorAt(pt) {
+            candidates.append((liveZIndex(ofBase: groups[i].model.base), 0, i, .group(i)))
+        }
+        for i in buttons.indices {
+            guard !elementIsHidden(buttons[i].model.base, live: true),
+                  ancestorsVisible(buttons[i].ancestorBases),
+                  !ancestorsPassThrough(buttons[i].ancestorBases),
+                  elementIsEnabled(buttons[i].model.base) else { continue }
+            candidates.append((liveZIndex(ofBase: buttons[i].model.base), 1, i, .button(i)))
+        }
+        for i in sliders.indices {
+            guard !elementIsHidden(sliders[i].model.base, live: true),
+                  ancestorsVisible(sliders[i].ancestorBases),
+                  !ancestorsPassThrough(sliders[i].ancestorBases),
+                  elementIsEnabled(sliders[i].model.base) else { continue }
+            candidates.append((liveZIndex(ofBase: sliders[i].model.base), 2, i, .slider(i)))
+        }
+        for i in texts.indices {
+            guard !elementIsHidden(texts[i].model.base, live: true),
+                  ancestorsVisible(texts[i].ancestorBases),
+                  !ancestorsPassThrough(texts[i].ancestorBases),
+                  elementIsEnabled(texts[i].model.base),
+                  texts[i].model.base.onClick != nil else { continue }
+            candidates.append((liveZIndex(ofBase: texts[i].model.base), 3, i, .text(i)))
+        }
+        candidates.sort { a, b in
+            if a.z != b.z { return a.z > b.z }
+            if a.catPriority != b.catPriority { return a.catPriority < b.catPriority }
+            return a.tieIndex > b.tieIndex
+        }
+
+        for candidate in candidates {
+            switch candidate.kind {
+            case .group(let i):
+                guard let color = groups[i].colorAt(pt) else { continue }
                 let elem = groups[i].model.elements.first { $0.mappingColor.lowercased() == color }
                 guard buttonElementIsEnabled(elem) else { continue }
                 groups[i].pressedColor = color
                 groupHoverViews["\(i)"]?.isHidden = true
                 setNeedsDisplay(bounds)
                 return
-            }
-        }
-        for i in buttons.indices.reversed() {
-            guard !elementIsHidden(buttons[i].model.base, live: true),
-                  ancestorsVisible(buttons[i].ancestorBases),
-                  !ancestorsPassThrough(buttons[i].ancestorBases),
-                  elementIsEnabled(buttons[i].model.base) else { continue }
-            guard buttons[i].hitTest(pt) else { continue }
-            print("[Skinner] mouseDown: hit button[\(i)] id=\(buttons[i].model.base.id ?? "nil") frame=\(buttons[i].frame) onClick='\(buttons[i].model.base.onClick?.prefix(60) ?? "nil")'")
-            if let script = buttons[i].model.base.onMouseDown, !script.isEmpty {
-                engine?.evaluate(script)
-                applyScriptChanges()
-                // view.size() fired: switch to resize tracking instead of button press
-                if resizeDragState != nil { return }
-            }
-            // Only claim the press if this button has an action; otherwise fall through to window drag.
-            let hasAction = buttons[i].model.base.onClick != nil
-                         || buttons[i].model.base.onMouseDown != nil
-                         || buttons[i].model.kind != .generic
-            if hasAction {
-                buttons[i].isPressed = true
-                setNeedsDisplay(bounds)
-                return
-            }
-        }
-        for i in sliders.indices.reversed() {
-            guard !elementIsHidden(sliders[i].model.base, live: true),
-                  ancestorsVisible(sliders[i].ancestorBases),
-                  !ancestorsPassThrough(sliders[i].ancestorBases),
-                  elementIsEnabled(sliders[i].model.base) else { continue }
-            if let norm = sliderNormalizedValue(at: pt, slider: sliders[i]) {
+            case .button(let i):
+                guard buttons[i].hitTest(pt) else { continue }
+                print("[Skinner] mouseDown: hit button[\(i)] id=\(buttons[i].model.base.id ?? "nil") frame=\(buttons[i].frame) onClick='\(buttons[i].model.base.onClick?.prefix(60) ?? "nil")'")
+                if let script = buttons[i].model.base.onMouseDown, !script.isEmpty {
+                    engine?.evaluate(script)
+                    applyScriptChanges()
+                    // view.size() fired: switch to resize tracking instead of button press
+                    if resizeDragState != nil { return }
+                }
+                // Only claim the press if this button has an action; otherwise fall through
+                // to whatever's beneath it (or window drag).
+                let hasAction = buttons[i].model.base.onClick != nil
+                             || buttons[i].model.base.onMouseDown != nil
+                             || buttons[i].model.kind != .generic
+                if hasAction {
+                    buttons[i].isPressed = true
+                    setNeedsDisplay(bounds)
+                    return
+                }
+            case .slider(let i):
+                guard let norm = sliderNormalizedValue(at: pt, slider: sliders[i]) else { continue }
                 activeSliderIdx = i
                 applySlider(idx: i, normalized: norm, isMouseUp: false)
                 return
+            case .text(let i):
+                guard texts[i].frame.contains(pt) else { continue }
+                pressedTextIdx = i
+                return
             }
-        }
-        for i in texts.indices.reversed() {
-            guard !elementIsHidden(texts[i].model.base, live: true),
-                  ancestorsVisible(texts[i].ancestorBases),
-                  !ancestorsPassThrough(texts[i].ancestorBases),
-                  elementIsEnabled(texts[i].model.base) else { continue }
-            guard texts[i].frame.contains(pt), texts[i].model.base.onClick != nil else { continue }
-            pressedTextIdx = i
-            return
         }
         print("[Skinner] mouseDown: no interactive element hit, starting window drag")
         if let win = window {
@@ -1728,8 +1877,26 @@ public final class SkinCanvasView: NSView {
     private func applySlider(idx: Int, normalized: Double, isMouseUp: Bool) {
         sliders[idx].value = normalized
         let slider = sliders[idx]
-        let minV   = resolveSliderBound(slider.model.min) ?? 0
-        let maxV   = resolveSliderBound(slider.model.max) ?? 100
+        // Elements with a dedicated kind imply their range even when the skin omits
+        // min/max — matching updateLiveSliders' duration-based display math. A flat
+        // 0–100 default here previously made seekSlider without explicit max="..."
+        // seek in raw *seconds* out of 100, snapping past end-of-track on short songs
+        // and firing an unwanted auto-advance to the next track.
+        // A plain <slider> with no min/max/onchange scripting falls back to legacy
+        // reserved-id binding (see reservedSliderRole) instead of the .generic default.
+        let unboundReserved: ReservedSliderRole? =
+            (slider.model.kind == .generic && (slider.model.valueOnChange?.isEmpty ?? true))
+            ? reservedSliderRole(slider.model.base.id) : nil
+
+        let defaultMin: Double
+        let defaultMax: Double
+        switch (slider.model.kind, unboundReserved) {
+        case (.seek, _), (_, .seek): defaultMin = 0;    defaultMax = playerBackend?.duration ?? 0
+        case (.balance, _), (_, .balance): defaultMin = -100; defaultMax = 100
+        default: defaultMin = 0; defaultMax = 100
+        }
+        let minV   = resolveSliderBound(slider.model.min) ?? defaultMin
+        let maxV   = resolveSliderBound(slider.model.max) ?? defaultMax
         let raw    = minV + normalized * (maxV - minV)
 
         if let id = slider.model.base.id {
@@ -1745,19 +1912,24 @@ public final class SkinCanvasView: NSView {
         // Direct backend calls for standard kinds — fallback for skins without JS scripts,
         // and guarantees correct behavior regardless of whether the skin script fires.
         if let backend = playerBackend {
-            switch slider.model.kind {
-            case .seek:
+            switch (slider.model.kind, unboundReserved) {
+            case (.seek, _), (_, .seek):
                 // Only seek on release; continuous seeking during drag is choppy with AVFoundation.
                 if isMouseUp { backend.seek(to: raw) }
-            case .volume:
+            case (.volume, _), (_, .volume):
                 backend.volume = max(0, min(100, Int(raw.rounded())))
-            case .balance:
+            case (.balance, _), (_, .balance):
                 backend.balance = max(-100, min(100, Int(raw.rounded())))
             default: break
             }
         }
 
-        applyScriptChanges()
+        // Skip the full element-tree rebuild on intermediate drag ticks — only the
+        // slider's own (already-updated) value changed. Sliders with a live
+        // `value_onchange` script keep the full pipeline every tick since that script
+        // may drive other elements' structure (visibility/image), not just backend state.
+        let hasLiveScript = !(slider.model.valueOnChange?.isEmpty ?? true)
+        applyScriptChanges(fullRebuild: isMouseUp || hasLiveScript)
     }
 
     public override func mouseMoved(with event: NSEvent) {
@@ -3007,20 +3179,34 @@ public final class SkinCanvasView: NSView {
         DispatchQueue.main.asyncAfter(deadline: timerDeadline, execute: item)
     }
 
-    private func applyScriptChanges() {
+    /// - Parameter fullRebuild: When `false`, skips the parts of the pipeline that only
+    ///   matter for *structural* changes (element position/visibility/image swaps) —
+    ///   `recollect()`, `reloadPlaylistViews()`, `promoteNewGifSubviews()`. Used for
+    ///   intermediate slider-drag ticks, where the only thing that changed is the one
+    ///   slider's own value (already updated in-place by `applySlider`), so redoing a
+    ///   full element-tree walk + JS coordinate resolution on every `mouseDragged` is
+    ///   pure overhead that eats into the frame budget and makes fast drags look like
+    ///   they're skipping/stalling. The full pipeline still runs on drag-end (mouseUp)
+    ///   so any onDragEnd-driven structural change is picked up immediately after.
+    private func applyScriptChanges(fullRebuild: Bool = true) {
         engine?.fireOnEndMoveCallbacks()
-        recollect()
+        if fullRebuild {
+            recollect()
+        }
         updateAnimatedButtonFrames()
         updateLiveSliders()
         updateAnimatedSubviewVisibility()
-        reloadPlaylistViews()
+        if fullRebuild {
+            reloadPlaylistViews()
+            updatePlaylistViewVisibility()
+        }
         // Rebuild the click-through mask synchronously so the upcoming draw (below)
         // reflects elements' new positions/images. Deferring this to a later runloop
         // turn caused one stale-mask frame to be drawn first, flashing the background
         // through areas a moved/covering element no longer leaves transparent.
         // Cheap in the common (no-op) case via the signature check in buildBgOpacity().
         buildBgOpacity()
-        if let bundle {
+        if fullRebuild, let bundle {
             let lc = LayoutContext(viewWidth: bounds.width, viewHeight: bounds.height)
             promoteNewGifSubviews(in: skinView.elements, offset: .zero, lc: lc, bundle: bundle)
         }
@@ -3260,10 +3446,11 @@ public final class SkinCanvasView: NSView {
         info.tableView.backgroundColor = bgColor
         info.scrollView.backgroundColor = bgColor
 
-        let nameWidth = rect.width * 0.65
-        let durWidth  = rect.width * 0.35
-        for tc in info.tableView.tableColumns {
-            tc.width = tc.identifier.rawValue == "duration" ? durWidth : nameWidth
+        let totalW = rect.width
+        let cols = info.tableView.tableColumns
+        let totalWeight = cols.reduce(0.0) { $0 + columnWeight(for: $1.identifier.rawValue) }
+        for tc in cols {
+            tc.width = (columnWeight(for: tc.identifier.rawValue) / totalWeight) * totalW
         }
 
         info.dataSource.backend       = playerBackend
@@ -3273,12 +3460,53 @@ public final class SkinCanvasView: NSView {
         info.dataSource.playingBgColor = plBgColor
     }
 
+    /// Finds every `<playlist>` element paired with its ancestor subview chain, descending
+    /// into hidden subviews too (unlike collectTexts/collectButtons) — a playlist inside a
+    /// collapsed pl drawer still needs to be found so its NSTableView can be hidden.
+    private func collectPlaylistRefs(in elements: [SkinElement], ancestors: [ElementBase] = []) -> [(Playlist, [ElementBase])] {
+        var result: [(Playlist, [ElementBase])] = []
+        for element in elements {
+            switch element {
+            case .playlist(let p):
+                result.append((p, ancestors))
+            case .subview(let sv):
+                result += collectPlaylistRefs(in: sv.children, ancestors: ancestors + [sv.base])
+            default: break
+            }
+        }
+        return result
+    }
+
+    /// drawElements only reaches a <playlist> element (and hides its NSTableView there) when
+    /// every ancestor subview is currently visible — it stops recursing at a hidden subview.
+    /// So closing a pl drawer (hiding its subview) would leave the already-created scrollView
+    /// stuck visible forever. Run this independently of the draw walk to keep it in sync.
+    private func updatePlaylistViewVisibility() {
+        for (p, ancestors) in collectPlaylistRefs(in: skinView.elements) {
+            let key = p.base.id ?? "_pl"
+            guard let info = playlistNSViews[key] else { continue }
+            info.scrollView.isHidden = elementIsHidden(p.base, live: true) || !ancestorsVisible(ancestors)
+        }
+    }
+
     private func parsePlaylistColumns(_ spec: String?) -> [(key: String, title: String)] {
         guard let spec, !spec.isEmpty else { return [("name", "Name")] }
         return spec.split(separator: ";").compactMap { part in
             let kv = part.split(separator: "=", maxSplits: 1)
             guard kv.count == 2 else { return nil }
             return (String(kv[0]).lowercased(), String(kv[1]))
+        }
+    }
+
+    private func columnWeight(for key: String) -> CGFloat {
+        switch key {
+        case "wm/tracknumber":  return 1.0
+        case "duration", "time": return 2.0
+        case "filetype", "type", "status": return 1.5
+        case "artist":          return 4.0
+        case "album":           return 3.0
+        case "userrating", "rating", "bitrate", "genre": return 1.5
+        default:                return 5.0   // name / title
         }
     }
 
@@ -3885,6 +4113,13 @@ public final class SkinCanvasView: NSView {
     /// at the WMS-declared value and the element would remain hidden under the background.
     private func liveZIndex(_ element: SkinElement) -> Int {
         guard let base = element.base else { return 0 }
+        return liveZIndex(ofBase: base)
+    }
+
+    /// Same live-zIndex lookup as `liveZIndex(_:)`, but callable from an `ElementBase`
+    /// directly (used by mouseDown's cross-category hit-test ordering, where the
+    /// candidates are RenderedGroup/Button/Slider/Text rather than raw SkinElements).
+    private func liveZIndex(ofBase base: ElementBase) -> Int {
         if let id = base.id, let z = engine?.state(for: id)?.zIndex { return z }
         return base.zIndex ?? 0
     }
@@ -3953,6 +4188,8 @@ private final class PlaylistDataSource: NSObject, NSTableViewDataSource, NSTable
             guard d > 0 else { return "" }
             let s = Int(d)
             return "\(s / 60):\(String(format: "%02d", s % 60))"
+        case "wm/tracknumber":
+            return "\(row + 1)"
         default:
             return ""
         }
@@ -4059,6 +4296,7 @@ private struct RenderedSlider {
     let model:           Slider
     let frame:           CGRect
     let frameCount:      Int
+    let framesStackedVertically: Bool
     let positionMapData: MapData?
     let ancestorBases:   [ElementBase]
     var value:           Double = 0

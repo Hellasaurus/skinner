@@ -192,6 +192,7 @@ public struct Slider: Sendable {
     public var borderSize: Int?
     public var slide: Bool?
     public var tiled: Bool
+    public var useForegroundProgress: Bool
 }
 
 // MARK: - TextLabel

@@ -41,6 +41,28 @@ extension SkinCanvasView {
         mouseMoved(with: move)
     }
 
+    /// Synthesizes a mouse-down-drag-up sequence from `from` to `to` in this view's
+    /// coordinate space, interpolated over `steps` intermediate `mouseDragged` events.
+    /// Drives real slider-drag codepaths (`activeSliderIdx`, `mouseDragged`) that
+    /// `debugClick` (down+up with no drag in between) can't reach.
+    public func debugDrag(from: CGPoint, to: CGPoint, steps: Int) {
+        let windowNumber = window?.windowNumber ?? 0
+        func event(_ type: NSEvent.EventType, _ p: CGPoint, _ pressure: Float) -> NSEvent? {
+            NSEvent.mouseEvent(with: type, location: convert(p, to: nil),
+                               modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: windowNumber, context: nil,
+                               eventNumber: 0, clickCount: 1, pressure: pressure)
+        }
+        if let down = event(.leftMouseDown, from, 1) { mouseDown(with: down) }
+        let steps = max(1, steps)
+        for i in 1...steps {
+            let t = CGFloat(i) / CGFloat(steps)
+            let p = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+            if let move = event(.leftMouseDragged, p, 1) { mouseDragged(with: move) }
+        }
+        if let up = event(.leftMouseUp, to, 0) { mouseUp(with: up) }
+    }
+
     /// Renders the current frame via `draw(_:)`. Captures CGContext output only —
     /// composited `NSImageView` subviews (animated GIFs, viz covers) are not included.
     /// Uses `lockFocus` rather than `cacheDisplay` so this works for layer-backed
