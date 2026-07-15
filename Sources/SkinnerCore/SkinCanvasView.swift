@@ -78,6 +78,9 @@ public final class SkinCanvasView: NSView {
     private var gifOverlayFrames:         [(frame: CGRect, zIndex: Int)] = []
     private var buttonOverlayCoverViews:  [String: NSImageView] = [:]
     private var buttonOverlayCoverSigs:   [String: String]      = [:]
+    /// Fully-opaque (alpha=255) copies of `backgroundTiled` images that lack a
+    /// `transparencyColor`, keyed by source-image identity. See `opaqueTile(_:)`.
+    private var opaqueTileCache: [ObjectIdentifier: NSImage] = [:]
 
     public var onOpenView:   ((String) -> Void)? { didSet { engine?.onOpenView  = onOpenView  } }
     public var onCloseView:  ((String) -> Void)? { didSet { engine?.onCloseView = onCloseView } }
@@ -1166,9 +1169,14 @@ public final class SkinCanvasView: NSView {
                         // top=11) both sit further left than f_top_right/f_right_s (left=
                         // view.width-55, top=0), so without this check a top-row stretch picks
                         // one of their smaller bounds and falls short of the actual right border.
+                        // Tiled siblings are excluded: their declared left/top often starts well
+                        // before their image's far edge (e.g. a tall corner-hugging strut), so
+                        // using their anchor coordinate as a bound falls short of the real border
+                        // — only fixed corner/anchor pieces reliably mark the row's true edge.
                         func rowRightBound() -> CGFloat {
                             elements.compactMap { e -> CGFloat? in
                                 guard case .subview(let s) = e, s.base.horizontalAlignment == .right,
+                                      s.backgroundTiled != true,
                                       liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y == sy
                                 else { return nil }
                                 return liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
@@ -1188,8 +1196,26 @@ public final class SkinCanvasView: NSView {
                            explicitH <= img.size.height || sv.backgroundTiled {
                             h = explicitH
                         } else if sv.base.verticalAlignment == .stretch {
+                            // Tiled siblings excluded for the same reason as rowRightBound above:
+                            // a tiled bottom strut's declared top can sit well above its image's
+                            // actual lower edge, which would otherwise collapse this bound.
+                            // Also require horizontal overlap with this strut's own column: a
+                            // vertical strut on one side (e.g. left) must not be bound by the
+                            // opposite corner (e.g. f_bot_right) just because it happens to have
+                            // a smaller top — Half-Life 2's f_bot_left (top=view.height-89) and
+                            // f_bot_right/f_bot_s (top=view.height-121) differ, so without this
+                            // check f_left_s picked the wrong (righthand) corner's bound and came
+                            // up short; same issue hit Dreamcatcher's f_right_s in reverse.
                             let botBound = elements.compactMap { e -> CGFloat? in
-                                guard case .subview(let s) = e, s.base.verticalAlignment == .bottom else { return nil }
+                                guard case .subview(let s) = e, s.base.verticalAlignment == .bottom,
+                                      s.backgroundTiled != true,
+                                      let sName = s.backgroundImage,
+                                      let sImg = cache.images[sName.lowercased()]
+                                else { return nil }
+                                let sLeft = liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                                let sWidth = lc.resolve(s.base.width) ?? sImg.size.width
+                                let tolerance: CGFloat = 2
+                                guard sLeft <= sx + w + tolerance, sLeft + sWidth >= sx - tolerance else { return nil }
                                 return liveCoord(s.base.id, attr: s.base.top, propName: "top", lc: lc) + offset.y
                             }.min() ?? lc.viewHeight
                             h = max(0, botBound - sy)
@@ -1208,6 +1234,16 @@ public final class SkinCanvasView: NSView {
                                       let sName = s.backgroundImage,
                                       let sImg = cache.images[sName.lowercased()]
                                 else { return nil }
+                                // Only a sibling that actually touches this strut horizontally is a
+                                // real corner/anchor for its row — an unrelated control (e.g. a
+                                // button cluster) that merely happens to share the same top
+                                // coordinate must not be allowed to clamp the strut's height (e.g.
+                                // Ginger Man's pl_set_no icon sits at top=0 like f_top_left/right,
+                                // but doesn't border f_top_s at all).
+                                let sLeft = liveCoord(s.base.id, attr: s.base.left, propName: "left", lc: lc) + offset.x
+                                let sWidth = lc.resolve(s.base.width) ?? sImg.size.width
+                                let tolerance: CGFloat = 2
+                                guard sLeft <= sx + w + tolerance, sLeft + sWidth >= sx - tolerance else { return nil }
                                 return lc.resolve(s.base.height) ?? sImg.size.height
                             }
                             h = anchorHeights.filter { $0 < img.size.height }.min() ?? img.size.height
@@ -1215,7 +1251,8 @@ public final class SkinCanvasView: NSView {
                             h = img.size.height
                         }
                         if sv.backgroundTiled {
-                            drawTiledImage(img, in: NSRect(x: sx, y: sy, width: w, height: h), ctx: ctx)
+                            drawTiledImage(img, in: NSRect(x: sx, y: sy, width: w, height: h), ctx: ctx,
+                                           forceOpaque: sv.base.transparencyColor == nil)
                         } else {
                             img.draw(in: NSRect(x: sx, y: sy, width: w, height: h))
                         }
@@ -1456,9 +1493,10 @@ public final class SkinCanvasView: NSView {
         }
     }
 
-    private func drawTiledImage(_ img: NSImage, in destRect: NSRect, ctx: CGContext) {
-        let iw = img.size.width
-        let ih = img.size.height
+    private func drawTiledImage(_ img: NSImage, in destRect: NSRect, ctx: CGContext, forceOpaque: Bool = false) {
+        let tileImg = forceOpaque ? opaqueTile(img) : img
+        let iw = tileImg.size.width
+        let ih = tileImg.size.height
         guard iw > 0, ih > 0 else { return }
         ctx.saveGState()
         ctx.clip(to: destRect)
@@ -1466,12 +1504,65 @@ public final class SkinCanvasView: NSView {
         while ty < destRect.maxY {
             var tx = destRect.minX
             while tx < destRect.maxX {
-                img.draw(in: NSRect(x: tx, y: ty, width: iw, height: ih))
+                tileImg.draw(in: NSRect(x: tx, y: ty, width: iw, height: ih))
                 tx += iw
             }
             ty += ih
         }
         ctx.restoreGState()
+    }
+
+    /// Some border-tile assets (e.g. Constantine's `f_top_tile.png`) bake a soft
+    /// alpha gradient/groove into their own pixels rather than a hard edge — real
+    /// WMP composites `backgroundTiled` strips straight from GDI bitmaps with no
+    /// per-pixel alpha, so any translucency in the source PNG was never actually
+    /// visible there. Here, with nothing opaque behind the row, that translucency
+    /// shows as a repeating transparent seam at every tile boundary. Elements with
+    /// an explicit `transparencyColor` (chroma-keyed, already zeroed in AssetCache)
+    /// are left alone; this only flattens accidental/authoring-artifact alpha on
+    /// otherwise-opaque tiled strips.
+    private func opaqueTile(_ img: NSImage) -> NSImage {
+        let key = ObjectIdentifier(img)
+        if let cached = opaqueTileCache[key] { return cached }
+        guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let space = cg.colorSpace,
+              let bctx = CGContext(data: nil, width: cg.width, height: cg.height,
+                                    bitsPerComponent: 8, bytesPerRow: cg.width * 4,
+                                    space: space,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else {
+            opaqueTileCache[key] = img
+            return img
+        }
+        bctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        if let data = bctx.data {
+            let pixels = data.bindMemory(to: UInt8.self, capacity: cg.width * cg.height * 4)
+            for i in 0 ..< cg.width * cg.height {
+                let o = i * 4
+                let a = pixels[o + 3]
+                // Skip fully-transparent pixels (e.g. rounded corners already cut out
+                // in AssetCache) — there's no colour to recover for those. Also skip
+                // very-low-alpha pixels: un-premultiplying divides stored (alpha-
+                // scaled-down) RGB by alpha, and at alpha near zero the 8-bit
+                // quantization noise gets amplified into wrong, often lurid, colours
+                // rather than the intended tone. For alpha in between, un-premultiply
+                // before forcing alpha to 255, otherwise the already-scaled-down RGB
+                // would bake in as a darkened colour instead of the intended opaque one.
+                guard a > 24, a < 255 else { continue }
+                let factor = 255.0 / Double(a)
+                pixels[o]     = UInt8(min(255.0, Double(pixels[o])     * factor))
+                pixels[o + 1] = UInt8(min(255.0, Double(pixels[o + 1]) * factor))
+                pixels[o + 2] = UInt8(min(255.0, Double(pixels[o + 2]) * factor))
+                pixels[o + 3] = 255
+            }
+        }
+        guard let flatCG = bctx.makeImage() else {
+            opaqueTileCache[key] = img
+            return img
+        }
+        let flat = NSImage(cgImage: flatCG, size: img.size)
+        opaqueTileCache[key] = flat
+        return flat
     }
 
     private func drawSlider(_ slider: RenderedSlider) {
@@ -3037,7 +3128,8 @@ public final class SkinCanvasView: NSView {
                                  buttonOverride: belowButtons, sliderOverride: belowSliders)
                 }
                 if info.subview?.backgroundTiled == true {
-                    drawTiledImage(info.bgImage, in: info.drawRect, ctx: imgCtx)
+                    drawTiledImage(info.bgImage, in: info.drawRect, ctx: imgCtx,
+                                   forceOpaque: info.subview?.base.transparencyColor == nil)
                 } else {
                     info.bgImage.draw(in: info.drawRect)
                 }

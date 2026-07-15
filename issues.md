@@ -11,13 +11,11 @@ This list is not exhaustive
 - (no remaining issues)
 
 ## Half Life 2
-- eq/pl view: left side of window has a gap
 - when the shutter is open, os drop shadow does not work in the top right corner
 
 ## Grinch 
 - eq reset button nonfunctional
 - `kbps` drawn in top left corner of bounding box outside of drawn area
-- when plview is closed, playlist still drawn
 - when eq view is closed, the drop shadow remains
 
 ## Gorillaz
@@ -41,16 +39,11 @@ This list is not exhaustive
 - plview does not properly retract
 - background renders as mostly transparent
 
-## Gingerbread woman
-- viz/pl/eq window - interior border missing segment top border near center
+## Ginger\_woman
 - pause button inoperative
 
-## Gingerbread man
-- pl/viz windows:
-    - interior border missing segment top border near h center
-    - left/right borders missing segment near v center
-- pause button inoperative
-- seek/volume sliders not rendering correctly - some graphic is being drawn in front of the slider
+## Ginger\_man
+- (border rendering fixed)
 
 ## Gadget
 - timer does not render
@@ -72,7 +65,6 @@ This list is not exhaustive
 - several button mismaps, most buttons incorrectly mapped.
 
 ## Dreamcatcher
-- pl and viz windows: graphics on left and right border have gaps
 - `dreamcatcher` graphic on bottom of pl and viz windows drawn twice: once centered and once left aligned.
 - pause button displays as play button on hover and does not pause
 
@@ -110,7 +102,7 @@ This list is not exhaustive
 - volume sliders work but do not visually update
 
 ## Constantine
-- plview and viz borders poorly rendered in general; several elements have gaps or do not align in the borders. 
+- (border rendering fixed)
 
 ## Compact
 - big black box in front of much of the ui. 
