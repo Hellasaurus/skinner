@@ -646,8 +646,17 @@ public final class SkinCanvasView: NSView {
             case .text(let t):
                 guard !elementIsHidden(t.base),
                       t.base.onClick != nil || t.hoverForegroundColor != nil else { continue }
-                let x = (resolveCoord(t.base.left, lc: lc) ?? 0) + offset.x
-                let y = (resolveCoord(t.base.top,  lc: lc) ?? 0) + offset.y
+                let rawX = resolveCoord(t.base.left, lc: lc) ?? 0
+                let rawY = resolveCoord(t.base.top,  lc: lc) ?? 0
+                // Propagate computed positions back to JS proxies so sibling-reference
+                // jscript expressions (e.g. tBandWidth.left = jscript:tBufferPercent.left+15)
+                // resolve correctly when subsequent texts in the same parent are processed.
+                if let id = t.base.id {
+                    if case .jsExpr = t.base.left { engine?.setLiveNumber(id: id, property: "left", value: rawX) }
+                    if case .jsExpr = t.base.top  { engine?.setLiveNumber(id: id, property: "top",  value: rawY) }
+                }
+                let x = rawX + offset.x
+                let y = rawY + offset.y
                 let w =  resolveCoord(t.base.width,  lc: lc) ?? 100
                 let h =  resolveCoord(t.base.height, lc: lc) ?? 14
                 result.append(RenderedText(model: t, frame: CGRect(x: x, y: y, width: w, height: h),
@@ -1331,8 +1340,17 @@ public final class SkinCanvasView: NSView {
 
             case .text(let t):
                 guard !elementIsHidden(t.base, live: true) else { continue }
-                let tx = (resolveCoord(t.base.left,   lc: lc) ?? 0) + offset.x
-                let ty = (resolveCoord(t.base.top,    lc: lc) ?? 0) + offset.y
+                let rawTX = resolveCoord(t.base.left, lc: lc) ?? 0
+                let rawTY = resolveCoord(t.base.top,  lc: lc) ?? 0
+                // Propagate computed positions back to JS proxies so sibling-reference
+                // jscript expressions (e.g. tBandWidth.left = jscript:tBufferPercent.left+15)
+                // resolve correctly when subsequent texts in the same parent are processed.
+                if let id = t.base.id {
+                    if case .jsExpr = t.base.left { engine?.setLiveNumber(id: id, property: "left", value: rawTX) }
+                    if case .jsExpr = t.base.top  { engine?.setLiveNumber(id: id, property: "top",  value: rawTY) }
+                }
+                let tx = rawTX + offset.x
+                let ty = rawTY + offset.y
                 let tw =  resolveCoord(t.base.width,  lc: lc) ?? 100
                 let th =  resolveCoord(t.base.height, lc: lc) ?? 14
                 // wmpprop:/jsExpr: bindings are always evaluated live so they reflect

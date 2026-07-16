@@ -37,9 +37,12 @@ public final class AVFoundationPlayer: PlayerBackend {
 
     public var balance: Int {
         get { _balance }
-        set { _balance = newValue.clamped(to: -100...100) }
+        set {
+            _balance = newValue.clamped(to: -100...100)
+            playerNode.pan = Float(_balance) / 100
+        }
     }
-    private var _balance: Int = 0  // stored; not yet applied (deferred)
+    private var _balance: Int = 0
 
     public var isMuted: Bool {
         get { _isMuted }
