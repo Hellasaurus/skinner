@@ -37,6 +37,7 @@ public final class SkinCanvasView: NSView {
     private var activeSliderIdx: Int?
     private var activeDragSliderOverlayView: NSImageView?
     private var activeDragSliderOverlaySig:   String?
+    private var dragCatcherView: DragCatcherView?
     private var didFinishInit    = false
     private var pressedTextIdx:  Int?
     private var lastKnownMousePt: NSPoint?
@@ -902,6 +903,7 @@ public final class SkinCanvasView: NSView {
         renderVizCoverImages(lc: lc)
         renderButtonOverlayCovers(lc: lc)
         renderActiveDragSliderOverlay()
+        keepDragCatcherOnTop()
     }
 
     /// Redraws cover NSImageViews for buttons whose frame falls inside a looping-GIF
@@ -2111,6 +2113,40 @@ public final class SkinCanvasView: NSView {
     }
 
     // MARK: - Drag and drop
+
+    /// AppKit resolves a drag-and-drop destination by walking the *actual* subview tree
+    /// for the frontmost view registered for the dragged types at that point — unlike
+    /// mouse-click routing (which here goes entirely through `hitTest` above, and never
+    /// even looks at subviews), an unregistered subview sitting in front of the drop
+    /// point does not fall back to an ancestor; it just swallows the drag. Any skin with
+    /// enough overlay subviews in front of the canvas — GIF `NSImageView`s, the viz
+    /// container/cover images, playlist views — ends up with large "dead" regions where
+    /// a file drop is silently ignored, even though `self` (this view) is registered and
+    /// covers the whole window. Kept as the frontmost subview at all times (see
+    /// `keepDragCatcherOnTop`, called at the end of every `draw(_:)`) so the drag search
+    /// always finds it before any other overlay, regardless of what the skin has added.
+    private final class DragCatcherView: NSView {
+        weak var canvas: SkinCanvasView?
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            canvas?.draggingEntered(sender) ?? []
+        }
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            canvas?.performDragOperation(sender) ?? false
+        }
+    }
+
+    private func keepDragCatcherOnTop() {
+        let catcher = dragCatcherView ?? {
+            let v = DragCatcherView(frame: bounds)
+            v.autoresizingMask = [.width, .height]
+            v.canvas = self
+            v.registerForDraggedTypes([.fileURL])
+            dragCatcherView = v
+            return v
+        }()
+        if catcher.frame != bounds { catcher.frame = bounds }
+        addSubview(catcher, positioned: .above, relativeTo: nil)
+    }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
