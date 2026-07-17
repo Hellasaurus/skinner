@@ -35,6 +35,8 @@ public final class SkinCanvasView: NSView {
     private var resizeDragState: (startPt: NSPoint, startFrame: NSRect)?
     private var isResizingFromJS = false
     private var activeSliderIdx: Int?
+    private var activeDragSliderOverlayView: NSImageView?
+    private var activeDragSliderOverlaySig:   String?
     private var didFinishInit    = false
     private var pressedTextIdx:  Int?
     private var lastKnownMousePt: NSPoint?
@@ -899,6 +901,7 @@ public final class SkinCanvasView: NSView {
                      buttonIdx: &bi, sliderIdx: &si)
         renderVizCoverImages(lc: lc)
         renderButtonOverlayCovers(lc: lc)
+        renderActiveDragSliderOverlay()
     }
 
     /// Redraws cover NSImageViews for buttons whose frame falls inside a looping-GIF
@@ -2295,6 +2298,26 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// Same problem as `withLiveInteractionState`, for sliders: `collectSliders()` sets
+    /// `value` via `resolvedSliderValue(s)`, which only handles a literal `value` attribute
+    /// and resolves to 0 for wmpprop/jsExpr-bound sliders (volume, balance, EQ bands, custom
+    /// seek) — the backend-driven / in-drag value only ever gets folded into `self.sliders`,
+    /// by `updateLiveSliders()` and `applySlider()`. A fresh `collectSliders()` call made for
+    /// viz-cover compositing never sees that, so a slider living in a viz-covered subview
+    /// composites with a stale/zero value baked in — permanently, since the signature that
+    /// gates recompositing is built from that same stale value and so never changes either.
+    private func withLiveSliderValue(_ freshSliders: [RenderedSlider]) -> [RenderedSlider] {
+        func key(_ s: RenderedSlider) -> String { s.model.base.id ?? "\(s.frame.minX),\(s.frame.minY)" }
+        let liveByKey = Dictionary(sliders.map { (key($0), $0) }, uniquingKeysWith: { a, _ in a })
+        return freshSliders.map { fresh in
+            var s = fresh
+            if let live = liveByKey[key(fresh)] {
+                s.value = live.value
+            }
+            return s
+        }
+    }
+
     // MARK: - Visualization
 
     /// Resolves a sibling subview's absolute frame for viz-cover collection. `fallbackSize`
@@ -2992,6 +3015,59 @@ public final class SkinCanvasView: NSView {
                        intent: .defaultIntent)
     }
 
+    private func sliderKey(_ s: RenderedSlider) -> String { s.model.base.id ?? "\(s.frame.minX),\(s.frame.minY)" }
+
+    /// True while `s` is the slider currently being dragged. Used to keep the (expensive —
+    /// see `renderVizCoverImages`) cover-composite signature stable during a drag instead of
+    /// changing on every `mouseDragged` tick, which previously forced a full lockFocus
+    /// recomposite (~35-40ms) per tick and made viz-covered sliders (e.g. Kids' volume,
+    /// living in the same subview as `<effects>`) feel laggy under rapid drag events. The
+    /// live value is still shown during the drag via `renderActiveDragSliderOverlay`, a much
+    /// cheaper single-slider-sized composite drawn on top of the (temporarily stale) cover.
+    private func isActiveDragSlider(_ s: RenderedSlider) -> Bool {
+        guard let i = activeSliderIdx, i < sliders.count else { return false }
+        return sliderKey(sliders[i]) == sliderKey(s)
+    }
+
+    /// Cheap counterpart to the big per-cover composite in `renderVizCoverImages`: while a
+    /// slider inside a viz-covered subview is being dragged, that composite's signature is
+    /// held stable (see `isActiveDragSlider`) so it doesn't recompute on every tick. This
+    /// draws just that one slider, at its own small size, into a dedicated `NSImageView`
+    /// stacked above the cover — cheap enough to redraw every tick — so the thumb still
+    /// visibly tracks the drag. Hidden once the drag ends and the real cover composite
+    /// catches up with the final value.
+    private func renderActiveDragSliderOverlay() {
+        guard let i = activeSliderIdx, i < sliders.count else {
+            activeDragSliderOverlayView?.isHidden = true
+            return
+        }
+        let slider = sliders[i]
+        guard vizCoverInfos.contains(where: { $0.frame.intersects(slider.frame) }) else {
+            activeDragSliderOverlayView?.isHidden = true
+            return
+        }
+        let iv = activeDragSliderOverlayView ?? {
+            let new = NSImageView(frame: slider.frame)
+            new.imageScaling = .scaleAxesIndependently
+            addSubview(new)
+            activeDragSliderOverlayView = new
+            return new
+        }()
+        if iv.frame != slider.frame { iv.frame = slider.frame }
+        iv.isHidden = false
+        let sig = "\(sliderKey(slider))|\(slider.frameIndex)|\(slider.value)"
+        if activeDragSliderOverlaySig == sig, iv.image != nil { return }
+        activeDragSliderOverlaySig = sig
+        let composite = NSImage(size: slider.frame.size)
+        composite.lockFocusFlipped(true)
+        if let imgCtx = NSGraphicsContext.current?.cgContext {
+            imgCtx.translateBy(x: -slider.frame.origin.x, y: -slider.frame.origin.y)
+            drawSlider(slider)
+        }
+        composite.unlockFocus()
+        iv.image = composite
+    }
+
     /// Called at the end of every draw(_:) cycle to update the viz cover NSImageViews.
     /// Each cover composites its background image, the positive-zIndex children of its
     /// subview, and any global groups/buttons/sliders that intersect the cover frame but
@@ -3016,7 +3092,7 @@ public final class SkinCanvasView: NSView {
             if info.isFullSubviewCover, let sv {
                 let elementsArr: [SkinElement] = [.subview(sv)]
                 let subButtons = withLiveInteractionState(collectButtons(in: elementsArr, offset: info.containerOffset, lc: lc))
-                let subSliders = collectSliders(in: elementsArr, offset: info.containerOffset, lc: lc)
+                let subSliders = withLiveSliderValue(collectSliders(in: elementsArr, offset: info.containerOffset, lc: lc))
                 let subGroups  = collectGroups(in: elementsArr, offset: info.containerOffset, lc: lc)
 
                 var sig: [VizCoverSigEntry] = [
@@ -3029,8 +3105,11 @@ public final class SkinCanvasView: NSView {
                         extra: "\(b.isPressed)|\(b.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"))
                 }
                 for s in subSliders {
-                    sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame,
-                        extra: "\(s.frameIndex)|\(s.value)"))
+                    // Held stable while `s` is being dragged (see `isActiveDragSlider`) so a
+                    // drag doesn't force a full recomposite on every tick; the live position
+                    // is shown via the cheap `renderActiveDragSliderOverlay` instead.
+                    let extra = isActiveDragSlider(s) ? "active-drag" : "\(s.frameIndex)|\(s.value)"
+                    sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: extra))
                 }
                 for g in subGroups {
                     // `subGroups` came from a fresh `collectGroups()` call (structural only —
@@ -3081,9 +3160,9 @@ public final class SkinCanvasView: NSView {
             }
             let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
             let coverButtons  = withLiveInteractionState(collectButtons(in: aboveChildren, offset: coverOffset, lc: lc))
-            let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
+            let coverSliders  = withLiveSliderValue(collectSliders(in: aboveChildren, offset: coverOffset, lc: lc))
             let belowButtons  = withLiveInteractionState(collectButtons(in: belowChildren, offset: coverOffset, lc: lc))
-            let belowSliders  = collectSliders(in: belowChildren, offset: coverOffset, lc: lc)
+            let belowSliders  = withLiveSliderValue(collectSliders(in: belowChildren, offset: coverOffset, lc: lc))
             // Buttongroups living directly in aboveChildren/belowChildren aren't collected
             // here — `drawElements`'s `.buttonGroup` case looks them up from `self.groups`
             // by mappingImage directly (always live) — but their hover/press state must
@@ -3155,7 +3234,8 @@ public final class SkinCanvasView: NSView {
                     extra: "\(b.isPressed)|\(b.isHovered)|\(js?.down ?? false)|\(js?.image ?? "")"))
             }
             for s in belowSliders + coverSliders + extraSliders {
-                sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: "\(s.frameIndex)"))
+                let extra = isActiveDragSlider(s) ? "active-drag" : "\(s.frameIndex)"
+                sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: extra))
             }
             for g in extraGroups + coverOwnedGroups {
                 sig.append(vizCoverSigEntry(id: g.model.base.id, frame: g.frame,
