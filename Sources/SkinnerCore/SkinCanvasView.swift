@@ -2274,6 +2274,27 @@ public final class SkinCanvasView: NSView {
         }
     }
 
+    /// `collectButtons(in:...)` calls made for viz-cover compositing (see
+    /// `renderVizCoverImages`) build fresh `RenderedButton`s with `isHovered`/`isPressed`
+    /// reset to `false` — they only resolve structural layout, not live interaction state.
+    /// Since those buttons get drawn into an `NSImageView` composited *above* the main
+    /// CGContext pass, drawing them with their fresh (always-idle) state permanently masks
+    /// whatever hover/press image the main pass correctly drew underneath. Stamps in the
+    /// live state from `self.buttons` (matched by id, falling back to frame origin for
+    /// buttons with no id) so the composite reflects the same interaction state.
+    private func withLiveInteractionState(_ freshButtons: [RenderedButton]) -> [RenderedButton] {
+        func key(_ b: RenderedButton) -> String { b.model.base.id ?? "\(b.frame.minX),\(b.frame.minY)" }
+        let liveByKey = Dictionary(buttons.map { (key($0), $0) }, uniquingKeysWith: { a, _ in a })
+        return freshButtons.map { fresh in
+            var b = fresh
+            if let live = liveByKey[key(fresh)] {
+                b.isHovered = live.isHovered
+                b.isPressed = live.isPressed
+            }
+            return b
+        }
+    }
+
     // MARK: - Visualization
 
     /// Resolves a sibling subview's absolute frame for viz-cover collection. `fallbackSize`
@@ -2994,7 +3015,7 @@ public final class SkinCanvasView: NSView {
 
             if info.isFullSubviewCover, let sv {
                 let elementsArr: [SkinElement] = [.subview(sv)]
-                let subButtons = collectButtons(in: elementsArr, offset: info.containerOffset, lc: lc)
+                let subButtons = withLiveInteractionState(collectButtons(in: elementsArr, offset: info.containerOffset, lc: lc))
                 let subSliders = collectSliders(in: elementsArr, offset: info.containerOffset, lc: lc)
                 let subGroups  = collectGroups(in: elementsArr, offset: info.containerOffset, lc: lc)
 
@@ -3012,8 +3033,15 @@ public final class SkinCanvasView: NSView {
                         extra: "\(s.frameIndex)|\(s.value)"))
                 }
                 for g in subGroups {
+                    // `subGroups` came from a fresh `collectGroups()` call (structural only —
+                    // hoveredColor/pressedColor always nil), so pull the live values from
+                    // `self.groups` (matched by mappingImage, same key `drawGroup`'s caller
+                    // uses) for the signature — otherwise a hover-only change never differs
+                    // from the last signature and the composite (drawn above the CGContext
+                    // pass) never redraws to show it.
+                    let live = groups.first(where: { $0.model.mappingImage == g.model.mappingImage })
                     sig.append(vizCoverSigEntry(id: g.model.base.id, frame: g.frame,
-                        extra: "\(g.hoveredColor ?? "")|\(g.pressedColor ?? "")"))
+                        extra: "\(live?.hoveredColor ?? "")|\(live?.pressedColor ?? "")"))
                 }
                 newSignatures.append(sig)
 
@@ -3052,10 +3080,23 @@ public final class SkinCanvasView: NSView {
                 return true
             }
             let coverOffset   = CGPoint(x: frame.origin.x, y: frame.origin.y)
-            let coverButtons  = collectButtons(in: aboveChildren, offset: coverOffset, lc: lc)
+            let coverButtons  = withLiveInteractionState(collectButtons(in: aboveChildren, offset: coverOffset, lc: lc))
             let coverSliders  = collectSliders(in: aboveChildren, offset: coverOffset, lc: lc)
-            let belowButtons  = collectButtons(in: belowChildren, offset: coverOffset, lc: lc)
+            let belowButtons  = withLiveInteractionState(collectButtons(in: belowChildren, offset: coverOffset, lc: lc))
             let belowSliders  = collectSliders(in: belowChildren, offset: coverOffset, lc: lc)
+            // Buttongroups living directly in aboveChildren/belowChildren aren't collected
+            // here — `drawElements`'s `.buttonGroup` case looks them up from `self.groups`
+            // by mappingImage directly (always live) — but their hover/press state must
+            // still be folded into `sig` below, or a hover-only change on one of them won't
+            // change the signature and the stale composite (drawn above the CGContext pass)
+            // will keep masking the correctly-updated pixels drawn underneath.
+            let ownedGroupMappingImages: Set<String> = Set((aboveChildren + belowChildren).compactMap {
+                if case .buttonGroup(let bg) = $0 { return bg.mappingImage }
+                return nil
+            })
+            let coverOwnedGroups = groups.filter { g in
+                g.model.mappingImage.map(ownedGroupMappingImages.contains) ?? false
+            }
 
             // Global groups/buttons/sliders that intersect the viz cover frame but live
             // outside the cover subview's child tree (already drawn via aboveChildren).
@@ -3116,7 +3157,7 @@ public final class SkinCanvasView: NSView {
             for s in belowSliders + coverSliders + extraSliders {
                 sig.append(vizCoverSigEntry(id: s.model.base.id, frame: s.frame, extra: "\(s.frameIndex)"))
             }
-            for g in extraGroups {
+            for g in extraGroups + coverOwnedGroups {
                 sig.append(vizCoverSigEntry(id: g.model.base.id, frame: g.frame,
                     extra: "\(g.hoveredColor ?? "")|\(g.pressedColor ?? "")"))
             }
